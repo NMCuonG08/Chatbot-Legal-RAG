@@ -37,6 +37,9 @@ htmlcov/
 *.out
 *.err
 
+# Data files
+*.jsonl
+
 # Environment and secrets
 .env
 .env.*
