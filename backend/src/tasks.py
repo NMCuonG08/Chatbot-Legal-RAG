@@ -20,7 +20,11 @@ from brain import (
 )
 from config import DEFAULT_COLLECTION_NAME
 from database import get_celery_app
-from models import get_conversation_messages, update_chat_conversation
+from models import (
+    ensure_database_schema,
+    get_conversation_messages,
+    update_chat_conversation,
+)
 from query_rewriter import rewrite_query_to_multi_queries, rewrite_query_with_context
 from rerank import rerank_documents
 from search import hybrid_search, search_engine  # Import new hybrid search
@@ -299,6 +303,9 @@ def llm_handle_message(bot_id, user_id, question):
     4. Generate and save response
     """
     logger.info("Start handle message")
+
+    # Ensure required tables exist before worker writes conversation records.
+    ensure_database_schema()
 
     # Update chat conversation
     conversation_id = update_chat_conversation(bot_id, user_id, question, True)

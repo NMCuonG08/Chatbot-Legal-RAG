@@ -28,6 +28,8 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
+    environment:
+      QDRANT_URL: http://qdrant:6333
     depends_on:
       - redis
       - mariadb
@@ -37,6 +39,10 @@ services:
     build:
       context: ./backend
       dockerfile: worker.Dockerfile
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      CELERY_WORKER_CONCURRENCY: 2
+      CELERY_LOGLEVEL: info
     depends_on:
       - redis
       - mariadb

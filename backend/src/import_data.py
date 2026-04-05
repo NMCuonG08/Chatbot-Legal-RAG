@@ -22,7 +22,23 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 # Path to the data file
-DATA_FILE_PATH = "/usr/src/app/data/train.jsonl"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_LOCAL_DATA_FILE_PATH = REPO_ROOT / "data" / "train.jsonl"
+DEFAULT_CONTAINER_DATA_FILE_PATH = Path("/usr/src/app/data/train.jsonl")
+
+
+def _resolve_default_data_file_path() -> str:
+    env_path = os.getenv("IMPORT_DATA_FILE_PATH")
+    if env_path:
+        return env_path
+
+    if DEFAULT_CONTAINER_DATA_FILE_PATH.exists():
+        return str(DEFAULT_CONTAINER_DATA_FILE_PATH)
+
+    return str(DEFAULT_LOCAL_DATA_FILE_PATH)
+
+
+DATA_FILE_PATH = _resolve_default_data_file_path()
 
 
 def import_qa_data(
@@ -40,6 +56,11 @@ def import_qa_data(
         batch_size: Number of vectors to process in each batch
         limit: Maximum number of records to process (None for all)
     """
+
+    # Fall back to defaults when callers pass null/None values from Swagger.
+    data_file_path = data_file_path or DATA_FILE_PATH
+    collection_name = collection_name or DEFAULT_COLLECTION_NAME
+    batch_size = batch_size or 50
 
     # Check if file exists
     if not os.path.exists(data_file_path):

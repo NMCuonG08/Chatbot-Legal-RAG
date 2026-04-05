@@ -1,10 +1,25 @@
 import logging
+import os
+from urllib.parse import urlparse
 
 import redis
 
 from utils import generate_request_id
 
-redis_client = redis.StrictRedis(host="valkey-db", port="6379", db=0)
+
+
+def _build_redis_client():
+    redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+    parsed_url = urlparse(redis_url)
+
+    host = parsed_url.hostname or "127.0.0.1"
+    port = parsed_url.port or 6379
+    db = int((parsed_url.path or "/0").lstrip("/") or 0)
+
+    return redis.StrictRedis(host=host, port=port, db=db)
+
+
+redis_client = _build_redis_client()
 
 
 def get_conversation_key(bot_id, user_id):
@@ -28,7 +43,8 @@ def get_conversation_id(bot_id, user_id, ttl_seconds=360):
     except Exception as e:
         # Handle any exceptions (e.g., connection errors)
         logging.exception(f"Get conversation error: {e}")
-        return None
+        # Fallback for local/dev so chat history still gets grouped and persisted.
+        return key
 
 
 def clear_conversation_id(bot_id, user_id):

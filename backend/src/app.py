@@ -11,10 +11,15 @@ from pydantic import BaseModel
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-from models import insert_document
+from models import (
+    ensure_database_schema,
+    insert_document,
+    list_documents,
+    list_user_conversations,
+)
 from tasks import index_document_v2, llm_handle_message
 from utils import setup_logging
-from vectorize import create_collection
+from vectorize import create_collection, list_collection_points, list_collections
 
 # Constants
 TASK_TIMEOUT = 60
@@ -27,11 +32,23 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 
 
+@app.on_event("startup")
+async def startup_event():
+    ensure_database_schema()
+
+
 class CompleteRequest(BaseModel):
     bot_id: Optional[str] = "botLawyer"
-    user_id: str
+    user_id: Optional[str] = "anonymous"
     user_message: str
     sync_request: Optional[bool] = False
+
+
+class ImportRequest(BaseModel):
+    data_file_path: Optional[str] = None
+    collection_name: Optional[str] = None
+    batch_size: Optional[int] = 50
+    limit: Optional[int] = None
 
 
 @app.get("/")
@@ -42,6 +59,45 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy", "service": "Vietnamese Legal Chatbot Backend"}
+
+
+@app.get("/collections")
+async def get_collections():
+    return {"collections": list_collections()}
+
+
+@app.get("/documents")
+async def get_documents(limit: int = 100, offset: int = 0):
+    return {
+        "documents": list_documents(limit=limit, offset=offset),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/history/{user_id}")
+async def get_user_history(user_id: str, limit: int = 100, offset: int = 0):
+    return {
+        "user_id": user_id,
+        "history": list_user_conversations(user_id, limit=limit, offset=offset),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/collections/{collection_name}/points")
+async def get_collection_points(
+    collection_name: str,
+    limit: int = 20,
+    offset: int = 0,
+    include_vectors: bool = False,
+):
+    return list_collection_points(
+        collection_name,
+        limit=limit,
+        offset=offset,
+        include_vectors=include_vectors,
+    )
 
 
 @app.post("/chat/complete")
@@ -111,10 +167,15 @@ async def create_document(data: Dict):
 
 
 @app.post("/data/import")
-async def import_qa_data_endpoint():
+async def import_qa_data_endpoint(data: ImportRequest):
     from import_data import import_qa_data
 
-    success = import_qa_data()
+    success = import_qa_data(
+        data_file_path=data.data_file_path,
+        collection_name=data.collection_name,
+        batch_size=data.batch_size or 50,
+        limit=data.limit,
+    )
     return {"success": success}
 
 

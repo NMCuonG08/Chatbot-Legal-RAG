@@ -14,14 +14,6 @@ from utils import setup_logging
 
 Base = declarative_base()
 
-# Avoid crashing app import when database is temporarily unavailable.
-try:
-    Base.metadata.create_all(bind=engine)
-except Exception as e:
-    logging.getLogger(__name__).warning(
-        "Database not ready during model initialization: %s", e
-    )
-
 
 def _new_db_session() -> Session:
     return next(get_db())
@@ -124,6 +116,36 @@ def get_conversation_messages(conversation_id):
     return convert_conversation_to_openai_messages(user_conversations)
 
 
+def list_user_conversations(user_id: str, limit: int = 100, offset: int = 0):
+    ensure_database_schema()
+    db = _new_db_session()
+    try:
+        conversations = (
+            db.query(ChatConversation)
+            .filter(ChatConversation.user_id == user_id)
+            .order_by(ChatConversation.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "id": conversation.id,
+                "conversation_id": conversation.conversation_id,
+                "bot_id": conversation.bot_id,
+                "user_id": conversation.user_id,
+                "message": conversation.message,
+                "is_request": conversation.is_request,
+                "completed": conversation.completed,
+                "created_at": conversation.created_at,
+                "updated_at": conversation.updated_at,
+            }
+            for conversation in conversations
+        ]
+    finally:
+        db.close()
+
+
 class Document(Base):
     __tablename__ = "document"
 
@@ -136,8 +158,17 @@ class Document(Base):
     )
 
 
+def ensure_database_schema():
+    """Create missing tables for the current database if needed."""
+    try:
+        Base.metadata.create_all(bind=engine)
+    except Exception as e:
+        logger.warning("Database not ready during schema initialization: %s", e)
+
+
 # insert document into database
 def insert_document(question: str, content: str):
+    ensure_database_schema()
     db = _new_db_session()
     # Step 1: Create a new Document instance
     new_doc = Document(
@@ -155,3 +186,32 @@ def insert_document(question: str, content: str):
     logger.info(f"Create document successfully {new_doc}")
 
     return new_doc
+
+
+def list_documents(limit: int = 100, offset: int = 0):
+    ensure_database_schema()
+    db = _new_db_session()
+    try:
+        documents = (
+            db.query(Document)
+            .order_by(Document.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "id": document.id,
+                "question": document.question,
+                "content": document.content,
+                "created_at": document.created_at,
+                "updated_at": document.updated_at,
+            }
+            for document in documents
+        ]
+    finally:
+        db.close()
+
+
+# Run once on import after models are defined.
+ensure_database_schema()

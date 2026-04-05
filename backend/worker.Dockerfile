@@ -9,4 +9,4 @@ COPY src /app/src
 
 ENV PYTHONPATH=/app
 
-CMD ["celery", "-A", "src.tasks.celery_app", "worker", "--loglevel=info"]
+CMD ["sh", "-c", "celery -A src.tasks.celery_app worker --loglevel=${CELERY_LOGLEVEL:-info} --concurrency=${CELERY_WORKER_CONCURRENCY:-2}"]

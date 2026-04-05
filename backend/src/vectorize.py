@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from qdrant_client import QdrantClient
@@ -13,7 +14,11 @@ from qdrant_client.models import (
 )
 
 logger = logging.getLogger(__name__)
-client = QdrantClient(url="http://qdrant:6333")
+
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+
+client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
 
 def create_collection(name, vector_size=1024):
@@ -24,6 +29,80 @@ def create_collection(name, vector_size=1024):
         collection_name=name,
         vectors_config=VectorParams(size=vector_size, distance=Distance.DOT),
     )
+
+
+def list_collections():
+    """Return a lightweight list of collection names and basic metadata."""
+    collections = client.get_collections().collections
+    return [
+        {
+            "name": collection.name,
+        }
+        for collection in collections
+    ]
+
+
+def list_collection_points(
+    collection_name: str,
+    limit: int = 20,
+    offset: int = 0,
+    include_vectors: bool = False,
+):
+    """Return points from a collection using Qdrant scroll."""
+
+    def _vector_preview(vector, preview_size: int = 4):
+        if vector is None:
+            return None
+
+        def _non_zero_preview(values):
+            if not isinstance(values, list):
+                return values
+
+            non_zero = []
+            for idx, val in enumerate(values):
+                if val != 0:
+                    non_zero.append({"index": idx, "value": val})
+                    if len(non_zero) >= preview_size:
+                        break
+
+            if non_zero:
+                return non_zero
+
+            # Fallback when vector is dense-zero or very tiny values rounded to zero upstream.
+            return [{"index": i, "value": values[i]} for i in range(min(preview_size, len(values)))]
+
+        # Handle both single-vector and named-vector collections.
+        if isinstance(vector, dict):
+            return {name: _non_zero_preview(values) for name, values in vector.items()}
+
+        if isinstance(vector, list):
+            return _non_zero_preview(vector)
+
+        return vector
+
+    points, next_offset = client.scroll(
+        collection_name=collection_name,
+        limit=limit,
+        offset=offset,
+        with_payload=True,
+        with_vectors=True,
+    )
+
+    return {
+        "collection_name": collection_name,
+        "points": [
+            {
+                "id": point.id,
+                "payload": point.payload,
+                "vector_preview": _vector_preview(point.vector),
+                "vector": point.vector if include_vectors else None,
+            }
+            for point in points
+        ],
+        "limit": limit,
+        "offset": offset,
+        "next_offset": next_offset,
+    }
 
 
 def add_vector(collection_name, vectors={}, batch_size=100):

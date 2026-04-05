@@ -3,8 +3,11 @@ Custom Embedding Service - Sử dụng model riêng thay vì OpenAI
 """
 
 import logging
+import hashlib
 import os
+import re
 from functools import lru_cache
+from collections import Counter
 from typing import List, Union
 
 import requests
@@ -21,6 +24,10 @@ CUSTOM_EMBEDDING_ENABLED = (
 
 # Fallback to OpenAI if custom embedding fails
 USE_OPENAI_FALLBACK = os.environ.get("USE_OPENAI_FALLBACK", "true").lower() == "true"
+USE_LOCAL_EMBEDDING_FALLBACK = (
+    os.environ.get("USE_LOCAL_EMBEDDING_FALLBACK", "true").lower() == "true"
+)
+LOCAL_EMBEDDING_DIMENSION = int(os.environ.get("LOCAL_EMBEDDING_DIMENSION", "1024"))
 
 
 class CustomEmbeddingService:
@@ -31,9 +38,32 @@ class CustomEmbeddingService:
         self.embedding_endpoint = f"{self.api_url}/embed"
         self.health_endpoint = f"{self.api_url}/health"
         self.timeout = 30  # seconds
+        self.service_available = True
 
         # Check service health on init
-        self._check_health()
+        self.service_available = self._check_health()
+
+    def _local_embedding(self, text: str) -> List[float]:
+        """Generate a deterministic local fallback embedding."""
+        normalized = text.lower()
+        tokens = re.findall(r"[\wÀ-ỹ]+", normalized, flags=re.UNICODE)
+
+        vector = [0.0] * LOCAL_EMBEDDING_DIMENSION
+        if not tokens:
+            return vector
+
+        counts = Counter(tokens)
+        for token, count in counts.items():
+            digest = hashlib.sha256(token.encode("utf-8")).digest()
+            index = int.from_bytes(digest[:4], "big") % LOCAL_EMBEDDING_DIMENSION
+            weight = 1.0 + (count * 0.1)
+            vector[index] += weight
+
+        norm = sum(value * value for value in vector) ** 0.5
+        if norm:
+            vector = [value / norm for value in vector]
+
+        return vector
 
     def _check_health(self):
         """Check if custom embedding service is healthy"""
@@ -81,6 +111,11 @@ class CustomEmbeddingService:
         # Clean texts
         texts = [t.replace("\n", " ").strip() for t in texts]
 
+        if USE_LOCAL_EMBEDDING_FALLBACK and not self.service_available:
+            logger.warning("⚠️ Custom embedding service unavailable, using local fallback embeddings")
+            embeddings = [self._local_embedding(item) for item in texts]
+            return embeddings[0] if is_single else embeddings
+
         try:
             # Call API
             response = requests.post(
@@ -111,6 +146,11 @@ class CustomEmbeddingService:
 
         except Exception as e:
             logger.error(f"❌ Error getting embedding from custom service: {e}")
+            if USE_LOCAL_EMBEDDING_FALLBACK:
+                logger.warning("⚠️ Falling back to local embeddings after remote embedding failure")
+                self.service_available = False
+                embeddings = [self._local_embedding(item) for item in texts]
+                return embeddings[0] if is_single else embeddings
             raise
 
     def get_similarity(self, texts1: List[str], texts2: List[str]) -> List[List[float]]:

@@ -47,25 +47,33 @@ def split_document(text, metadata={"course": "LLM"}, use_semantic=True):
     doc = Document(text=text, metadata=metadata)
 
     if use_semantic:
-        # Use semantic splitter with custom Vietnamese legal embeddings
-        # This ensures chunks break at semantic boundaries rather than arbitrary tokens
-        embed_model = CustomEmbeddingWrapper()
-        splitter = SemanticSplitterNodeParser(
-            buffer_size=1,  # Number of sentences to group together when evaluating semantic similarity
-            breakpoint_percentile_threshold=95,  # Threshold for semantic similarity to create a split
-            embed_model=embed_model,
-        )
-        logger.info(
-            "Using semantic splitter with custom embedding model for document chunking"
-        )
-    else:
-        # Fallback to token-based splitting
-        splitter = TokenTextSplitter(
-            chunk_size=512,  # Increased for better context
-            chunk_overlap=50,
-            separator=" ",
-        )
-        logger.info("Using token splitter for document chunking")
+        try:
+            # Use semantic splitter with custom Vietnamese legal embeddings
+            # This ensures chunks break at semantic boundaries rather than arbitrary tokens
+            embed_model = CustomEmbeddingWrapper()
+            splitter = SemanticSplitterNodeParser(
+                buffer_size=1,  # Number of sentences to group together when evaluating semantic similarity
+                breakpoint_percentile_threshold=95,  # Threshold for semantic similarity to create a split
+                embed_model=embed_model,
+            )
+            logger.info(
+                "Using semantic splitter with custom embedding model for document chunking"
+            )
+            nodes = splitter.get_nodes_from_documents([doc])
+            logger.info(f"Split document into {len(nodes)} chunks")
+            return nodes
+        except Exception as e:
+            logger.warning(
+                f"Semantic splitting failed, falling back to token splitter: {e}"
+            )
+
+    # Fallback to token-based splitting
+    splitter = TokenTextSplitter(
+        chunk_size=512,  # Increased for better context
+        chunk_overlap=50,
+        separator=" ",
+    )
+    logger.info("Using token splitter for document chunking")
 
     nodes = splitter.get_nodes_from_documents([doc])
     logger.info(f"Split document into {len(nodes)} chunks")
