@@ -1,0 +1,7 @@
+CREATE TABLE IF NOT EXISTS chat_history (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    session_id VARCHAR(255) NOT NULL,
+    role_name VARCHAR(50) NOT NULL,
+    message_text TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

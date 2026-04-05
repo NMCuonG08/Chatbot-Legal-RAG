@@ -1,0 +1,6 @@
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements_serving.txt /app/requirements_serving.txt
+RUN pip install --no-cache-dir -r /app/requirements_serving.txt
+COPY scripts /app/scripts
+CMD ["python", "scripts/serve_model.py"]

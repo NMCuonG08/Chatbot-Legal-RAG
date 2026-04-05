@@ -1,0 +1,7 @@
+services:
+  embed-serving:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu-serving
+    ports:
+      - "9000:9000"

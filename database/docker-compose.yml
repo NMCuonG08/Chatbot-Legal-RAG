@@ -1,0 +1,10 @@
+services:
+  mariadb:
+    image: mariadb:11
+    environment:
+      MYSQL_DATABASE: legal_db
+      MYSQL_USER: legal
+      MYSQL_PASSWORD: legal
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
