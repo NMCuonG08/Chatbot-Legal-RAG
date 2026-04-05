@@ -52,6 +52,10 @@ htmlcov/
 qdrant_storage/
 *.sqlite3
 
+data/
+backend/data/
+data_pipeline/data/
+
 # Project-specific generated artifacts
 llm_finetuning_serving/final_model/
 llm_finetuning_serving/outputs/

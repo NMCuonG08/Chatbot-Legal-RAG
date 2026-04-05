@@ -1,11 +1,13 @@
 import asyncio
+from functools import lru_cache
 import logging
 from copy import copy
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, TypedDict
 
 from celery import shared_task
 from dotenv import load_dotenv
+from langgraph.graph import END, START, StateGraph
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -36,6 +38,14 @@ from vectorize import add_vector, search_vector
 
 setup_logging()
 logger = logging.getLogger(__name__)
+
+
+class ChatGraphState(TypedDict, total=False):
+    history: List[Dict]
+    question: str
+    route: str
+    standalone_question: str
+    response: str
 
 celery_app = get_celery_app(__name__)
 celery_app.autodiscover_tasks()
@@ -117,26 +127,19 @@ def retrieve_with_multi_query_fallback(
     return all_docs
 
 
-@shared_task()
-def bot_rag_answer_message(history, question):
+def generate_rag_answer(history, question):
+    """Pure function for RAG answer generation.
+
+    Expects an already-normalized question.
     """
-    Enhanced RAG pipeline with:
-    1. Follow-up question handling
-    2. Multi-query retrieval
-    3. Reranking
-    4. Improved prompting for Vietnamese legal context
-    """
-    # Step 1: Handle follow-up questions by rephrasing with context
-    standalone_question = follow_up_question(history, question)
+    standalone_question = question
     logger.info(f"Standalone question: {standalone_question}")
 
-    # Step 2: Generate multiple query variations for better retrieval coverage
     query_variations = rewrite_query_to_multi_queries(
         standalone_question, num_queries=3
     )
     logger.info(f"Query variations: {query_variations}")
 
-    # Step 3: Retrieve documents using hybrid search with fallback
     try:
         retrieved_docs = retrieve_with_hybrid_search(query_variations, top_k=4)
         logger.info(f"Hybrid search retrieved {len(retrieved_docs)} documents")
@@ -145,13 +148,9 @@ def bot_rag_answer_message(history, question):
         retrieved_docs = retrieve_with_multi_query_fallback(query_variations, top_k=4)
 
     logger.info(f"Retrieved {len(retrieved_docs)} documents before reranking")
-
-    # Step 4: Rerank documents based on relevance to the original question
-    # Use the standalone question for reranking to ensure relevance
     ranked_docs = rerank_documents(retrieved_docs, standalone_question, top_n=5)
     logger.info(f"Top {len(ranked_docs)} documents after reranking")
 
-    # Step 5: Construct enhanced prompt with legal context
     system_prompt = """Bạn là trợ lý AI chuyên về tư vấn pháp luật Việt Nam. Nhiệm vụ của bạn là:
 1. Trả lời câu hỏi dựa trên các tài liệu pháp luật được cung cấp
 2. Trích dẫn chính xác các điều khoản, khoản, điểm từ văn bản pháp luật
@@ -175,12 +174,139 @@ QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung c
     )
 
     logger.info(f"Sending {len(openai_messages)} messages to Vietnamese LLM")
-
-    # Step 6: Generate answer using Vietnamese Legal LLM
     assistant_answer = vietnamese_llm_chat_complete(openai_messages)
-
-    logger.info(f"Bot RAG reply generated successfully")
+    logger.info("Bot RAG reply generated successfully")
     return assistant_answer
+
+
+def generate_agent_answer(history, question):
+    logger.info("Using ReAct agent with tools")
+    return ai_agent_handle(question)
+
+
+def generate_web_search_answer(history, question):
+    logger.info("Using Tavily web search for query")
+    search_results = tavily_search_legal(question, max_results=5)
+
+    system_prompt = """Bạn là trợ lý AI giúp tìm kiếm thông tin pháp luật trên internet.
+    Hãy tổng hợp và trả lời câu hỏi dựa trên kết quả tìm kiếm được cung cấp."""
+
+    openai_messages = (
+        [{"role": "system", "content": system_prompt}]
+        + history
+        + [
+            {
+                "role": "user",
+                "content": f"Kết quả tìm kiếm:\n{search_results}\n\nCâu hỏi: {question}\n\nHãy tổng hợp thông tin và trả lời.",
+            }
+        ]
+    )
+
+    return openai_chat_complete(openai_messages)
+
+
+def generate_general_answer(history, question):
+    logger.info("Using general chat")
+
+    system_prompt = """Bạn là trợ lý AI thân thiện của hệ thống tư vấn pháp luật Việt Nam.
+Hãy trả lời lịch sự và hướng dẫn người dùng về các câu hỏi pháp luật bạn có thể giúp đỡ.
+
+Bạn có thể:
+- Trả lời câu hỏi về luật pháp Việt Nam
+- Tính toán phí phạt, chia thừa kế, kiểm tra tuổi pháp lý
+- Tìm kiếm thông tin pháp luật mới trên internet
+- Hướng dẫn thủ tục pháp lý"""
+
+    openai_messages = (
+        [{"role": "system", "content": system_prompt}]
+        + history
+        + [{"role": "user", "content": question}]
+    )
+
+    return vietnamese_llm_chat_complete(openai_messages)
+
+
+def _build_chat_graph():
+    graph = StateGraph(ChatGraphState)
+
+    def route_node(state: ChatGraphState):
+        history = state.get("history", [])
+        question = state.get("question", "")
+        route = detect_route(history, question)
+        standalone_question = question
+
+        if route != "general_chat":
+            standalone_question = follow_up_question(history, question)
+
+        return {
+            "route": route,
+            "standalone_question": standalone_question,
+        }
+
+    def legal_rag_node(state: ChatGraphState):
+        history = state.get("history", [])
+        question = state.get("standalone_question", state.get("question", ""))
+        return {"response": generate_rag_answer(history, question)}
+
+    def agent_tools_node(state: ChatGraphState):
+        history = state.get("history", [])
+        question = state.get("standalone_question", state.get("question", ""))
+        return {"response": generate_agent_answer(history, question)}
+
+    def web_search_node(state: ChatGraphState):
+        history = state.get("history", [])
+        question = state.get("standalone_question", state.get("question", ""))
+        return {"response": generate_web_search_answer(history, question)}
+
+    def general_chat_node(state: ChatGraphState):
+        history = state.get("history", [])
+        question = state.get("question", "")
+        return {"response": generate_general_answer(history, question)}
+
+    def choose_route(state: ChatGraphState):
+        return state.get("route", "general_chat")
+
+    graph.add_node("route", route_node)
+    graph.add_node("legal_rag", legal_rag_node)
+    graph.add_node("agent_tools", agent_tools_node)
+    graph.add_node("web_search", web_search_node)
+    graph.add_node("general_chat", general_chat_node)
+
+    graph.add_edge(START, "route")
+    graph.add_conditional_edges(
+        "route",
+        choose_route,
+        {
+            "legal_rag": "legal_rag",
+            "agent_tools": "agent_tools",
+            "web_search": "web_search",
+            "general_chat": "general_chat",
+        },
+    )
+
+    graph.add_edge("legal_rag", END)
+    graph.add_edge("agent_tools", END)
+    graph.add_edge("web_search", END)
+    graph.add_edge("general_chat", END)
+
+    return graph.compile()
+
+
+@lru_cache(maxsize=1)
+def get_chat_graph():
+    return _build_chat_graph()
+
+
+def run_chat_graph(history, question):
+    graph = get_chat_graph()
+    result = graph.invoke({"history": history, "question": question})
+    return result.get("response", "")
+
+
+@shared_task()
+def bot_rag_answer_message(history, question):
+    standalone_question = follow_up_question(history, question)
+    return generate_rag_answer(history, standalone_question)
 
 
 def index_document_v2(id, question, content, collection_name=DEFAULT_COLLECTION_NAME):
@@ -211,84 +337,7 @@ def get_summarized_response(response):
 
 @shared_task()
 def bot_route_answer_message(history, question):
-    """
-    Route user query to appropriate handler based on intent detection.
-
-    Routes:
-    - legal_rag: Use RAG system for legal questions
-    - agent_tools: Use ReAct agent with tools for calculations and validations
-    - web_search: Use Google search for current events
-    - general_chat: Handle with simple conversation
-    """
-    # Detect the appropriate route
-    route = detect_route(history, question)
-    logger.info(f"Selected route: {route}")
-
-    if route == "legal_rag":
-        # Use RAG system for legal questions
-        logger.info("Using RAG system for legal knowledge retrieval")
-        return bot_rag_answer_message(history, question)
-
-    elif route == "agent_tools":
-        # Use ReAct agent with tools for complex queries
-        logger.info("Using ReAct agent with tools")
-
-        # Rephrase question if it's a follow-up
-        standalone_question = follow_up_question(history, question)
-
-        # Use agent to handle the question
-        agent_response = ai_agent_handle(standalone_question)
-
-        logger.info("Agent response generated")
-        return agent_response
-
-    elif route == "web_search":
-        # Use Tavily AI search for current information
-        logger.info("Using Tavily web search for query")
-
-        # Rephrase question if it's a follow-up
-        standalone_question = follow_up_question(history, question)
-
-        # Search the web using Tavily
-        search_results = tavily_search_legal(standalone_question, max_results=5)
-
-        # Generate answer based on search results
-        system_prompt = """Bạn là trợ lý AI giúp tìm kiếm thông tin pháp luật trên internet.
-        Hãy tổng hợp và trả lời câu hỏi dựa trên kết quả tìm kiếm được cung cấp."""
-
-        openai_messages = (
-            [{"role": "system", "content": system_prompt}]
-            + history
-            + [
-                {
-                    "role": "user",
-                    "content": f"Kết quả tìm kiếm:\n{search_results}\n\nCâu hỏi: {question}\n\nHãy tổng hợp thông tin và trả lời.",
-                }
-            ]
-        )
-
-        return openai_chat_complete(openai_messages)
-
-    else:  # general_chat
-        # Handle general conversation
-        logger.info("Using general chat")
-
-        system_prompt = """Bạn là trợ lý AI thân thiện của hệ thống tư vấn pháp luật Việt Nam.
-Hãy trả lời lịch sự và hướng dẫn người dùng về các câu hỏi pháp luật bạn có thể giúp đỡ.
-
-Bạn có thể:
-- Trả lời câu hỏi về luật pháp Việt Nam
-- Tính toán phí phạt, chia thừa kế, kiểm tra tuổi pháp lý
-- Tìm kiếm thông tin pháp luật mới trên internet
-- Hướng dẫn thủ tục pháp lý"""
-
-        openai_messages = (
-            [{"role": "system", "content": system_prompt}]
-            + history
-            + [{"role": "user", "content": question}]
-        )
-
-        return vietnamese_llm_chat_complete(openai_messages)
+    return run_chat_graph(history, question)
 
 
 @shared_task()
@@ -316,9 +365,8 @@ def llm_handle_message(bot_id, user_id, question):
     logger.info("Conversation messages: %s", messages)
     history = messages[:-1]
 
-    # Use intelligent routing to handle the question
-    # This will automatically choose between RAG, web search, or general chat
-    response = bot_route_answer_message(history, question)
+    # Use LangGraph-based routing to handle the question.
+    response = run_chat_graph(history, question)
     logger.info(f"Chatbot response generated")
 
     # Summarize response for storage (optional, can be disabled if not needed)
