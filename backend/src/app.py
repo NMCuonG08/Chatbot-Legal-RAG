@@ -12,11 +12,13 @@ from pydantic import BaseModel
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 from models import (
+    delete_user_conversations,
     ensure_database_schema,
     insert_document,
     list_documents,
     list_user_conversations,
 )
+from cache import clear_conversation_id
 from tasks import index_document_v2, llm_handle_message
 from utils import setup_logging
 from vectorize import create_collection, list_collection_points, list_collections
@@ -82,6 +84,28 @@ async def get_user_history(user_id: str, limit: int = 100, offset: int = 0):
         "history": list_user_conversations(user_id, limit=limit, offset=offset),
         "limit": limit,
         "offset": offset,
+    }
+
+
+@app.delete("/history/{user_id}")
+async def delete_history(user_id: str, bot_id: str = "botLawyer"):
+    """Clear all chat history for a user, including from cache"""
+    logger.info(f"Deleting history for user {user_id} and bot {bot_id}")
+    
+    # Clear session from cache (Redis)
+    cache_cleared = clear_conversation_id(bot_id, user_id)
+    
+    # Clear records from database
+    db_cleared = delete_user_conversations(user_id)
+    
+    if not db_cleared:
+        raise HTTPException(status_code=500, detail="Failed to delete history from database")
+        
+    return {
+        "user_id": user_id,
+        "status": "success",
+        "cache_cleared": cache_cleared,
+        "db_cleared": db_cleared
     }
 
 

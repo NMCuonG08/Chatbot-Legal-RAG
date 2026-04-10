@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Script to split finetune dataset into train/test/valid splits
-and upload to Digital Ocean bucket and save locally.
+Script to split finetune dataset into train/test/valid splits and save locally.
 """
 
 import json
@@ -143,85 +142,7 @@ class DataSplitter:
         return file_paths
 
 
-class DOUploader:
-    def __init__(self, 
-                 access_key: str = None,
-                 secret_key: str = None,
-                 endpoint_url: str = "https://sfo3.digitaloceanspaces.com",
-                 bucket_name: str = "legal-datalake"):
-        """
-        Initialize Digital Ocean Spaces uploader
-        
-        Args:
-            access_key: DO Spaces access key (if None, will try environment variables)
-            secret_key: DO Spaces secret key (if None, will try environment variables)
-            endpoint_url: DO Spaces endpoint URL
-            bucket_name: Bucket name
-        """
-        self.bucket_name = bucket_name
-        
-        # Get credentials from environment if not provided
-        self.access_key = access_key or os.getenv('DO_SPACES_KEY')
-        self.secret_key = secret_key or os.getenv('DO_SPACES_SECRET')
-        
-        if not self.access_key or not self.secret_key:
-            logger.warning("Digital Ocean credentials not found. Please set DO_SPACES_ACCESS_KEY and DO_SPACES_SECRET_KEY environment variables")
-            self.client = None
-            return
-        
-        # Initialize DO Spaces client
-        try:
-            session = boto3.session.Session()
-            self.client = session.client('s3',
-                                       config=Config(s3={'addressing_style': 'virtual'}),
-                                       region_name='sfo3',
-                                       endpoint_url=endpoint_url,
-                                       aws_access_key_id=self.access_key,
-                                       aws_secret_access_key=self.secret_key)
-            logger.info(f"Digital Ocean Spaces client initialized for bucket: {bucket_name}")
-        except Exception as e:
-            logger.error(f"Failed to initialize DO Spaces client: {e}")
-            self.client = None
-    
-    def upload_file(self, local_file_path: str, remote_key: str):
-        """Upload a file to Digital Ocean Spaces"""
-        if not self.client:
-            logger.warning("DO Spaces client not available. Skipping upload.")
-            return False
-        
-        try:
-            file_size = os.path.getsize(local_file_path)
-            logger.info(f"Uploading {local_file_path} to s3://{self.bucket_name}/{remote_key} ({file_size / 1024 / 1024:.1f} MB)")
-            
-            with tqdm(total=file_size, unit='B', unit_scale=True, desc=f"Uploading {Path(local_file_path).name}") as pbar:
-                def upload_callback(bytes_transferred):
-                    pbar.update(bytes_transferred)
-                
-                self.client.upload_file(
-                    local_file_path, 
-                    self.bucket_name, 
-                    remote_key,
-                    Callback=upload_callback
-                )
-            
-            logger.info(f"Successfully uploaded {remote_key}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to upload {local_file_path}: {e}")
-            return False
-    
-    def upload_splits(self, file_paths: Dict[str, str], base_remote_path: str = "process_data/finetune_data/splits"):
-        """Upload all split files to DO Spaces"""
-        if not self.client:
-            logger.warning("DO Spaces client not available. Skipping all uploads.")
-            return
-        
-        logger.info(f"Uploading splits to {base_remote_path}/")
-        
-        for split_name, file_path in file_paths.items():
-            remote_key = f"{base_remote_path}/{split_name}.jsonl"
-            self.upload_file(file_path, remote_key)
+
 
 
 def main():
@@ -278,12 +199,8 @@ def main():
     # Run splitting
     file_paths = splitter.run_split()
     
-    # Upload to Digital Ocean Spaces if not skipped
-    if not args.skip_upload:
-        uploader = DOUploader(bucket_name=args.bucket_name)
-        uploader.upload_splits(file_paths, args.remote_path)
-    else:
-        logger.info("Skipping upload to Digital Ocean Spaces")
+    # No upload, only local save
+    logger.info("All splits saved locally. No upload performed.")
     
     # Print summary
     logger.info("\n" + "="*50)
@@ -294,10 +211,7 @@ def main():
         file_size = os.path.getsize(file_path) / 1024 / 1024
         logger.info(f"  {split_name}.jsonl: {file_size:.1f} MB")
     
-    if not args.skip_upload:
-        logger.info(f"\nRemote files uploaded to: s3://{args.bucket_name}/{args.remote_path}/")
-        for split_name in file_paths.keys():
-            logger.info(f"  {split_name}.jsonl")
+
 
 
 if __name__ == "__main__":

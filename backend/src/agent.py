@@ -1,6 +1,14 @@
+import asyncio
+import inspect
 import json
 import logging
 import os
+
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except ImportError:
+    pass
 from typing import Dict
 
 from celery import shared_task
@@ -277,9 +285,79 @@ def ai_agent_handle(question: str) -> str:
             )
 
         logger.info(f"[AGENT] Processing question: {question}")
-        response = ai_agent.chat(question)
+        
+        # Robust execution wrapper to handle different LlamaIndex versions and event loops
+        async def _safe_execute_agent():
+            # Try async methods first (modern llama-index)
+            # Newer ReActAgent (Workflow) uses run/arun which often returns a WorkflowHandler
+            if hasattr(ai_agent, "arun"):
+                # Try with 'input' keyword (modern Workflow) or positional
+                try:
+                    result = await ai_agent.arun(input=question)
+                except Exception:
+                    result = await ai_agent.arun(question)
+                
+                # If result is a WorkflowHandler, we need to await it to get the actual response
+                if inspect.isawaitable(result) or hasattr(result, "__await__"):
+                    result = await result
+                return result
+
+            if hasattr(ai_agent, "achat"):
+                return await ai_agent.achat(question)
+            
+            # Sync fallbacks
+            if hasattr(ai_agent, "run"):
+                result = ai_agent.run(question)
+                if inspect.isawaitable(result) or hasattr(result, "__await__"):
+                    result = await result
+                return result
+                
+            if hasattr(ai_agent, "chat"):
+                return ai_agent.chat(question)
+            
+            raise AttributeError(f"Agent {type(ai_agent)} has no execution method (run/arun/chat/achat)")
+
+        try:
+            # Use asyncio.run for clean loop management in each Celery task
+            logger.info(f"[AGENT] Running agent (Type: {type(ai_agent)})")
+            result = asyncio.run(_safe_execute_agent())
+        except Exception as e:
+            if "already running" in str(e).lower():
+                logger.info("[AGENT] Loop already running, applying nest_asyncio")
+                import nest_asyncio
+                nest_asyncio.apply()
+                # Use current loop
+                loop = asyncio.get_event_loop()
+                result = loop.run_until_complete(_safe_execute_agent())
+            else:
+                raise e
+
         logger.info(f"[AGENT] Response generated successfully")
-        return response.response
+        
+        # Extract text content and ensure it's a clean string (no 'assistant:' prefix)
+        res_text = ""
+        if isinstance(result, str):
+            res_text = result
+        elif hasattr(result, "response"):
+            # Result is often an AgentOutput/Response object
+            inner = result.response
+            if hasattr(inner, "content"):
+                res_text = str(inner.content)
+            elif hasattr(inner, "text"):
+                res_text = str(inner.text)
+            else:
+                res_text = str(inner)
+        elif hasattr(result, "content"):
+            res_text = str(result.content)
+        else:
+            res_text = str(result)
+            
+        # Clean up common prefixes
+        if res_text.startswith("assistant: "):
+            res_text = res_text[len("assistant: "):]
+            
+        logger.info(f"[AGENT] Clean response extracted (length: {len(res_text)})")
+        return res_text
     except Exception as e:
         logger.error(f"[AGENT] Error: {e}")
         return f"Xin lỗi, đã xảy ra lỗi khi xử lý câu hỏi: {str(e)}"

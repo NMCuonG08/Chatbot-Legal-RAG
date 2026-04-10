@@ -12,3 +12,4 @@ cohere
 langgraph>=0.2,<0.3
 llama-index-llms-openai
 llama-index-retrievers-bm25
+nest_asyncio==1.6.0

@@ -34,11 +34,7 @@ services:
       # Optional: Hugging Face
       - HF_TOKEN=${HF_TOKEN}
       
-      # Optional: Digital Ocean Spaces
-      - DO_SPACES_KEY=${DO_SPACES_KEY}
-      - DO_SPACES_SECRET=${DO_SPACES_SECRET}
-      - DO_SPACES_ENDPOINT=${DO_SPACES_ENDPOINT}
-      - DO_SPACES_BUCKET=${DO_SPACES_BUCKET}
+
     
     # Volumes
     volumes:

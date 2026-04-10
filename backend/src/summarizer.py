@@ -35,8 +35,14 @@ def summarize_text(text):
 
     messages = [HumanMessage(content=prompt)]
     try:
-        summary = summarizer_model(messages)
-        return summary.content
+        # Sử dụng .invoke hoặc .chat tuỳ theo API của ChatGroq
+        if hasattr(summarizer_model, "invoke"):
+            summary = summarizer_model.invoke(messages)
+        elif hasattr(summarizer_model, "chat"):
+            summary = summarizer_model.chat(messages=messages)
+        else:
+            raise Exception("summarizer_model does not support .invoke or .chat method")
+        return summary.content if hasattr(summary, "content") else str(summary)
     except Exception as e:
         import logging
         logger = logging.getLogger(__name__)

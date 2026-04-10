@@ -146,6 +146,21 @@ def list_user_conversations(user_id: str, limit: int = 100, offset: int = 0):
         db.close()
 
 
+def delete_user_conversations(user_id: str):
+    """Delete all chat history for a specific user"""
+    db = _new_db_session()
+    try:
+        db.query(ChatConversation).filter(ChatConversation.user_id == user_id).delete()
+        db.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Error deleting user conversations: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
 class Document(Base):
     __tablename__ = "document"
 

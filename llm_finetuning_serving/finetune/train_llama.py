@@ -82,19 +82,19 @@ class FineTuneConfig:
 class LlamaFineTuner:
     def __init__(self, config: FineTuneConfig, data_dir: str):
         self.config = config
-        self.data_dir = Path(data_dir)
+        # Chuẩn hóa đường dẫn dữ liệu và output cho phù hợp workspace
+        self.data_dir = Path(data_dir).resolve()
         self.model = None
         self.tokenizer = None
         self.trainer = None
-        
-        # Setup output directory
-        self.output_dir = Path(config.output_dir)
+
+        # Setup output directory (outputs/ nằm trong finetune/)
+        self.output_dir = (Path(__file__).parent / "outputs").resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Save config
         with open(self.output_dir / "config.json", 'w') as f:
-            config_dict = {k: v for k, v in config.__dict__.items() 
-                          if not k.startswith('_')}
+            config_dict = {k: v for k, v in config.__dict__.items() if not k.startswith('_')}
             if config_dict.get('dtype'):
                 config_dict['dtype'] = str(config_dict['dtype'])
             json.dump(config_dict, f, indent=2)
@@ -139,34 +139,14 @@ class LlamaFineTuner:
             logger.info(f"📊 GPU Memory: {gpu_allocated:.1f}GB / {gpu_memory:.1f}GB used")
         
     def load_datasets(self) -> Dict[str, Dataset]:
-        """Load train, validation, and test datasets from Digital Ocean Spaces"""
-        logger.info("Loading train, validation, and test datasets from Digital Ocean Spaces...")
-        
-        try:
-            spaces_manager = DOSpacesManager()
-            
-            local_data_dir = Path("../data_processing/splits")
-            local_data_dir.mkdir(parents=True, exist_ok=True)
-            
-            files_to_download = [
-                ("process_data/finetune_data/splits/train.jsonl", str(local_data_dir / "train.jsonl")),
-                ("process_data/finetune_data/splits/valid.jsonl", str(local_data_dir / "valid.jsonl")),
-                ("process_data/finetune_data/splits/test.jsonl", str(local_data_dir / "test.jsonl")),
-            ]
-            
-            for spaces_path, local_path in files_to_download:
-                if not Path(local_path).exists():
-                    logger.info(f"Downloading {spaces_path}...")
-                    spaces_manager.download_file(spaces_path, local_path, show_progress=False)
-                    
-        except Exception as e:
-            logger.warning(f"Could not download from DO Spaces: {e}")
-            logger.info("Using local data files...")
-        
+        """Load train, validation, and test datasets from local splits directory"""
+        logger.info("Loading train, validation, and test datasets from local splits directory...")
+
         datasets = {}
-        
+        splits_dir = (Path(__file__).parent.parent / "data_processing" / "splits").resolve()
+
         # Load train dataset
-        train_path = Path("../data_processing/splits/train.jsonl")
+        train_path = splits_dir / "train.jsonl"
         if train_path.exists():
             train_data = []
             with open(train_path, 'r', encoding='utf-8') as f:
@@ -176,9 +156,9 @@ class LlamaFineTuner:
             logger.info(f"✅ Loaded {len(train_data)} training examples")
         else:
             raise FileNotFoundError(f"Training data not found: {train_path}")
-        
+
         # Load validation dataset
-        val_path = Path("../data_processing/splits/valid.jsonl")
+        val_path = splits_dir / "valid.jsonl"
         if val_path.exists():
             val_data = []
             with open(val_path, 'r', encoding='utf-8') as f:
@@ -188,9 +168,9 @@ class LlamaFineTuner:
             logger.info(f"✅ Loaded {len(val_data)} validation examples")
         else:
             logger.warning("Validation data not found - training without validation")
-        
+
         # Load test dataset
-        test_path = Path("../data_processing/splits/test.jsonl")
+        test_path = splits_dir / "test.jsonl"
         if test_path.exists():
             test_data = []
             with open(test_path, 'r', encoding='utf-8') as f:
@@ -200,7 +180,7 @@ class LlamaFineTuner:
             logger.info(f"✅ Loaded {len(test_data)} test examples")
         else:
             logger.warning("Test data not found - will skip final testing")
-        
+
         # Summary
         logger.info("📊 Dataset Summary:")
         logger.info(f"   🏋️ Train: {len(datasets.get('train', []))} examples")
@@ -208,7 +188,7 @@ class LlamaFineTuner:
         logger.info(f"   🧪 Test: {len(datasets.get('test', []))} examples")
         total_examples = sum(len(ds) for ds in datasets.values())
         logger.info(f"   📊 Total: {total_examples} examples")
-        
+
         return datasets
     
     def apply_chat_template_to_datasets(self, datasets: Dict[str, Dataset]) -> Dict[str, Dataset]:
@@ -542,12 +522,12 @@ def main(gpu_type: str = "h200"):
             run_name=f"vietnamese-legal-llama-h200-MAXIMIZED-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         )
     
-    # Update output directory
-    config.output_dir = "/home/mikeethanh/Vietnamese-Legal-Chatbot-RAG-System/llm_finetuning_serving/finetune/outputs"
-    
-    # Data directory
-    data_dir = "/home/mikeethanh/Vietnamese-Legal-Chatbot-RAG-System/llm_finetuning_serving/data_processing/splits"
-    
+    # Update output directory (outputs/ nằm trong finetune/)
+    config.output_dir = str((Path(__file__).parent / "outputs").resolve())
+
+    # Data directory (splits/ nằm trong data_processing/)
+    data_dir = str((Path(__file__).parent.parent / "data_processing" / "splits").resolve())
+
     # Initialize trainer
     logger.info("🚀 Initializing Vietnamese Legal LLM Fine-tuner with Unsloth")
     logger.info("� H200 MAXIMIZED Configuration (140GB VRAM AGGRESSIVE USAGE):")
@@ -562,7 +542,7 @@ def main(gpu_type: str = "h200"):
     logger.info(f"   - Optimizer: {config.optim} (full precision for H200)")
     logger.info(f"   - Expected VRAM: ~80-120GB (maximizing 140GB capacity)")
     logger.info(f"   - Data workers: {getattr(config, 'dataloader_num_workers', 8)} parallel")
-    
+
     finetuner = LlamaFineTuner(config, data_dir)
     
     try:

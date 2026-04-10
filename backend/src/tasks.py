@@ -369,15 +369,8 @@ def llm_handle_message(bot_id, user_id, question):
     response = run_chat_graph(history, question)
     logger.info(f"Chatbot response generated")
 
-    # Summarize response for storage (optional, can be disabled if not needed)
-    try:
-        summarized_response = get_summarized_response(response)
-    except Exception as e:
-        logger.warning(f"Failed to summarize response: {e}, using original")
-        summarized_response = response
-
-    # Save response to history
-    update_chat_conversation(bot_id, user_id, summarized_response, False)
+    # Save full response to history (to preserve all details like the specific age)
+    update_chat_conversation(bot_id, user_id, response, False)
 
     # Return full response
     return {"role": "assistant", "content": response}
