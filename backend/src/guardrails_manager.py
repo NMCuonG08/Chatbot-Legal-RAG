@@ -147,18 +147,16 @@ class LegalGuardrailsManager:
         try:
             logger.info("[GUARDRAILS] Running RAG Hallucination checks...")
             
-            # We pass the retrieved document context to check if output is grounded.
-            context = {"context": doc_context}
             messages = [
-                {"role": "context", "content": doc_context},
+                {"role": "context", "content": {"context": doc_context}},
                 {"role": "assistant", "content": response_text}
             ]
             
             # Use generate_async with the context passed
             if hasattr(self.rails, "generate_async"):
-                response = await self.rails.generate_async(messages=messages, meta=context)
+                response = await self.rails.generate_async(messages=messages)
             else:
-                response = self.rails.generate(messages=messages, meta=context)
+                response = self.rails.generate(messages=messages)
                 
             if response:
                 if isinstance(response, dict):
