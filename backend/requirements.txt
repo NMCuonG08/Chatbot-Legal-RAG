@@ -14,7 +14,7 @@ llama-index-llms-openai
 llama-index-retrievers-bm25
 nest_asyncio==1.6.0
 nemoguardrails
-qdrant-client
+qdrant-client==1.11.1
 langchain-openai
 llama-index-llms-groq
 

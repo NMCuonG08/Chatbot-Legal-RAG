@@ -59,7 +59,6 @@ def initialize_search_index(documents: List[Dict]) -> bool:
                 text=text,
                 metadata={
                     "question": doc.get('question', ''),
-                    "content": doc.get('content', ''),
                     "source": doc.get('source', 'unknown'),
                     "doc_id": doc.get('doc_id', i)
                 }

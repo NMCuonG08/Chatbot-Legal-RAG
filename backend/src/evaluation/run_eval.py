@@ -33,6 +33,9 @@ SRC_DIR = Path(__file__).resolve().parents[1]
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from dotenv import load_dotenv
+load_dotenv(SRC_DIR.parent / ".env")
+
 logger = logging.getLogger(__name__)
 
 
