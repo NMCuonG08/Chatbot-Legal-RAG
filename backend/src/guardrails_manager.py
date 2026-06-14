@@ -17,6 +17,7 @@ class LegalGuardrailsManager:
 
     def _init_engine(self):
         try:
+            import os
             from nemoguardrails import RailsConfig, LLMRails
             
             config_dir = Path(__file__).parent.resolve() / "guardrails"
@@ -26,6 +27,40 @@ class LegalGuardrailsManager:
                 
             logger.info(f"Loading NeMo Guardrails config from {config_dir}")
             config = RailsConfig.from_path(str(config_dir))
+            
+            # --- Dynamic LLM Configuration via Environment Variables ---
+            llm_provider = os.environ.get("LLM_PROVIDER", "groq").lower()
+            llm_model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
+            
+            logger.info(f"[GUARDRAILS] Configuring NeMo LLM engine - Provider: {llm_provider}, Model: {llm_model}")
+            
+            if config.models:
+                config.models[0].engine = llm_provider
+                config.models[0].model = llm_model
+                
+                # Configure specific provider details
+                if llm_provider == "ollama":
+                    ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+                    api_key = os.environ.get("OLLAMA_API_KEY")
+                    if api_key:
+                        logger.info("[GUARDRAILS] Ollama API key detected. Routing Ollama Cloud through OpenAI engine compatibility layer.")
+                        config.models[0].engine = "openai"
+                        config.models[0].parameters = {
+                            "openai_api_base": f"{ollama_url.rstrip('/')}/v1"
+                        }
+                        os.environ["OPENAI_API_KEY"] = api_key
+                    else:
+                        config.models[0].engine = "ollama"
+                        config.models[0].parameters = {
+                            "base_url": ollama_url
+                        }
+                elif llm_provider == "openai":
+                    openai_base = os.environ.get("OPENAI_API_BASE")
+                    if openai_base:
+                        config.models[0].parameters = {
+                            "openai_api_base": openai_base
+                        }
+            
             self.rails = LLMRails(config)
             self.initialized = True
             logger.info("✅ NVIDIA NeMo Guardrails initialized successfully")

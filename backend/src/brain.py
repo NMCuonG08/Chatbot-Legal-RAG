@@ -11,11 +11,18 @@ from custom_embedding import get_custom_embedding
 logger = logging.getLogger(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", default=None)
-VIETNAMESE_LLM_API_URL = os.environ.get("VIETNAMESE_LLM_API_URL", default="http://http://3.89.75.45:6000/v1/chat/completions")
+VIETNAMESE_LLM_API_URL = os.environ.get("VIETNAMESE_LLM_API_URL", default="http://3.89.75.45:6000/v1/chat/completions")
 
 
 def get_groq_client():
-    return Groq(api_key=GROQ_API_KEY)
+    if not GROQ_API_KEY:
+        logger.warning("GROQ_API_KEY is not configured in the environment.")
+        return None
+    try:
+        return Groq(api_key=GROQ_API_KEY)
+    except Exception as e:
+        logger.warning(f"Could not initialize Groq client: {e}")
+        return None
 
 
 client = get_groq_client()
@@ -61,27 +68,96 @@ def vietnamese_llm_chat_complete(messages=(), temperature=0.7, max_tokens=512):
         return groq_chat_complete(messages)
 
 
-def groq_chat_complete(messages=(), model="llama-3.1-8b-instant", raw=False):
-    """Chat completion using Groq API with better models for Vietnamese"""
-    logger.info("Chat complete for {}".format(messages))
-    if not GROQ_API_KEY:
-        logger.warning("GROQ_API_KEY not set, returning empty response")
-        return "Error: GROQ_API_KEY not configured"
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_tokens=2048,
-            temperature=0.7
-        )
-        if raw:
-            return response.choices[0].message
-        output = response.choices[0].message
-        logger.info(f"Chat complete output: {output.content[:100]}")
-        return output.content
-    except Exception as e:
-        logger.error(f"Groq API error: {e}")
-        return f"Error: {str(e)}"
+def groq_chat_complete(messages=(), model=None, raw=False):
+    """Generic chat completion routing to Groq, Ollama, or OpenAI based on env variables"""
+    llm_provider = os.environ.get("LLM_PROVIDER", "groq").lower()
+    default_model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
+    model_name = model or default_model
+    
+    logger.info(f"Chat complete using provider: {llm_provider}, model: {model_name}")
+    
+    if llm_provider == "groq":
+        if not GROQ_API_KEY:
+            logger.warning("GROQ_API_KEY not set, returning empty response")
+            return "Error: GROQ_API_KEY not configured"
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                max_tokens=2048,
+                temperature=0.7
+            )
+            if raw:
+                return response.choices[0].message
+            output = response.choices[0].message
+            logger.info(f"Chat complete output: {output.content[:100]}")
+            return output.content
+        except Exception as e:
+            logger.error(f"Groq API error: {e}")
+            return f"Error: {str(e)}"
+            
+    elif llm_provider == "ollama":
+        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        try:
+            openai_url = f"{ollama_url.rstrip('/')}/v1"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 2048
+            }
+            api_key = os.environ.get("OLLAMA_API_KEY")
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+                
+            response = requests.post(f"{openai_url}/chat/completions", headers=headers, json=payload, timeout=60)
+            if response.status_code == 200:
+                result = response.json()
+                content = result["choices"][0]["message"]["content"]
+                logger.info(f"Ollama chat complete output: {content[:100]}")
+                if raw:
+                    from types import SimpleNamespace
+                    return SimpleNamespace(content=content)
+                return content
+            else:
+                logger.error(f"Ollama API error: {response.status_code} - {response.text}")
+                return f"Error: Ollama API returned {response.status_code}"
+        except Exception as e:
+            logger.error(f"Ollama API error: {e}")
+            return f"Error: {str(e)}"
+            
+    elif llm_provider == "openai":
+        openai_key = os.environ.get("OPENAI_API_KEY")
+        openai_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
+        if not openai_key:
+            return "Error: OPENAI_API_KEY not configured"
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {openai_key}"
+            }
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 2048
+            }
+            response = requests.post(f"{openai_base}/chat/completions", headers=headers, json=payload, timeout=60)
+            if response.status_code == 200:
+                result = response.json()
+                content = result["choices"][0]["message"]["content"]
+                if raw:
+                    from types import SimpleNamespace
+                    return SimpleNamespace(content=content)
+                return content
+            else:
+                return f"Error: OpenAI API returned {response.status_code}"
+        except Exception as e:
+            return f"Error: {str(e)}"
+            
+    else:
+        return f"Error: Unsupported LLM provider {llm_provider}"
 
 
 # Keep openai_chat_complete as alias for backward compatibility

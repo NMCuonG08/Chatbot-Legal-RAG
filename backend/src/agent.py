@@ -235,11 +235,43 @@ all_tools = [
     quick_answer_tool_func,
 ]
 
-# Initialize LLM and Agent with Groq
-groq_api_key = os.environ.get("GROQ_API_KEY")
-llm = Groq(model="llama-3.1-8b-instant", api_key=groq_api_key, temperature=0.1) if groq_api_key else None
-if not llm:
-    logger.warning("GROQ_API_KEY not set, agent initialization may fail")
+# Initialize LLM and Agent dynamically based on environment variables
+llm_provider = os.environ.get("LLM_PROVIDER", "groq").lower()
+llm_model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
+llm = None
+
+logger.info(f"Initializing LlamaIndex Agent LLM - Provider: {llm_provider}, Model: {llm_model}")
+
+if llm_provider == "groq":
+    from llama_index.llms.groq import Groq
+    groq_api_key = os.environ.get("GROQ_API_KEY")
+    if groq_api_key:
+        llm = Groq(model=llm_model, api_key=groq_api_key, temperature=0.1)
+    else:
+        logger.warning("GROQ_API_KEY not set, agent initialization may fail")
+elif llm_provider == "ollama":
+    from llama_index.llms.ollama import Ollama
+    ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+    api_key = os.environ.get("OLLAMA_API_KEY")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+    llm = Ollama(
+        model=llm_model, 
+        base_url=ollama_url, 
+        temperature=0.1, 
+        request_timeout=60.0,
+        headers=headers
+    )
+elif llm_provider == "openai":
+    from llama_index.llms.openai import OpenAI
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    openai_base = os.environ.get("OPENAI_API_BASE")
+    llm = OpenAI(model=llm_model, api_key=openai_key, api_base=openai_base, temperature=0.1)
+else:
+    logger.warning(f"Unsupported LLM provider: {llm_provider}. Falling back to Groq.")
+    from llama_index.llms.groq import Groq
+    groq_api_key = os.environ.get("GROQ_API_KEY")
+    if groq_api_key:
+        llm = Groq(model=llm_model, api_key=groq_api_key, temperature=0.1)
 
 # Create agent with Vietnamese legal context
 agent_system_prompt = """Bạn là trợ lý AI chuyên về tư vấn pháp luật Việt Nam với khả năng sử dụng các công cụ.
