@@ -17,4 +17,4 @@ nemoguardrails
 qdrant-client==1.11.1
 langchain-openai
 llama-index-llms-groq
-
+sentence-transformers

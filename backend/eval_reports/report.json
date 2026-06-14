@@ -1,0 +1,144 @@
+{
+  "generated_at": "2026-06-14T16:50:27.408714Z",
+  "mode": "retrieval",
+  "n_samples": 5,
+  "seed": 42,
+  "top_k": 10,
+  "retrieval_results": {
+    "vector": {
+      "metrics": {
+        "n_queries": 5,
+        "hit@1": 0.0,
+        "recall@1": 0.0,
+        "ndcg@1": 0.0,
+        "hit@3": 0.0,
+        "recall@3": 0.0,
+        "ndcg@3": 0.0,
+        "hit@5": 0.0,
+        "recall@5": 0.0,
+        "ndcg@5": 0.0,
+        "hit@10": 0.2,
+        "recall@10": 0.2,
+        "ndcg@10": 0.05781296526357758,
+        "mrr": 0.02,
+        "latency_ms_mean": 3515.684599998349,
+        "latency_ms_p95": 13464.138199997251
+      },
+      "ranks": [
+        0,
+        0,
+        0,
+        0,
+        10
+      ]
+    },
+    "hybrid": {
+      "metrics": {
+        "n_queries": 5,
+        "hit@1": 0.0,
+        "recall@1": 0.0,
+        "ndcg@1": 0.0,
+        "hit@3": 0.0,
+        "recall@3": 0.0,
+        "ndcg@3": 0.0,
+        "hit@5": 0.0,
+        "recall@5": 0.0,
+        "ndcg@5": 0.0,
+        "hit@10": 0.0,
+        "recall@10": 0.0,
+        "ndcg@10": 0.0,
+        "mrr": 0.0,
+        "latency_ms_mean": 1229.6863399998983,
+        "latency_ms_p95": 6028.325100000075
+      },
+      "ranks": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "hybrid_rerank": {
+      "metrics": {
+        "n_queries": 5,
+        "hit@1": 0.0,
+        "recall@1": 0.0,
+        "ndcg@1": 0.0,
+        "hit@3": 0.2,
+        "recall@3": 0.2,
+        "ndcg@3": 0.1261859507142915,
+        "hit@5": 0.2,
+        "recall@5": 0.2,
+        "ndcg@5": 0.1261859507142915,
+        "hit@10": 0.2,
+        "recall@10": 0.2,
+        "ndcg@10": 0.1261859507142915,
+        "mrr": 0.1,
+        "latency_ms_mean": 63091.296379998676,
+        "latency_ms_p95": 137640.76389999536
+      },
+      "ranks": [
+        0,
+        0,
+        0,
+        0,
+        2
+      ]
+    },
+    "multi_query": {
+      "metrics": {
+        "n_queries": 5,
+        "hit@1": 0.0,
+        "recall@1": 0.0,
+        "ndcg@1": 0.0,
+        "hit@3": 0.0,
+        "recall@3": 0.0,
+        "ndcg@3": 0.0,
+        "hit@5": 0.0,
+        "recall@5": 0.0,
+        "ndcg@5": 0.0,
+        "hit@10": 0.0,
+        "recall@10": 0.0,
+        "ndcg@10": 0.0,
+        "mrr": 0.0,
+        "latency_ms_mean": 2754.175520001445,
+        "latency_ms_p95": 4756.312999998045
+      },
+      "ranks": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ]
+    },
+    "full": {
+      "metrics": {
+        "n_queries": 5,
+        "hit@1": 0.0,
+        "recall@1": 0.0,
+        "ndcg@1": 0.0,
+        "hit@3": 0.2,
+        "recall@3": 0.2,
+        "ndcg@3": 0.1261859507142915,
+        "hit@5": 0.2,
+        "recall@5": 0.2,
+        "ndcg@5": 0.1261859507142915,
+        "hit@10": 0.2,
+        "recall@10": 0.2,
+        "ndcg@10": 0.1261859507142915,
+        "mrr": 0.1,
+        "latency_ms_mean": 53589.80959999899,
+        "latency_ms_p95": 86502.09589999577
+      },
+      "ranks": [
+        0,
+        0,
+        0,
+        0,
+        2
+      ]
+    }
+  }
+}

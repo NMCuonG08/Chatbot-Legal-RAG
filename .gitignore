@@ -64,3 +64,7 @@ llm_finetuning_serving/final_model/
 llm_finetuning_serving/outputs/
 llm_finetuning_serving/checkpoints/
 
+# Gradio cache
+.gradio/
+
+

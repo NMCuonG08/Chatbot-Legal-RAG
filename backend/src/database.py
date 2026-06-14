@@ -85,6 +85,8 @@ def get_celery_app(name):
         accept_content=["json"],
         timezone="Asia/Ho_Chi_Minh",  # Set to a city in UTC+7
         enable_utc=True,
+        result_backend_transport_options={"redis_client_args": {"protocol": 2}},
+        broker_transport_options={"redis_client_args": {"protocol": 2}},
     )
 
     # Configure Celery logging
