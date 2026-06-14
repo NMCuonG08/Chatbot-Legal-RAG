@@ -48,6 +48,14 @@ def contract_penalty_calculator(
     Returns:
         Kết quả tính toán tiền phạt chi tiết
     """
+    # Tool Guardrail: Validate value range to prevent negative values or massive integers
+    if contract_value <= 0 or contract_value > 10**12:
+        return json.dumps({"error": "Giá trị hợp đồng không hợp lệ (phải từ 0 đến 1,000 tỷ VNĐ)"}, ensure_ascii=False)
+    if penalty_rate < 0 or penalty_rate > 100:
+        return json.dumps({"error": "Tỷ lệ phạt không hợp lệ (phải từ 0% đến 100%)"}, ensure_ascii=False)
+    if days_late < 0 or days_late > 3650:
+        return json.dumps({"error": "Số ngày chậm trễ không hợp lệ (phải từ 0 đến 3650 ngày - 10 năm)"}, ensure_ascii=False)
+
     result = calculate_contract_penalty(contract_value, penalty_rate, days_late)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -63,6 +71,15 @@ def legal_age_checker(birth_year: int, action_type: str = "sign_contract") -> st
     Returns:
         Thông tin về khả năng pháp lý và căn cứ pháp luật
     """
+    # Tool Guardrail: Validate parameters
+    current_year = 2026
+    if birth_year < 1900 or birth_year > current_year:
+        return json.dumps({"error": f"Năm sinh không hợp lệ (phải từ 1900 đến {current_year})"}, ensure_ascii=False)
+        
+    valid_actions = ["sign_contract", "marriage", "work", "criminal_responsibility"]
+    if action_type not in valid_actions:
+        return json.dumps({"error": f"Loại hành vi không hợp lệ. Các loại hợp lệ: {', '.join(valid_actions)}"}, ensure_ascii=False)
+
     result = check_legal_entity_age(birth_year, action_type)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -78,6 +95,10 @@ def inheritance_calculator(total_value: float, heirs_json: str) -> str:
     Returns:
         Phân chia tài sản thừa kế cho từng người
     """
+    # Tool Guardrail: Validate range
+    if total_value <= 0 or total_value > 10**12:
+        return json.dumps({"error": "Tổng giá trị tài sản không hợp lệ (phải từ 0 đến 1,000 tỷ VNĐ)"}, ensure_ascii=False)
+
     try:
         heirs = json.loads(heirs_json)
         result = calculate_inheritance_share(total_value, heirs)
@@ -98,6 +119,12 @@ def business_name_validator(business_name: str) -> str:
     Returns:
         Kết quả kiểm tra tính hợp lệ và các lưu ý
     """
+    # Tool Guardrail: Validate input length
+    if not business_name or len(business_name.strip()) == 0:
+        return json.dumps({"error": "Tên doanh nghiệp không được để trống"}, ensure_ascii=False)
+    if len(business_name) > 200:
+        return json.dumps({"error": "Tên doanh nghiệp quá dài (tối đa 200 ký tự)"}, ensure_ascii=False)
+
     result = check_business_name_rules(business_name)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -112,6 +139,11 @@ def statute_lookup(case_type: str) -> str:
     Returns:
         Thông tin về thời hiệu và căn cứ pháp lý
     """
+    # Tool Guardrail: Validate type
+    valid_cases = ["civil", "labor", "administrative", "criminal"]
+    if case_type not in valid_cases:
+        return json.dumps({"error": f"Loại vụ việc không hợp lệ. Các loại hợp lệ: {', '.join(valid_cases)}"}, ensure_ascii=False)
+
     result = get_statute_of_limitations(case_type)
     return json.dumps(result, ensure_ascii=False, indent=2)
 

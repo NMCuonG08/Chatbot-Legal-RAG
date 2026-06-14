@@ -1,0 +1,28 @@
+models:
+  - type: main
+    engine: groq
+    model: llama-3.1-8b-instant
+
+rails:
+  input:
+    flows:
+      - jailbreak
+      - political topic
+      - toxicity
+  output:
+    flows:
+      - toxicity
+
+prompts:
+  - task: check_hallucination
+    content: |
+      Bạn là chuyên gia thẩm định thông tin pháp lý của Việt Nam. Nhiệm vụ của bạn là xác định xem câu trả lời của trợ lý có được chứng minh hoàn toàn bởi các tài liệu tham khảo được cung cấp hay không.
+      Không tự bổ sung các thông tin ngoài tài liệu.
+      
+      Tài liệu tham khảo:
+      {{ context }}
+      
+      Câu trả lời của trợ lý:
+      {{ response }}
+      
+      Câu trả lời của trợ lý có hoàn toàn đúng sự thật và được chứng minh đầy đủ bởi tài liệu tham khảo không? Trả lời 'yes' hoặc 'no'.

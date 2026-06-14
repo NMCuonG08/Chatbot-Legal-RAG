@@ -39,6 +39,9 @@ from vectorize import add_vector, search_vector
 setup_logging()
 logger = logging.getLogger(__name__)
 
+from guardrails_manager import LegalGuardrailsManager
+guardrails_manager = LegalGuardrailsManager()
+
 
 class ChatGraphState(TypedDict, total=False):
     history: List[Dict]
@@ -176,6 +179,17 @@ QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung c
     logger.info(f"Sending {len(openai_messages)} messages to Vietnamese LLM")
     assistant_answer = vietnamese_llm_chat_complete(openai_messages)
     logger.info("Bot RAG reply generated successfully")
+    
+    # RAG Hallucination Guardrail Check
+    if guardrails_manager.initialized:
+        try:
+            logger.info("Verifying RAG groundedness using NeMo Guardrails")
+            assistant_answer = asyncio.run(
+                guardrails_manager.verify_output_rag(assistant_answer, doc_context)
+            )
+        except Exception as e:
+            logger.error(f"Error running output RAG guardrails: {e}")
+            
     return assistant_answer
 
 
@@ -246,17 +260,26 @@ def _build_chat_graph():
     def legal_rag_node(state: ChatGraphState):
         history = state.get("history", [])
         question = state.get("standalone_question", state.get("question", ""))
-        return {"response": generate_rag_answer(history, question)}
+        resp = generate_rag_answer(history, question)
+        if guardrails_manager.initialized:
+            resp = guardrails_manager.add_legal_disclaimer(resp)
+        return {"response": resp}
 
     def agent_tools_node(state: ChatGraphState):
         history = state.get("history", [])
         question = state.get("standalone_question", state.get("question", ""))
-        return {"response": generate_agent_answer(history, question)}
+        resp = generate_agent_answer(history, question)
+        if guardrails_manager.initialized:
+            resp = guardrails_manager.add_legal_disclaimer(resp)
+        return {"response": resp}
 
     def web_search_node(state: ChatGraphState):
         history = state.get("history", [])
         question = state.get("standalone_question", state.get("question", ""))
-        return {"response": generate_web_search_answer(history, question)}
+        resp = generate_web_search_answer(history, question)
+        if guardrails_manager.initialized:
+            resp = guardrails_manager.add_legal_disclaimer(resp)
+        return {"response": resp}
 
     def general_chat_node(state: ChatGraphState):
         history = state.get("history", [])
@@ -365,9 +388,22 @@ def llm_handle_message(bot_id, user_id, question):
     logger.info("Conversation messages: %s", messages)
     history = messages[:-1]
 
-    # Use LangGraph-based routing to handle the question.
-    response = run_chat_graph(history, question)
-    logger.info(f"Chatbot response generated")
+    # 1. Run Input Guardrails check
+    blocked_response = None
+    if guardrails_manager.initialized:
+        try:
+            logger.info("Running input guardrails check...")
+            blocked_response = asyncio.run(guardrails_manager.verify_input(question))
+        except Exception as e:
+            logger.error(f"Error running input guardrails: {e}")
+            
+    if blocked_response:
+        response = blocked_response
+        logger.info("Chatbot response generated (Blocked by Input Guardrails)")
+    else:
+        # 2. Use LangGraph-based routing to handle the question.
+        response = run_chat_graph(history, question)
+        logger.info(f"Chatbot response generated")
 
     # Save full response to history (to preserve all details like the specific age)
     update_chat_conversation(bot_id, user_id, response, False)
