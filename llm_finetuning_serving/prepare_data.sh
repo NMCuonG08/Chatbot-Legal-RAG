@@ -29,7 +29,7 @@ print_error() {
 }
 
 # Check if raw data exists
-RAW_DATA="../data_pipeline/data/finetune_llm/finetune_llm_data.jsonl"
+RAW_DATA="../data_pipeline/data/finetune_llm_data.jsonl"
 LOCAL_RAW_DATA="data_processing/raw_data/finetune_llm_data.jsonl"
 
 if [ -f "$RAW_DATA" ]; then

@@ -148,10 +148,10 @@ class DataSplitter:
 def main():
     parser = argparse.ArgumentParser(description="Split finetune dataset and upload to DO Spaces")
     parser.add_argument("--input-file", 
-                       default="/home/mikeethanh/Vietnamese-Legal-Chatbot-RAG-System/data_pipeline/data/finetune_llm/finetune_llm_data.jsonl",
+                       default=str((Path(__file__).parent / "processed_llama_data.jsonl").resolve()),
                        help="Path to input JSONL file")
     parser.add_argument("--output-dir", 
-                       default="splits",
+                       default=str((Path(__file__).parent / "splits").resolve()),
                        help="Directory to save split files")
     parser.add_argument("--train-ratio", 
                        type=float, 

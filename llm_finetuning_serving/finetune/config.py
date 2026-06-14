@@ -58,10 +58,116 @@ class H200OptimizedConfig:
     output_dir: str = "./outputs"
     run_name: str = f"vietnamese-legal-llama-h200-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
+@dataclass
+class H100OptimizedConfig:
+    """Configuration optimized for H100 GPU (80GB VRAM)"""
+    # Model settings
+    model_name: str = "unsloth/Llama-3.1-8B-Instruct"
+    max_seq_length: int = 4096
+    dtype: Optional[torch.dtype] = None
+    load_in_4bit: bool = False
+    
+    # LoRA settings
+    lora_r: int = 64
+    lora_alpha: int = 128
+    lora_dropout: float = 0.0
+    bias: str = "none"
+    use_gradient_checkpointing: str = "unsloth"
+    random_state: int = 3407
+    use_rslora: bool = False
+    
+    # Training settings
+    per_device_train_batch_size: int = 8
+    per_device_eval_batch_size: int = 8
+    gradient_accumulation_steps: int = 8
+    warmup_steps: int = 50
+    num_train_epochs: int = 4
+    max_steps: int = -1
+    learning_rate: float = 2e-4
+    weight_decay: float = 0.01
+    lr_scheduler_type: str = "cosine"
+    seed: int = 3407
+    
+    # Optimization
+    optim: str = "adamw_torch"
+    fp16: bool = False
+    bf16: bool = True
+    
+    # Logging
+    logging_steps: int = 1
+    save_strategy: str = "epoch"
+    evaluation_strategy: str = "epoch"
+    save_total_limit: int = 3
+    load_best_model_at_end: bool = True
+    metric_for_best_model: str = "eval_loss"
+    greater_is_better: bool = False
+    
+    # Data
+    dataset_text_field: str = "text"
+    packing: bool = False
+    
+    # Output
+    output_dir: str = "./outputs"
+    run_name: str = f"vietnamese-legal-llama-h100-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+@dataclass
+class A4000OptimizedConfig:
+    """Configuration optimized for A4000 GPU (16GB VRAM)"""
+    # Model settings
+    model_name: str = "unsloth/Llama-3.1-8B-Instruct"
+    max_seq_length: int = 2048
+    dtype: Optional[torch.dtype] = None
+    load_in_4bit: bool = True  # Required for 16GB VRAM
+    
+    # LoRA settings
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.0
+    bias: str = "none"
+    use_gradient_checkpointing: str = "unsloth"
+    random_state: int = 3407
+    use_rslora: bool = False
+    
+    # Training settings
+    per_device_train_batch_size: int = 2
+    per_device_eval_batch_size: int = 2
+    gradient_accumulation_steps: int = 8
+    warmup_steps: int = 50
+    num_train_epochs: int = 4
+    max_steps: int = -1
+    learning_rate: float = 2e-4
+    weight_decay: float = 0.01
+    lr_scheduler_type: str = "cosine"
+    seed: int = 3407
+    
+    # Optimization
+    optim: str = "paged_adamw_8bit"
+    fp16: bool = True
+    bf16: bool = False
+    
+    # Logging
+    logging_steps: int = 1
+    save_strategy: str = "epoch"
+    evaluation_strategy: str = "epoch"
+    save_total_limit: int = 3
+    load_best_model_at_end: bool = True
+    metric_for_best_model: str = "eval_loss"
+    greater_is_better: bool = False
+    
+    # Data
+    dataset_text_field: str = "text"
+    packing: bool = False
+    
+    # Output
+    output_dir: str = "./outputs"
+    run_name: str = f"vietnamese-legal-llama-a4000-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
 def get_config(gpu_type: str = "h200"):
     """Get configuration based on GPU type"""
     configs = {
         "h200": H200OptimizedConfig,
+        "h100": H100OptimizedConfig,
+        "a4000": A4000OptimizedConfig,
     }
     
     if gpu_type not in configs:

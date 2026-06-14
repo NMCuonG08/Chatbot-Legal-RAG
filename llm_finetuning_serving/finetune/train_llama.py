@@ -3,11 +3,15 @@ Script finetune Llama-3.1-8B using Unsloth with LoRA
 Optimized for Vietnamese Legal QA
 """
 
+import sys
+from pathlib import Path
+# Add parent directory to sys.path to enable importing modules like do_spaces_manager
+sys.path.append(str(Path(__file__).parent.parent.resolve()))
+
 import os
 import json
 import logging
 import torch
-from pathlib import Path
 from typing import Dict, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -20,8 +24,6 @@ from trl import SFTTrainer
 from datasets import Dataset
 import wandb
 
-import sys
-sys.path.append('..')
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -480,9 +482,9 @@ def main(gpu_type: str = "h200"):
     if len(sys.argv) > 1:
         gpu_type = sys.argv[1].lower()
     
-    # Import configs
+    # Import config
     try:
-        from configs import get_config, print_config_comparison
+        from config import get_config, print_config_comparison
         config = get_config(gpu_type)
         
         # Print configuration comparison
@@ -490,8 +492,8 @@ def main(gpu_type: str = "h200"):
         print(f"\n🎯 Selected GPU Configuration: {gpu_type.upper()}")
         
     except ImportError:
-        # Fallback to H200 MAXIMIZED config if configs.py not available
-        logger.warning("configs.py not found, using H200 MAXIMIZED configuration")
+        # Fallback to H200 MAXIMIZED config if config.py not available
+        logger.warning("config.py not found, using H200 MAXIMIZED configuration")
         config = FineTuneConfig(
             # Model settings - H200 MAXIMIZED
             model_name="unsloth/Llama-3.1-8B-Instruct",
@@ -518,7 +520,7 @@ def main(gpu_type: str = "h200"):
             dataloader_pin_memory=True,
             
             # Output
-            output_dir="/home/mikeethanh/Vietnamese-Legal-Chatbot-RAG-System/llm_finetuning_serving/finetune/outputs",
+            output_dir=str((Path(__file__).parent / "outputs").resolve()),
             run_name=f"vietnamese-legal-llama-h200-MAXIMIZED-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         )
     
@@ -570,7 +572,11 @@ def main(gpu_type: str = "h200"):
             eval_results = {}
             
         # Evaluate on test set if available
-        test_results = finetuner.evaluate_test_set(datasets)
+        if 'test' in formatted_datasets:
+            logger.info("📊 Running final test set evaluation...")
+            test_results = finetuner.evaluate(formatted_datasets['test'], dataset_name="test")
+        else:
+            test_results = {}
         
         print("\\n" + "="*80)
         print("🎉 VIETNAMESE LEGAL LLM FINETUNE HOÀN THÀNH! (H200 MAXIMIZED)")

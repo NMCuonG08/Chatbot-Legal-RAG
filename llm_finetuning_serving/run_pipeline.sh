@@ -249,10 +249,10 @@ run_full_pipeline() {
     setup_environment
     
     # Copy data from local if available, otherwise prompt user
-    if [ -f "../data_pipeline/data/finetune_llm/finetune_llm_data.jsonl" ]; then
+    if [ -f "../data_pipeline/data/finetune_llm_data.jsonl" ]; then
         print_status "Found local data, copying and processing..."
         mkdir -p data_processing/raw_data
-        cp ../data_pipeline/data/finetune_llm/finetune_llm_data.jsonl data_processing/raw_data/
+        cp ../data_pipeline/data/finetune_llm_data.jsonl data_processing/raw_data/
         analyze_data
         process_data
         split_data

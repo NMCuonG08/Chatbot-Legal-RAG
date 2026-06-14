@@ -13,7 +13,7 @@ def merge_instruction_format_data():
     # Đường dẫn thư mục gốc
     script_dir = Path(__file__).parent
     project_root = script_dir.parent
-    data_dir = project_root / "data_pipeline" / "data"
+    data_dir = project_root / "data"
     
     # File output
     output_file = data_dir / "finetune_llm_data.jsonl"
