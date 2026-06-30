@@ -1,23 +1,23 @@
-# ⚖️ Trợ lý Pháp luật Việt Nam (Vietnamese Legal Chatbot - RAG & Agentic Workflow)
+# ⚖️ Vietnamese Legal Assistant (RAG & Agentic Chatbot)
 
-Hệ thống trợ lý ảo thông minh hỗ trợ tra cứu văn bản pháp luật Việt Nam, tính toán chi phí pháp lý và kiểm tra điều kiện hành vi dân sự. Hệ thống được xây dựng trên kiến trúc **RAG nâng cao (Advanced RAG)** kết hợp với **Tác tử thông minh (Agentic Workflow)**, được bảo vệ bởi hệ thống kiểm duyệt an toàn nhiều tầng.
+An intelligent legal virtual assistant designed to lookup Vietnamese legal documents, calculate legal costs/penalties, and verify civil legal conditions. The system is built on an **Advanced RAG** architecture combined with an **Agentic Workflow**, protected by multi-layered safety guardrails.
 
 ---
 
-## 🏗️ Kiến trúc Hệ thống
+## 🏗️ System Architecture
 
 ```mermaid
 graph TD
-    User([Người dùng]) -->|Gửi câu hỏi| UI[Streamlit Frontend]
-    UI -->|Gọi API bất đồng bộ| API[FastAPI Backend]
-    API -->|Đẩy tác vụ vào hàng đợi| Broker[(Redis)]
-    Worker[Celery Worker] <-->|Nhận & xử lý tác vụ| Broker
+    User([User]) -->|Submits query| UI[Streamlit Frontend]
+    UI -->|Async API requests| API[FastAPI Backend]
+    API -->|Queue tasks| Broker[(Redis)]
+    Worker[Celery Worker] <-->|Fetch & process tasks| Broker
     
     subgraph Engine [Core Agentic & RAG Engine]
-        Worker -->|1. Kiểm tra an toàn đầu vào| Guard[Guardrails Manager]
-        Guard -->|2. Định tuyến ý định - LangGraph| Router{Router Node}
+        Worker -->|1. Input safety check| Guard[Guardrails Manager]
+        Guard -->|2. Intent routing| Router{LangGraph Router}
         
-        Router -->|legal_rag| RAG[Luồng RAG Nâng Cao]
+        Router -->|legal_rag| RAG[Advanced RAG Flow]
         Router -->|agent_tools| Agent[ReAct Agent]
         Router -->|web_search| Web[Web Search]
         Router -->|general_chat| Gen[General Chat]
@@ -26,97 +26,124 @@ graph TD
         Query -->|Hybrid Search| DB_V[(Qdrant Vector DB)]
         Query -->|Keyword Search| BM25[BM25 Search]
         DB_V & BM25 -->|Merge & Rerank| Rerank[Cohere Reranker]
-        Rerank -->|Sinh câu trả lời| LLM_Legal[Vietnamese Legal LLM]
+        Rerank -->|Generate answer| LLM_Legal[Vietnamese Legal LLM]
         
-        Agent -->|Gọi công cụ| Tools[Legal Tools]
-        Tools -->|Tính phạt vi phạm / Chia thừa kế / Kiểm tra tuổi / Đặt tên DN| Agent
-        Agent --> LLM_Groq[Groq / Ollama / OpenAI]
+        Agent -->|Execute tools| Tools[Legal Tools]
+        Tools -->|Contract Penalty / Inheritance / Age / Biz Name| Agent
+        Agent --> LLM_Groq[Groq / Llama / OpenAI]
         
-        Web -->|Tìm tin thời sự pháp luật| Tavily[Tavily Search API]
+        Web -->|Search legal news| Tavily[Tavily Search API]
     end
     
-    LLM_Legal & LLM_Groq & Tavily -->|Kiểm tra ảo giác & Chèn tuyên bố miễn trừ| OutputGuard[Output Guardrails]
-    OutputGuard -->|Lưu lịch sử hội thoại| SQL[(MariaDB / MySQL)]
-    OutputGuard -->|Trả kết quả| Broker
+    LLM_Legal & LLM_Groq & Tavily -->|Hallucination & Groundedness check| OutputGuard[Output Guardrails]
+    OutputGuard -->|Save conversation history| SQL[(PostgreSQL / MySQL)]
+    OutputGuard -->|Return result| Broker
 ```
 
 ---
 
-## 🌟 Tính năng Nổi bật
+## 🌟 Key Features
 
-### 1. Bộ Định Tuyến Ý Định Thông Minh (LangGraph Router)
-- **Phân loại ý định**: Tự động phân tích câu hỏi của người dùng và chuyển hướng xử lý sang luồng tối ưu nhất.
-- **Tự động viết lại câu hỏi tiếp nối (Contextual Query Rewriter)**: Cho phép trò chuyện tự nhiên. Các câu hỏi ngắn như *"Nếu chậm 15 ngày thì sao?"* sẽ tự động được phân tích cùng lịch sử chat để viết lại thành *"Tiền phạt vi phạm hợp đồng chậm trễ 15 ngày là bao nhiêu?"* trước khi tra cứu.
+### 1. LangGraph Intent Router & Query Expansion
+*   **Intent Classification:** Dynamically routes user queries to the optimal pipeline (Advanced RAG, ReAct Agent, Web Search, or General Chat).
+*   **Contextual Query Rewriter:** Analyzes conversation history to rewrite short follow-up queries (e.g., *"What if it is 15 days late?"* becomes *"What is the contract penalty for a delay of 15 days?"*).
+*   **Synonym Query Expansion:** Automatically expands queries with Vietnamese legal synonyms to maximize retrieval recall.
 
-### 2. Luồng RAG Nâng Cao (Advanced RAG Pipeline)
-- **Truy vấn đa chiều (Query Expansion)**: Sinh ra 3 câu hỏi tương đương từ câu hỏi gốc nhằm tối ưu hóa kết quả tìm kiếm ngữ nghĩa.
-- **Tìm kiếm Lai (Hybrid Search)**: Kết hợp sức mạnh của tìm kiếm vector (Dense Retrieval) trên Qdrant và tìm kiếm từ khóa truyền thống (Sparse Retrieval - BM25).
-- **Tái xếp hạng (Reranking)**: Tích hợp Cohere Reranker xếp hạng lại tài liệu để chọn lọc ra 5 đoạn văn bản pháp luật đắt giá nhất.
-- **Mô hình ngôn ngữ Việt Hóa**: Tích hợp LLM chuyên biệt về Luật Việt Nam, tự động chuyển đổi linh hoạt sang Groq (Llama-3.1), Ollama, hoặc OpenAI khi có sự cố mạng.
+### 2. Advanced RAG & Incremental Indexing
+*   **Hybrid Search:** Combines dense vector retrieval in Qdrant with sparse keyword search (BM25) using LlamaIndex `QueryFusionRetriever`.
+*   **Cohere Reranking:** Re-orders retrieved document chunks to inject the most relevant legal context into the generator.
+*   **Two-Tier Incremental Re-Indexing:** Compares MD5 hashes of document chunks during updates to skip unchanged documents, avoiding redundant embeddings and lowering API costs.
+*   **Garbage Collection:** Automatically identifies and deletes orphaned vector chunks from Qdrant and metadata references from MySQL.
 
-### 3. Tác Tử Tính Toán & Xác Thực Pháp Lý (Agentic Legal Tools)
-Sử dụng mô hình ReAct Agent của LlamaIndex để kích hoạt các công cụ hỗ trợ người dùng tự động:
-- **Tính phạt vi phạm hợp đồng**: Tự động tính toán số tiền phạt dựa trên Điều 301 Luật Thương mại hoặc thỏa thuận dân sự (áp dụng ngưỡng trần pháp lý 12% giá trị hợp đồng bị vi phạm).
-- **Tính phân chia thừa kế**: Chia tài sản thừa kế đều cho các thành viên thuộc hàng thừa kế thứ nhất theo Điều 651 Bộ luật Dân sự 2015.
-- **Kiểm tra độ tuổi pháp lý**: Đánh giá năng lực hành vi dân sự dựa trên năm sinh đối với các hoạt động: ký hợp đồng lao động, đăng ký kết hôn, đi làm, chịu trách nhiệm hình sự.
-- **Kiểm tra quy tắc đặt tên doanh nghiệp**: Quét và cảnh báo tên doanh nghiệp vi phạm quy định cấm đặt tên (sử dụng từ ngữ cơ quan nhà nước, đảng phái...) theo Điều 36 Luật Doanh nghiệp 2020.
-- **Tra cứu thời hiệu khởi kiện**: Tra cứu nhanh thời hạn pháp lý còn hiệu lực khởi kiện cho các vụ việc Dân sự, Lao động, Hành chính, Hình sự.
+### 3. Agentic Legal Calculators
+Powered by LlamaIndex `ReActAgent`, the chatbot triggers programmatic legal tools for precise calculations:
+*   **Contract Penalty Calculator:** Calculates penalty fees based on commercial laws, applying the legal 12% ceiling cap of the contract value.
+*   **Inheritance Share Calculator:** Splits inheritance assets evenly among the first line of heirs under the Vietnamese Civil Code.
+*   **Legal Age Verifier:** Checks age eligibility for signing labor contracts, marriage, employment, and criminal liability.
+*   **Business Naming Validator:** Flags business names violating legal naming guidelines.
 
-### 4. Hệ Thống Kiểm Duyệt Nhiều Tầng (NVIDIA NeMo Guardrails)
-- **Input Guardrails**:
-  - Chặn các cuộc tấn công tiêm nhiễm câu lệnh (Jailbreak / Prompt Injection).
-  - Chặn các câu hỏi mang tính chất nhạy cảm chính trị, hướng dẫn hành vi vi phạm pháp luật hoặc ngôn từ độc hại (Toxicity).
-- **Output Guardrails**:
-  - Kiểm tra mức độ trung thực của câu trả lời so với tài liệu gốc (Groundedness Check) nhằm ngăn chặn hiện tượng AI tự bịa đặt thông tin.
-  - Tự động bổ sung thông điệp miễn trừ trách nhiệm pháp lý (*"Thông tin chỉ mang tính chất tham khảo..."*) ở cuối mỗi câu trả lời.
+### 4. Episodic Memory
+*   **Long-Term Memory:** Extracts key facts from conversation sessions and saves them as vectors in Qdrant.
+*   **Contextual Retrieval:** Performs dual-retrieval (laws + conversation context history) to provide highly personalized answers.
+
+### 5. Multi-Layered Safety Guardrails (NVIDIA NeMo)
+*   **Input Protection:** Detects jailbreaks, prompt injections, and politically sensitive queries.
+*   **Output Groundedness:** Verifies generated answers against source documents to prevent hallucinations and appends legal disclaimers.
+
+### 6. Enterprise-Grade Reliability
+*   **Redis Distributed Locks:** Prevents race conditions during concurrent document indexing.
+*   **SQL Transactions:** Wraps database metadata edits in atomic SQL transactions with automatic rollback on failures.
+
+### 7. Comprehensive RAG Evaluation Suite
+A 4-pillar evaluation framework tracking:
+*   **Operational Metrics:** Token count, API cost tracking, latency (TTFT/TTLT).
+*   **Quality Metrics:** LLM-as-a-judge faithfulness and answer relevance.
+*   **Agentic Metrics:** Tool call success rates and router accuracy.
+*   **Failure Mode Analysis:** Automatic classification of errors (Retrieval, Routing, Hallucination, Execution).
 
 ---
 
-## 🛠️ Công Nghệ Sử Dụng
+## 🛠️ Technology Stack
 
-- **Giao diện**: Streamlit
-- **Cổng API**: FastAPI
-- **Xử lý tác vụ ngầm**: Celery + Redis
-- **Cơ sở dữ liệu Vector**: Qdrant
-- **Cơ sở dữ liệu Quan hệ**: MariaDB / PostgreSQL
-- **Khung RAG & Agent**: LlamaIndex, LangGraph, NVIDIA NeMo Guardrails
-- **Mô hình Ngôn ngữ**: Vietnamese Legal LLM, Groq (Llama-3.1-8b-instant), Ollama, OpenAI
+*   **Frontend:** Streamlit
+*   **Backend API:** FastAPI
+*   **Task Queue:** Celery + Redis
+*   **Vector DB:** Qdrant
+*   **Relational DB:** PostgreSQL / MySQL
+*   **RAG & Agent Framework:** LlamaIndex, LangGraph, NVIDIA NeMo Guardrails
+*   **Language Models:** Llama-3.1 (via Groq), Cohere Rerank, Sentence Transformers
 
 ---
 
-## 🚀 Hướng dẫn Cài đặt & Chạy Dự án
+## 🚀 Installation & Setup
 
-### 1. Chuẩn bị File Cấu Hình `.env`
-Sao chép file cấu hình mẫu tại thư mục `backend/` và điền đầy đủ các khóa API:
+### 1. Configuration (`.env`)
+Copy the template configuration file in the `backend/` directory and configure the environment variables:
 ```bash
 cp backend/.env.example backend/.env
 ```
-Các khóa quan trọng cần cấu hình:
-- `GROQ_API_KEY`: Khóa API chạy LLM dự phòng.
-- `TAVILY_API_KEY`: Khóa API phục vụ tìm kiếm tin tức luật trên internet.
-- `COHERE_API_KEY`: Khóa API phục vụ tái xếp hạng tài liệu (Reranker).
+Key API keys required:
+*   `GROQ_API_KEY`: Groq LLM API key.
+*   `COHERE_API_KEY`: Cohere Rerank API key.
+*   `TAVILY_API_KEY`: Tavily Search API key.
 
-### 2. Khởi chạy bằng Docker Compose
-Dự án được container hóa hoàn chỉnh. Bạn chỉ cần chạy lệnh sau để kích hoạt tất cả các dịch vụ:
+### 2. Running the Application
+
+Ensure your Docker services (Qdrant, Redis, PostgreSQL/MySQL) are up and running, then start the application services:
+
+**Start the Celery Worker:**
 ```bash
-docker compose up --build
+cd backend/src
+celery -A tasks.celery_app worker --loglevel=info -P solo
 ```
 
-**Các cổng dịch vụ mặc định:**
-- **Frontend UI**: `http://localhost:8501` (Giao diện Chat Streamlit)
-- **Backend API**: `http://localhost:8000` (Tài liệu Swagger tại `http://localhost:8000/docs`)
-- **Qdrant Dashboard**: `http://localhost:6333/dashboard`
+**Start the FastAPI Backend:**
+```bash
+cd backend/src
+uvicorn app:app --host 0.0.0.0 --port 8002
+```
+
+**Start the Streamlit UI:**
+```bash
+cd frontend
+streamlit run chat_interface.py --server.port 8501
+```
+
+*   **Frontend UI:** `http://localhost:8501`
+*   **Backend API Docs:** `http://localhost:8002/docs`
+*   **Qdrant Dashboard:** `http://localhost:6333/dashboard`
 
 ---
 
-## 📂 Cấu trúc Thư mục Chính
+## 📂 Project Structure
 
-- `backend/src/`: Mã nguồn cốt lõi của Backend.
-  - `app.py`: Định nghĩa các API endpoints FastAPI.
-  - `tasks.py`: Định nghĩa các tác vụ Celery (luồng LangGraph chính).
-  - `agent.py`: Thiết lập ReAct Agent và LlamaIndex.
-  - `legal_tools.py`: Triển khai các công cụ tính toán pháp lý Việt Nam.
-  - `guardrails_manager.py`: Quản lý các bộ lọc an toàn đầu vào/đầu ra.
-- `frontend/`: Mã nguồn giao diện Streamlit.
-- `data_pipeline/`: Pipeline thu thập, làm sạch và đóng gói dữ liệu phục vụ RAG.
-- `llm_finetuning_serving/`: Mã nguồn phục vụ huấn luyện tinh chỉnh mô hình Llama và phục vụ mô hình (Model Serving).
+*   `backend/src/`: Core backend logic.
+    *   `app.py`: FastAPI endpoints and lifespan initialization.
+    *   `tasks.py`: Celery tasks and LangGraph workflow orchestration.
+    *   `agent.py`: LlamaIndex ReAct Agent and tools configuration.
+    *   `legal_tools.py`: Vietnamese civil & commercial law calculation logic.
+    *   `semantic_cache.py`: Qdrant-based vector caching.
+    *   `search.py`: Hybrid search index and BM25 retriever.
+*   `frontend/`: Streamlit interface.
+*   `data_pipeline/`: Data ingestion, cleaning, and preprocessing.
+*   `llm_finetuning_serving/`: Model serving and training logic.

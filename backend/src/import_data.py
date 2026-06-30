@@ -16,7 +16,7 @@ from config import DEFAULT_COLLECTION_NAME
 from search import initialize_search_index
 from splitter import split_document
 from utils import setup_logging
-from vectorize import add_vector, create_collection
+from vectorize import add_vector, create_collection, delete_vectors_by_filter
 from database import SessionLocal
 
 setup_logging()
@@ -151,6 +151,16 @@ def import_qa_data(
 
                 db = SessionLocal()
                 try:
+                    # If this is the FIRST time indexing this document in the new system (MySQL has no chunks),
+                    # we clean up any old vectors belonging to this doc_id from Qdrant to avoid duplicates.
+                    if not old_chunks:
+                        logger.info(f"First-time indexing for document {doc_id_str} in the new system. Cleaning old Qdrant vectors...")
+                        delete_vectors_by_filter(collection_name, {"doc_id": doc_id_str})
+                        try:
+                            delete_vectors_by_filter(collection_name, {"doc_id": idx})
+                        except Exception:
+                            pass
+
                     # Fast-path check: If full document hash matches, skip splitting and embedding entirely!
                     if full_doc_cid in old_chunks_dict and old_chunks_dict[full_doc_cid] == doc_hash:
                         logger.info(f"Skipped entire document {doc_id_str} - full content hash matches.")

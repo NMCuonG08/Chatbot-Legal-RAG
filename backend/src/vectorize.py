@@ -67,6 +67,32 @@ def delete_vectors_by_ids(collection_name, point_ids):
         return False
 
 
+def delete_vectors_by_filter(collection_name, filters):
+    """
+    Delete points by payload filters (e.g. {"doc_id": doc_id})
+    """
+    if not filters:
+        return True
+    try:
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        conditions = []
+        for field, value in filters.items():
+            conditions.append(
+                FieldCondition(key=field, match=MatchValue(value=value))
+            )
+        if conditions:
+            client.delete(
+                collection_name=collection_name,
+                points_selector=Filter(must=conditions),
+                wait=True
+            )
+            logger.info(f"Deleted points by filter {filters} from collection {collection_name}")
+            return True
+    except Exception as e:
+        logger.error(f"Failed to delete points by filter: {e}")
+        return False
+
+
 def list_collections():
     """Return a lightweight list of collection names and basic metadata."""
     collections = client.get_collections().collections

@@ -39,7 +39,7 @@ from splitter import split_document
 from summarizer import summarize_text
 from tavily_tool import tavily_search_legal
 from utils import setup_logging
-from vectorize import add_vector, search_vector, delete_vectors_by_ids
+from vectorize import add_vector, search_vector, delete_vectors_by_ids, delete_vectors_by_filter
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -405,6 +405,17 @@ def index_document_v2(id, question, content, collection_name=DEFAULT_COLLECTION_
         # Fetch old chunks from Metadata Store
         old_chunks = get_doc_chunks(doc_id_str)
         old_chunks_dict = {c.chunk_id: c.chunk_hash for c in old_chunks}
+
+        # If this is the FIRST time indexing this document in the new system (MySQL has no chunks),
+        # we clean up any old vectors belonging to this doc_id from Qdrant to avoid duplicates.
+        if not old_chunks:
+            logger.info(f"First-time indexing for document {doc_id_str} in the new system. Cleaning old Qdrant vectors...")
+            delete_vectors_by_filter(collection_name, {"doc_id": doc_id_str})
+            try:
+                numeric_id = int(id)
+                delete_vectors_by_filter(collection_name, {"doc_id": numeric_id})
+            except (ValueError, TypeError):
+                pass
 
         # Fast-path check: If full document hash matches, skip splitting and embedding entirely!
         if full_doc_cid in old_chunks_dict and old_chunks_dict[full_doc_cid] == doc_hash:
