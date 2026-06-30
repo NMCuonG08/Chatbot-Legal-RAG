@@ -31,6 +31,42 @@ def create_collection(name, vector_size=1024):
     )
 
 
+def wipe_collection(name, vector_size=1024):
+    """
+    Recreate the collection to wipe all vectors instantly
+    """
+    try:
+        client.delete_collection(collection_name=name)
+        client.create_collection(
+            collection_name=name,
+            vectors_config=VectorParams(size=vector_size, distance=Distance.DOT),
+        )
+        logger.info(f"Wiped collection: {name}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to wipe collection {name}: {e}")
+        return False
+
+
+def delete_vectors_by_ids(collection_name, point_ids):
+    """
+    Delete points by their IDs from Qdrant collection
+    """
+    if not point_ids:
+        return True
+    try:
+        client.delete(
+            collection_name=collection_name,
+            points_selector=point_ids,
+            wait=True
+        )
+        logger.info(f"Deleted {len(point_ids)} points from collection {collection_name}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete points from collection {collection_name}: {e}")
+        return False
+
+
 def list_collections():
     """Return a lightweight list of collection names and basic metadata."""
     collections = client.get_collections().collections

@@ -1,0 +1,339 @@
+{
+  "generated_at": "2026-06-30T03:41:05.714080Z",
+  "mode": "all",
+  "n_samples": 2,
+  "seed": 42,
+  "top_k": 10,
+  "retrieval_results": {
+    "vector": {
+      "metrics": {
+        "n_queries": 2,
+        "hit@1": 0.0,
+        "recall@1": 0.0,
+        "ndcg@1": 0.0,
+        "hit@3": 0.0,
+        "recall@3": 0.0,
+        "ndcg@3": 0.0,
+        "hit@5": 0.0,
+        "recall@5": 0.0,
+        "ndcg@5": 0.0,
+        "hit@10": 0.0,
+        "recall@10": 0.0,
+        "ndcg@10": 0.0,
+        "mrr": 0.0,
+        "latency_ms_mean": 10311.008650000076,
+        "latency_ms_p95": 16539.553000000524
+      },
+      "ranks": [
+        0,
+        0
+      ]
+    },
+    "hybrid": {
+      "metrics": {
+        "n_queries": 2,
+        "hit@1": 0.0,
+        "recall@1": 0.0,
+        "ndcg@1": 0.0,
+        "hit@3": 0.0,
+        "recall@3": 0.0,
+        "ndcg@3": 0.0,
+        "hit@5": 0.0,
+        "recall@5": 0.0,
+        "ndcg@5": 0.0,
+        "hit@10": 0.0,
+        "recall@10": 0.0,
+        "ndcg@10": 0.0,
+        "mrr": 0.0,
+        "latency_ms_mean": 9649.67064999928,
+        "latency_ms_p95": 11087.075699999332
+      },
+      "ranks": [
+        0,
+        0
+      ]
+    },
+    "hybrid_rerank": {
+      "metrics": {
+        "n_queries": 2,
+        "hit@1": 0.0,
+        "recall@1": 0.0,
+        "ndcg@1": 0.0,
+        "hit@3": 0.0,
+        "recall@3": 0.0,
+        "ndcg@3": 0.0,
+        "hit@5": 0.0,
+        "recall@5": 0.0,
+        "ndcg@5": 0.0,
+        "hit@10": 0.0,
+        "recall@10": 0.0,
+        "ndcg@10": 0.0,
+        "mrr": 0.0,
+        "latency_ms_mean": 8615.545450000354,
+        "latency_ms_p95": 9019.882399999915
+      },
+      "ranks": [
+        0,
+        0
+      ]
+    },
+    "multi_query": {
+      "metrics": {
+        "n_queries": 2,
+        "hit@1": 0.0,
+        "recall@1": 0.0,
+        "ndcg@1": 0.0,
+        "hit@3": 0.0,
+        "recall@3": 0.0,
+        "ndcg@3": 0.0,
+        "hit@5": 0.0,
+        "recall@5": 0.0,
+        "ndcg@5": 0.0,
+        "hit@10": 0.0,
+        "recall@10": 0.0,
+        "ndcg@10": 0.0,
+        "mrr": 0.0,
+        "latency_ms_mean": 25120.37224999949,
+        "latency_ms_p95": 25217.962400000033
+      },
+      "ranks": [
+        0,
+        0
+      ]
+    },
+    "full": {
+      "metrics": {
+        "n_queries": 2,
+        "hit@1": 0.0,
+        "recall@1": 0.0,
+        "ndcg@1": 0.0,
+        "hit@3": 0.0,
+        "recall@3": 0.0,
+        "ndcg@3": 0.0,
+        "hit@5": 0.0,
+        "recall@5": 0.0,
+        "ndcg@5": 0.0,
+        "hit@10": 0.0,
+        "recall@10": 0.0,
+        "ndcg@10": 0.0,
+        "mrr": 0.0,
+        "latency_ms_mean": 24967.27015000033,
+        "latency_ms_p95": 25011.5167999993
+      },
+      "ranks": [
+        0,
+        0
+      ]
+    }
+  },
+  "generation_summary": {
+    "n_queries": 2,
+    "faithfulness_mean": 0.0,
+    "answer_relevance_mean": 0.5,
+    "context_precision_mean": 0.0,
+    "latency_ms_mean": 46762.68215000073,
+    "total_prompt_tokens": 1859,
+    "total_completion_tokens": 876,
+    "total_tokens": 2735,
+    "estimated_cost_usd": 0.00016303000000000002,
+    "latency_ms_p95": 46920.83300000013
+  },
+  "generation_results": [
+    {
+      "sample_id": "train-83823",
+      "question": "Đối với Lưu học sinh Campuchia thi tuyển vào trường đại học Việt Nam thì mức kinh phí đào tạo được hưởng là bao nhiêu?",
+      "answer": "Điều 3 Nghị định số 81/2021/NĐ-CP quy định về mức hỗ trợ học phí đối với lưu học sinh Campuchia học tập tại Việt Nam như sau:\n\n\"Điểm c. Mức hỗ trợ học phí đối với lưu học sinh Campuchia được thực hiện theo mức hỗ trợ do Thủ tướng Chính phủ quyết định. Mức hỗ trợ học phí tối đa đối với lưu học sinh Campuchia được tính trên cơ sở học phí thực tế của trường đại học Việt Nam mà lưu học sinh Campuchia được cử sang học tập.\"\n\nTuy nhiên, để có thông tin chính xác về mức kinh phí đào tạo được hưởng, tôi cần biết thêm thông tin chi tiết về trường đại học và khóa học cụ thể của lưu học sinh Campuchia.\n\nCăn cứ pháp lý: Nghị định số 81/2021/NĐ-CP ngày 21/8/2021 của Chính phủ về chính sách hỗ trợ lưu học sinh Campuchia học tập tại Việt Nam.",
+      "scores": {
+        "faithfulness": 0.0,
+        "answer_relevance": 0.5,
+        "context_precision": 0.0
+      },
+      "rationales": {
+        "faithfulness": "no_context",
+        "answer_relevance": "Câu trả lời chạm vào chủ đề nhưng không cung cấp thông tin cụ thể về mức kinh phí đào tạo, chỉ dẫn đến Nghị định số 81/2021/NĐ-CP và yêu cầu thêm thông tin chi tiết về trường đại học và khóa học cụ thể.",
+        "context_precision": "no_context"
+      },
+      "latency_ms": 46604.53130000133,
+      "token_usage": [
+        {
+          "provider": "groq",
+          "model": "llama-3.1-8b-instant",
+          "prompt_tokens": 300,
+          "completion_tokens": 89
+        },
+        {
+          "provider": "groq",
+          "model": "llama-3.1-8b-instant",
+          "prompt_tokens": 122,
+          "completion_tokens": 203
+        },
+        {
+          "provider": "groq",
+          "model": "llama-3.1-8b-instant",
+          "prompt_tokens": 435,
+          "completion_tokens": 72
+        }
+      ],
+      "failure_category": "retrieval_failure"
+    },
+    {
+      "sample_id": "train-14594",
+      "question": "Đóng bảo hiểm 15 năm có được về hưu không?",
+      "answer": "Theo quy định của Luật Bảo hiểm xã hội (BHXH) năm 2014, để được hưởng lương hưu, người lao động phải đáp ứng một số điều kiện sau:\n\n- Đủ điều kiện về tuổi đời: Nam từ 55 tuổi trở lên, nữ từ 50 tuổi trở lên; \n- Đủ điều kiện về thời gian đóng bảo hiểm xã hội: 20 năm đối với nam, 15 năm đối với nữ (thời gian đóng BHXH trước ngày 01/01/1998 có thể được tính vào thời gian hưởng hưu trí nếu đã đóng đủ bảo hiểm 15 năm trở lên).\n\nTuy nhiên, theo quy định tại điểm a khoản 1 Điều 60 Luật Bảo hiểm xã hội năm 2014, đối với trường hợp nam nghỉ hưu từ ngày 01/01/2018 trở đi thì phải có đủ 20 năm đóng BHXH trở lên; trường hợp nghỉ hưu trước ngày 01/01/2018 thì phải có đủ 15 năm đóng BHXH trở lên.\n\nVậy, với thời gian đóng bảo hiểm xã hội là 15 năm, nữ có thể được hưởng lương hưu. Tuy nhiên, cần lưu ý rằng thời gian đóng bảo hiểm xã hội trước ngày 01/01/1998 có thể được tính vào thời gian hưởng hưu trí nếu đã đóng đủ bảo hiểm 15 năm trở lên.\n\nCăn cứ pháp lý: \n\n- Luật Bảo hiểm xã hội năm 2014 (có hiệu lực từ ngày 01/01/2016);\n- Thông tư số 12/2015/TT-BLĐTBXH ngày 10/4/2015 của Bộ Lao động, Thương binh và Xã hội hướng dẫn thực hiện một số điều của Luật Bảo hiểm xã hội về bảo hiểm xã hội bắt buộc (có hiệu lực từ ngày 01/6/2015).",
+      "scores": {
+        "faithfulness": 0.0,
+        "answer_relevance": 0.5,
+        "context_precision": 0.0
+      },
+      "rationales": {
+        "faithfulness": "no_context",
+        "answer_relevance": "Câu trả lời đã chạm vào chủ đề và cung cấp thông tin liên quan, nhưng không giải đáp trực tiếp câu hỏi một cách rõ ràng và chính xác.",
+        "context_precision": "no_context"
+      },
+      "latency_ms": 46920.83300000013,
+      "token_usage": [
+        {
+          "provider": "groq",
+          "model": "llama-3.1-8b-instant",
+          "prompt_tokens": 286,
+          "completion_tokens": 71
+        },
+        {
+          "provider": "groq",
+          "model": "llama-3.1-8b-instant",
+          "prompt_tokens": 108,
+          "completion_tokens": 390
+        },
+        {
+          "provider": "groq",
+          "model": "llama-3.1-8b-instant",
+          "prompt_tokens": 608,
+          "completion_tokens": 51
+        }
+      ],
+      "failure_category": "retrieval_failure"
+    }
+  ],
+  "e2e_summary": {
+    "n_queries": 2,
+    "success_rate": 1.0,
+    "routing_accuracy": 1.0,
+    "latency_ms_mean": 68668.93875000006,
+    "latency_ms_p95": 78469.08970000004,
+    "routing_distribution": {
+      "agent_tools": 1,
+      "legal_rag": 1
+    },
+    "total_prompt_tokens": 2192,
+    "total_completion_tokens": 578,
+    "total_tokens": 2770,
+    "estimated_cost_usd": 0.00015584000000000003,
+    "tool_calls_count": 4,
+    "tool_calls_success_rate": 1.0,
+    "tool_calls_distribution": {
+      "web_search_tool": 2,
+      "tavily_search_tool": 2
+    }
+  },
+  "e2e_results": [
+    {
+      "sample_id": "train-83823",
+      "question": "Đối với Lưu học sinh Campuchia thi tuyển vào trường đại học Việt Nam thì mức kinh phí đào tạo được hưởng là bao nhiêu?",
+      "answer": "Tôi không thể trả lời chính xác mức kinh phí đào tạo học sinh Campuchia vào trường đại học Việt Nam. Bạn có thể tham khảo thông tin từ các nguồn chính thức như Bộ Giáo dục và Đào tạo Việt Nam hoặc Đại sứ quán Campuchia tại Việt Nam.\n\n*Lưu ý: Thông tin trên chỉ mang tính chất tham khảo cứu pháp lý và không thay thế cho ý kiến chuyên môn của Luật sư.*",
+      "route": "agent_tools",
+      "expected_route": "agent_tools",
+      "latency_ms": 78469.08970000004,
+      "token_usage": [
+        {
+          "provider": "groq",
+          "model": "llama-3.1-8b-instant",
+          "prompt_tokens": 859,
+          "completion_tokens": 52
+        }
+      ],
+      "tool_calls": [
+        {
+          "tool_name": "web_search_tool",
+          "args": {
+            "query": "mức kinh phí đào tạo học sinh Campuchia vào trường đại học Việt Nam",
+            "max_results": 1
+          },
+          "status": "success",
+          "error": null,
+          "result": "Lỗi tìm kiếm: search_engine() got an unexpected keyword argument 'top_k'"
+        },
+        {
+          "tool_name": "tavily_search_tool",
+          "args": {
+            "query": "mức kinh phí đào tạo học sinh Campuchia vào trường đại học Việt Nam",
+            "max_results": 1
+          },
+          "status": "success",
+          "error": null,
+          "result": "Kết quả tìm kiếm cho: mức kinh phí đào tạo học sinh Campuchia vào trường đại học Việt Nam\n\nChi tiết:\nKhông tìm thấy kết quả.\n"
+        },
+        {
+          "tool_name": "web_search_tool",
+          "args": {
+            "query": "mức kinh phí đào tạo học sinh Campuchia vào trường đại học Việt Nam",
+            "max_results": 1
+          },
+          "status": "success",
+          "error": null,
+          "result": "Lỗi tìm kiếm: search_engine() got an unexpected keyword argument 'top_k'"
+        },
+        {
+          "tool_name": "tavily_search_tool",
+          "args": {
+            "query": "mức kinh phí đào tạo học sinh Campuchia vào trường đại học Việt Nam",
+            "max_results": 1
+          },
+          "status": "success",
+          "error": null,
+          "result": "Kết quả tìm kiếm cho: mức kinh phí đào tạo học sinh Campuchia vào trường đại học Việt Nam\n\nChi tiết:\nKhông tìm thấy kết quả.\n"
+        }
+      ],
+      "error": null,
+      "failure_category": "retrieval_failure"
+    },
+    {
+      "sample_id": "train-14594",
+      "question": "Đóng bảo hiểm 15 năm có được về hưu không?",
+      "answer": "Tôi không thể kiểm tra được các tài liệu pháp luật được cung cấp. Tuy nhiên, tôi có thể trả lời dựa trên các quy định hiện hành về bảo hiểm xã hội.\n\nTheo quy định tại Điều 60 Luật Bảo hiểm xã hội 2014, để được hưởng chế độ hưu trí, cá nhân phải có thời gian đóng bảo hiểm xã hội đủ điều kiện hưởng chế độ hưu trí.\n\nĐiều 64 Luật Bảo hiểm xã hội 2014 quy định điều kiện hưởng chế độ hưu trí như sau:\n\n\"a) Đủ 20 năm đóng bảo hiểm xã hội trở lên;\n\nb) Đủ 15 năm đóng bảo hiểm xã hội trở lên và có tuổi hưởng lương hưu theo quy định tại Điều 65 của Luật này;\"\n\nTheo quy định trên, để được hưởng chế độ hưu trí, cá nhân phải có thời gian đóng bảo hiểm xã hội ít nhất 20 năm, hoặc nếu có thời gian đóng từ 15 năm trở lên thì phải có tuổi hưởng lương hưu (tuổi nghỉ hưu).\n\nVậy, nếu bạn đóng bảo hiểm xã hội 15 năm mà có tuổi nghỉ hưu thì có thể được hưởng chế độ hưu trí.\n\nTuy nhiên, cần lưu ý rằng điều kiện và thủ tục hưởng chế độ hưu trí có thể thay đổi theo quy định pháp luật hiện hành. Để được tư vấn cụ thể, bạn nên tham khảo luật sư hoặc cơ quan bảo hiểm xã hội.\n\nHãy cho tôi biết nếu bạn cần thông tin thêm.\n\n*Lưu ý: Thông tin trên chỉ mang tính chất tham khảo cứu pháp lý và không thay thế cho ý kiến chuyên môn của Luật sư.*",
+      "route": "legal_rag",
+      "expected_route": "legal_rag",
+      "latency_ms": 58868.787800000064,
+      "token_usage": [
+        {
+          "provider": "groq",
+          "model": "llama-3.1-8b-instant",
+          "prompt_tokens": 845,
+          "completion_tokens": 148
+        },
+        {
+          "provider": "groq",
+          "model": "llama-3.1-8b-instant",
+          "prompt_tokens": 286,
+          "completion_tokens": 72
+        },
+        {
+          "provider": "groq",
+          "model": "llama-3.1-8b-instant",
+          "prompt_tokens": 202,
+          "completion_tokens": 306
+        }
+      ],
+      "tool_calls": [],
+      "error": null,
+      "failure_category": "retrieval_failure"
+    }
+  ],
+  "failure_summary": {
+    "success": 0.0,
+    "execution_error": 0.0,
+    "routing_failure": 0.0,
+    "retrieval_failure": 1.0,
+    "hallucination_failure": 0.0,
+    "irrelevance_failure": 0.0
+  }
+}

@@ -5,6 +5,29 @@ import requests
 # Đổi endpoint cho đúng backend FastAPI
 API_URL = "http://localhost:8002/chat/complete"  # Đúng port backend
 
+def format_sources_markdown(content, sources):
+    if not sources:
+        return content
+        
+    markdown = content
+    markdown += "\n\n**Nguồn tài liệu tham khảo:**\n"
+    for i, doc in enumerate(sources, 1):
+        source_name = doc.get("source", "Tài liệu")
+        doc_id = doc.get("doc_id", "N/A")
+        question = doc.get("question", "")
+        content_text = doc.get("content", "")
+        
+        # Truncate content preview if it's too long (e.g. 200 chars)
+        content_preview = content_text[:200] + "..." if len(content_text) > 200 else content_text
+        content_preview = content_preview.replace("\n", " ")
+        
+        markdown += f"{i}. **{source_name} (ID: {doc_id})**\n"
+        if question:
+            markdown += f"   - *Câu hỏi gốc:* {question}\n"
+        markdown += f"   - *Nội dung:* {content_preview}\n"
+        
+    return markdown
+
 def chat_fn(message, history):
     # Chuyển history sang list các dict role/content nếu chưa đúng
     formatted_history = []
@@ -28,9 +51,11 @@ def chat_fn(message, history):
         response = requests.post(API_URL, json=payload)
         if response.status_code == 200:
             data = response.json()
-            # Nếu trả về trực tiếp (sync), lấy luôn response
+            # Nếu trả về trực tiếp (sync), lấy luôn response và nguồn
             if "response" in data:
-                answer = data["response"]
+                answer_text = data["response"]
+                sources = data.get("sources", [])
+                answer = format_sources_markdown(answer_text, sources)
             # Nếu trả về task_id (async), poll kết quả
             elif "task_id" in data:
                 task_id = data["task_id"]
@@ -42,7 +67,7 @@ def chat_fn(message, history):
                         poll_data = poll_resp.json()
                         if poll_data.get("task_status") == "SUCCESS":
                             result = poll_data.get("task_result", "Không nhận được phản hồi từ server.")
-                            # Xử lý kết quả trả về từ Celery
+                            # Xử lý kết quả trả về từ Celery (chứa cả content và sources)
                             answer = extract_content_from_result(result)
                             break
                         elif poll_data.get("task_status") == "FAILURE":
@@ -59,15 +84,13 @@ def chat_fn(message, history):
         answer = f"Lỗi kết nối: {e}"
     return answer
 
-# Hàm xử lý kết quả Celery trả về, luôn lấy nội dung trả lời cuối cùng
+# Hàm xử lý kết quả Celery trả về, lấy nội dung trả lời và định dạng nguồn tài liệu
 def extract_content_from_result(result):
-    # Nếu là dict có 'content'
+    # Nếu là dict có 'content' và 'sources'
     if isinstance(result, dict):
-        if 'content' in result:
-            return result['content']
-        if 'assistant' in result:
-            return result['assistant']
-        return str(result)
+        content = result.get('content', '')
+        sources = result.get('sources', [])
+        return format_sources_markdown(content, sources)
     # Nếu là tuple/list, lấy phần tử cuối cùng
     if isinstance(result, (tuple, list)):
         if result:

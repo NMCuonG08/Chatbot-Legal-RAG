@@ -265,3 +265,28 @@ def aggregate_generation_scores(
         "answer_relevance_mean": _mean("answer_relevance"),
         "context_precision_mean": _mean("context_precision"),
     }
+
+
+# Cost in USD per 1M tokens
+PRICING_MAP = {
+    "llama-3.1-8b-instant": {"prompt": 0.05, "completion": 0.08},
+    "llama-3.1-70b-versatile": {"prompt": 0.59, "completion": 0.79},
+    "vietnamese-legal-llm": {"prompt": 0.0, "completion": 0.0},  # private/local
+}
+
+
+def estimate_cost(token_records: List[dict]) -> float:
+    """Estimate cost in USD from accumulated token usage records."""
+    total_cost = 0.0
+    for record in token_records:
+        model = record.get("model", "")
+        p_tokens = record.get("prompt_tokens", 0)
+        c_tokens = record.get("completion_tokens", 0)
+
+        # Match model or default to 8b pricing
+        pricing = PRICING_MAP.get(model, PRICING_MAP["llama-3.1-8b-instant"])
+        cost = (p_tokens / 1_000_000.0 * pricing["prompt"]) + (
+            c_tokens / 1_000_000.0 * pricing["completion"]
+        )
+        total_cost += cost
+    return total_cost

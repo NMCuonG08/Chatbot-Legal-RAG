@@ -1,4 +1,6 @@
 import asyncio
+import contextvars
+import functools
 import inspect
 import json
 import logging
@@ -30,10 +32,52 @@ from tavily_tool import tavily_qna, tavily_search_legal
 
 logger = logging.getLogger(__name__)
 
+# Stores list of dicts: {"tool_name": str, "args": dict, "status": str, "error": Optional[str], "result": Optional[str]}
+agent_tool_calls = contextvars.ContextVar("agent_tool_calls", default=None)
+
+def track_tool_call(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        acc = agent_tool_calls.get()
+        if acc is None:
+            return func(*args, **kwargs)
+        
+        sig = inspect.signature(func)
+        bound = sig.bind_partial(*args, **kwargs)
+        bound.apply_defaults()
+        
+        call_record = {
+            "tool_name": func.__name__,
+            "args": dict(bound.arguments),
+            "status": "success",
+            "error": None,
+            "result": None
+        }
+        acc.append(call_record)
+        
+        try:
+            res = func(*args, **kwargs)
+            call_record["result"] = str(res)[:1000]
+            if isinstance(res, str):
+                try:
+                    parsed = json.loads(res)
+                    if "error" in parsed:
+                        call_record["status"] = "failed"
+                        call_record["error"] = parsed["error"]
+                except Exception:
+                    pass
+            return res
+        except Exception as exc:
+            call_record["status"] = "error"
+            call_record["error"] = f"{type(exc).__name__}: {exc}"
+            raise exc
+    return wrapper
+
 
 # ===== LEGAL CALCULATION TOOLS =====
 
 
+@track_tool_call
 def contract_penalty_calculator(
     contract_value: float, penalty_rate: float, days_late: int
 ) -> str:
@@ -60,6 +104,7 @@ def contract_penalty_calculator(
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+@track_tool_call
 def legal_age_checker(birth_year: int, action_type: str = "sign_contract") -> str:
     """
     Kiểm tra tuổi pháp lý để thực hiện hành vi dân sự.
@@ -84,6 +129,7 @@ def legal_age_checker(birth_year: int, action_type: str = "sign_contract") -> st
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+@track_tool_call
 def inheritance_calculator(total_value: float, heirs_json: str) -> str:
     """
     Tính phần thừa kế theo pháp luật Việt Nam (hàng thừa kế thứ nhất).
@@ -109,6 +155,7 @@ def inheritance_calculator(total_value: float, heirs_json: str) -> str:
         )
 
 
+@track_tool_call
 def business_name_validator(business_name: str) -> str:
     """
     Kiểm tra tên doanh nghiệp có hợp lệ theo Luật Doanh nghiệp Việt Nam.
@@ -129,6 +176,7 @@ def business_name_validator(business_name: str) -> str:
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+@track_tool_call
 def statute_lookup(case_type: str) -> str:
     """
     Tra cứu thời hiệu khởi kiện theo pháp luật Việt Nam.
@@ -151,6 +199,7 @@ def statute_lookup(case_type: str) -> str:
 # ===== WEB SEARCH TOOLS =====
 
 
+@track_tool_call
 def web_search_tool(query: str, max_results: int = 5) -> str:
     """
     Tìm kiếm thông tin pháp luật trên internet sử dụng Google Search.
@@ -170,6 +219,7 @@ def web_search_tool(query: str, max_results: int = 5) -> str:
         return f"Lỗi tìm kiếm: {str(e)}"
 
 
+@track_tool_call
 def tavily_search_tool(query: str, max_results: int = 5) -> str:
     """
     Tìm kiếm thông tin pháp luật sử dụng Tavily AI (tìm kiếm thông minh với AI).
@@ -189,6 +239,7 @@ def tavily_search_tool(query: str, max_results: int = 5) -> str:
         return f"Tavily không khả dụng: {str(e)}"
 
 
+@track_tool_call
 def quick_answer_tool(question: str) -> str:
     """
     Trả lời nhanh câu hỏi bằng tìm kiếm web (Tavily Q&A).

@@ -22,6 +22,7 @@ from cache import clear_conversation_id
 from tasks import index_document_v2, llm_handle_message
 from utils import setup_logging
 from vectorize import create_collection, list_collection_points, list_collections
+from semantic_cache import init_semantic_cache
 
 # Constants
 TASK_TIMEOUT = 60
@@ -37,6 +38,15 @@ app = FastAPI()
 @app.on_event("startup")
 async def startup_event():
     ensure_database_schema()
+    init_semantic_cache()
+    try:
+        from vectorize import create_collection, list_collections
+        existing = [c["name"] for c in list_collections()]
+        if "user_episodes" not in existing:
+            create_collection("user_episodes")
+            logger.info("Created Qdrant collection 'user_episodes' for Episodic Memory.")
+    except Exception as e:
+        logger.warning(f"Could not initialize user_episodes collection on startup: {e}")
 
 
 class CompleteRequest(BaseModel):
@@ -138,7 +148,10 @@ async def complete(data: CompleteRequest):
 
     if data.sync_request:
         response = llm_handle_message(bot_id, user_id, user_message)
-        return {"response": str(response)}
+        return {
+            "response": response.get("content", ""),
+            "sources": response.get("sources", [])
+        }
     else:
         task = llm_handle_message.delay(bot_id, user_id, user_message)
         return {"task_id": task.id}
@@ -177,6 +190,33 @@ async def create_vector_collection(data: Dict):
     create_status = create_collection(collection_name)
     logging.info(f"Create collection {collection_name} status: {create_status}")
     return {"status": create_status is not None}
+
+
+
+@app.delete("/collections/{collection_name}/clean")
+async def clean_collection(collection_name: str):
+    """Wipe all vector points in Qdrant collection and clean chunk metadata mapping in MySQL."""
+    from vectorize import wipe_collection
+    from models import _new_db_session, DocumentChunk
+    
+    # 1. Recreate the collection (which wipes all vectors)
+    success = wipe_collection(collection_name)
+    if not success:
+        raise HTTPException(status_code=500, detail=f"Failed to wipe collection {collection_name}")
+        
+    # 2. Clean MySQL mapping chunks
+    db = _new_db_session()
+    try:
+        db.query(DocumentChunk).delete()
+        db.commit()
+    except Exception as e:
+        logger.error(f"Failed to clean document chunks metadata in database: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to clean database metadata")
+    finally:
+        db.close()
+        
+    return {"status": "success", "message": f"Collection {collection_name} and all mapping metadata cleaned successfully."}
 
 
 @app.post("/document/create")

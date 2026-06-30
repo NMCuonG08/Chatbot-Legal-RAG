@@ -114,6 +114,84 @@ def _e2e_section(e2e_summary) -> str:
     return "## End-to-end (chat graph)\n\n" + _format_table(headers, rows) + "\n"
 
 
+def _operational_section(payload) -> str:
+    # Gather token & cost info from generation_summary and/or e2e_summary
+    gen_sum = payload.get("generation_summary", {})
+    e2e_sum = payload.get("e2e_summary", {})
+
+    rows = []
+    if gen_sum and "total_tokens" in gen_sum:
+        rows.append([
+            "Generation Stage",
+            gen_sum.get("total_prompt_tokens", 0),
+            gen_sum.get("total_completion_tokens", 0),
+            gen_sum.get("total_tokens", 0),
+            f"${gen_sum.get('estimated_cost_usd', 0.0):.5f}"
+        ])
+    if e2e_sum and "total_tokens" in e2e_sum:
+        rows.append([
+            "E2E Chat Graph Stage",
+            e2e_sum.get("total_prompt_tokens", 0),
+            e2e_sum.get("total_completion_tokens", 0),
+            e2e_sum.get("total_tokens", 0),
+            f"${e2e_sum.get('estimated_cost_usd', 0.0):.5f}"
+        ])
+
+    if not rows:
+        return ""
+
+    headers = ["Stage / Run Mode", "Prompt Tokens", "Completion Tokens", "Total Tokens", "Estimated Cost (USD)"]
+    return "## Operational Metrics (Tokens & Cost)\n\n" + _format_table(headers, rows) + "\n"
+
+
+def _failure_section(failure_summary) -> str:
+    if not failure_summary:
+        return ""
+    headers = ["Failure Mode", "Percentage"]
+    rows = []
+    for cat, pct in failure_summary.items():
+        rows.append([cat.replace("_", " ").title(), f"{pct * 100:.1f}%"])
+    return "## Failure Analysis Breakdown\n\n" + _format_table(headers, rows) + "\n"
+
+
+def _agentic_section(e2e_sum) -> str:
+    if not e2e_sum:
+        return ""
+
+    out = []
+
+    # 1. Routing metrics
+    headers_route = ["Routing Metric", "Value"]
+    rows_route = [
+        ("Routing Accuracy (Expected vs Actual)", f"{e2e_sum.get('routing_accuracy', 0.0) * 100:.1f}%"),
+    ]
+    # routing distribution
+    dist = e2e_sum.get("routing_distribution", {})
+    for route, count in dist.items():
+        rows_route.append((f"Route Chosen: {route}", count))
+
+    out.append("### Routing Decisions")
+    out.append(_format_table(headers_route, rows_route))
+    out.append("")
+
+    # 2. Tool use metrics
+    if "tool_calls_count" in e2e_sum and e2e_sum.get("tool_calls_count", 0) > 0:
+        headers_tool = ["Agentic Tool Metric", "Value"]
+        rows_tool = [
+            ("Total Tool Calls", e2e_sum.get("tool_calls_count", 0)),
+            ("Tool Calls Success Rate", f"{e2e_sum.get('tool_calls_success_rate', 0.0) * 100:.1f}%"),
+        ]
+        tool_dist = e2e_sum.get("tool_calls_distribution", {})
+        for tool, count in tool_dist.items():
+            rows_tool.append((f"Tool Used: {tool}", count))
+
+        out.append("### ReAct Agent Tool Usage")
+        out.append(_format_table(headers_tool, rows_tool))
+        out.append("")
+
+    return "## Agentic & Routing Metrics\n\n" + "\n".join(out)
+
+
 def _build_markdown_report(payload: dict) -> str:
     parts = [
         f"# RAG Evaluation Report",
@@ -128,6 +206,9 @@ def _build_markdown_report(payload: dict) -> str:
     parts.append(_retrieval_section(payload.get("retrieval_results")))
     parts.append(_generation_section(payload.get("generation_summary")))
     parts.append(_e2e_section(payload.get("e2e_summary")))
+    parts.append(_operational_section(payload))
+    parts.append(_failure_section(payload.get("failure_summary")))
+    parts.append(_agentic_section(payload.get("e2e_summary")))
     return "\n".join(p for p in parts if p)
 
 
@@ -182,6 +263,10 @@ def main() -> int:
         "top_k": args.top_k,
     }
 
+    retrieval_results = None
+    gen_results = None
+    e2e_results = None
+
     if args.mode in ("retrieval", "all"):
         from evaluation.eval_retrieval import run_retrieval_eval
 
@@ -213,6 +298,7 @@ def main() -> int:
                 "scores": r.scores,
                 "rationales": r.rationales,
                 "latency_ms": r.latency_ms,
+                "token_usage": r.token_usage,
             }
             for r in gen_results
         ]
@@ -227,11 +313,57 @@ def main() -> int:
                 "sample_id": r.sample_id,
                 "question": r.question,
                 "answer": r.answer,
+                "route": r.route,
+                "expected_route": r.expected_route,
                 "latency_ms": r.latency_ms,
+                "token_usage": r.token_usage,
+                "tool_calls": r.tool_calls,
                 "error": r.error,
             }
             for r in e2e_results
         ]
+
+    # Failure Classification
+    if args.mode in ("generation", "e2e", "all"):
+        failures = []
+        gen_by_id = {r.sample_id: r for r in (gen_results if gen_results else [])}
+        e2e_by_id = {r.sample_id: r for r in (e2e_results if e2e_results else [])}
+
+        from evaluation.failure_analysis import classify_sample_failure, summarize_failures
+
+        for sample in samples:
+            g_res = gen_by_id.get(sample.sample_id)
+            e_res = e2e_by_id.get(sample.sample_id)
+
+            err = (e_res.error if e_res else None)
+            ret_hit = g_res.retrieval_hit if g_res else None
+            faith = g_res.scores.get("faithfulness") if g_res else None
+            rel = g_res.scores.get("answer_relevance") if g_res else None
+
+            act_route = e_res.route if e_res else None
+            exp_route = e_res.expected_route if e_res else None
+
+            cat = classify_sample_failure(
+                error=err,
+                actual_route=act_route,
+                expected_route=exp_route,
+                retrieval_hit=ret_hit,
+                faithfulness=faith,
+                answer_relevance=rel,
+            )
+            failures.append(cat)
+
+            # Update detail payloads
+            if g_res:
+                for item in payload["generation_results"]:
+                    if item["sample_id"] == sample.sample_id:
+                        item["failure_category"] = cat
+            if e_res:
+                for item in payload["e2e_results"]:
+                    if item["sample_id"] == sample.sample_id:
+                        item["failure_category"] = cat
+
+        payload["failure_summary"] = summarize_failures(failures)
 
     # Render markdown using the dataclass-shaped retrieval runs, then drop them.
     md_payload = dict(payload)

@@ -17,6 +17,7 @@ from search import initialize_search_index
 from splitter import split_document
 from utils import setup_logging
 from vectorize import add_vector, create_collection
+from database import SessionLocal
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -91,9 +92,14 @@ def import_qa_data(
     # Read and process the JSONL file
     success_count = 0
     error_count = 0
-    vectors_batch = {}  # Collect vectors for batch processing
     total_vectors_processed = 0  # Track total vectors processed
     documents_for_search = []  # Collect documents for search index
+
+    import hashlib
+    import uuid
+    from models import get_doc_chunks, save_doc_chunk, delete_doc_chunks_by_ids
+    from custom_embedding import get_custom_embedding
+    from vectorize import delete_vectors_by_ids
 
     logger.info(f"📖 Opening file: {data_file_path}")
     
@@ -135,48 +141,91 @@ def import_qa_data(
                     "doc_id": idx
                 })
 
-                # Combine question and context for embedding
+                doc_id_str = f"train-{idx}"
                 text = f"{question} {context}"
+                doc_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
+                full_doc_cid = f"{doc_id_str}#full_doc"
 
-                # Split document into chunks if needed
-                nodes = split_document(text)
+                old_chunks = get_doc_chunks(doc_id_str)
+                old_chunks_dict = {c.chunk_id: c.chunk_hash for c in old_chunks}
 
-                # Process each chunk
-                for chunk_idx, node in enumerate(nodes):
-                    # Generate unique ID for this chunk (must be integer for Qdrant)
-                    # Using formula: idx * 1000 + chunk_idx to ensure uniqueness
-                    point_id = idx * 1000 + chunk_idx
+                db = SessionLocal()
+                try:
+                    # Fast-path check: If full document hash matches, skip splitting and embedding entirely!
+                    if full_doc_cid in old_chunks_dict and old_chunks_dict[full_doc_cid] == doc_hash:
+                        logger.info(f"Skipped entire document {doc_id_str} - full content hash matches.")
+                        success_count += 1
+                        continue
 
-                    # Get embedding
-                    vector = get_embedding(node.text)
+                    nodes = split_document(text)
 
-                    # Add to batch
-                    vectors_batch[point_id] = {
-                        "vector": vector,
-                        "payload": {
-                            "question": question,
-                            "content": node.text,
-                            "source": "train",  # Fixed source name
-                            "doc_id": idx,
-                        },
-                    }
+                    new_chunk_ids = set()
+                    to_upsert = []
+                    to_delete = []
 
-                success_count += 1
+                    # Classify chunks
+                    for chunk_idx, node in enumerate(nodes):
+                        cid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"doc_{doc_id_str}_chunk_{chunk_idx}"))
+                        new_chunk_ids.add(cid)
+                        chash = hashlib.md5(node.text.encode("utf-8")).hexdigest()
 
-                # Process batch when it reaches batch_size
-                if len(vectors_batch) >= batch_size:
-                    logger.info(f"🔄 Processing batch of {len(vectors_batch)} vectors...")
-                    add_vector(
-                        collection_name=collection_name,
-                        vectors=vectors_batch,
-                        batch_size=batch_size,
-                    )
-                    total_vectors_processed += len(vectors_batch)
-                    vectors_batch = {}  # Reset batch
-                    
-                    logger.info(
-                        f"✅ Processed {total_vectors_processed} vectors total - Records: {success_count}, Errors: {error_count}"
-                    )
+                        if cid not in old_chunks_dict or old_chunks_dict[cid] != chash:
+                            to_upsert.append((cid, node.text, chash))
+
+                    # Check deleted chunks
+                    for old_cid in old_chunks_dict.keys():
+                        if old_cid != full_doc_cid and old_cid not in new_chunk_ids:
+                            to_delete.append(old_cid)
+
+                    # 1. Delete orphaned chunks
+                    if to_delete:
+                        delete_vectors_by_ids(collection_name, to_delete)
+                        delete_doc_chunks_by_ids(to_delete, db=db)
+
+                    # 2. Embed and upsert added/modified chunks
+                    if to_upsert:
+                        texts_to_embed = [item[1] for item in to_upsert]
+                        try:
+                            embeddings = get_custom_embedding(texts_to_embed)
+                            if not isinstance(embeddings, list) or (embeddings and not isinstance(embeddings[0], list)):
+                                embeddings = [embeddings]
+                        except Exception as e:
+                            logger.error(f"Failed to generate embeddings in batch: {e}")
+                            raise e
+
+                        vectors_payload = {}
+                        for (cid, text_val, chash), vector in zip(to_upsert, embeddings):
+                            vectors_payload[cid] = {
+                                "vector": vector,
+                                "payload": {
+                                    "question": question,
+                                    "content": text_val,
+                                    "source": "train",
+                                    "doc_id": idx,
+                                }
+                            }
+                            save_doc_chunk(doc_id_str, cid, chash, db=db)
+
+                        add_vector(
+                            collection_name=collection_name,
+                            vectors=vectors_payload,
+                            batch_size=batch_size,
+                        )
+                        total_vectors_processed += len(to_upsert)
+
+                    # Save full document hash
+                    save_doc_chunk(doc_id_str, full_doc_cid, doc_hash, db=db)
+
+                    # Atomically commit transaction!
+                    db.commit()
+                    success_count += 1
+
+                except Exception as e:
+                    logger.error(f"Transaction failed for line {idx + 1}, rolling back: {e}")
+                    db.rollback()
+                    error_count += 1
+                finally:
+                    db.close()
 
             except json.JSONDecodeError as e:
                 logger.error(f"Line {idx + 1}: JSON decode error - {e}")
@@ -184,16 +233,6 @@ def import_qa_data(
             except Exception as e:
                 logger.error(f"Line {idx + 1}: Unexpected error - {e}")
                 error_count += 1
-
-    # Process remaining vectors in the final batch
-    if vectors_batch:
-        logger.info(f"🔄 Processing final batch of {len(vectors_batch)} vectors...")
-        add_vector(
-            collection_name=collection_name,
-            vectors=vectors_batch,
-            batch_size=batch_size,
-        )
-        total_vectors_processed += len(vectors_batch)
 
     logger.info("🎯 REACHED END OF PROCESSING LOOP!")
     logger.info(

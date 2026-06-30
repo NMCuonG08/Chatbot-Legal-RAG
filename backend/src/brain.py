@@ -1,3 +1,4 @@
+import contextvars
 import json
 import logging
 import os
@@ -12,6 +13,9 @@ logger = logging.getLogger(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", default=None)
 VIETNAMESE_LLM_API_URL = os.environ.get("VIETNAMESE_LLM_API_URL", default="http://3.89.75.45:6000/v1/chat/completions")
+
+# Stores list of dicts: {"provider": str, "model": str, "prompt_tokens": int, "completion_tokens": int}
+usage_accumulator = contextvars.ContextVar("usage_accumulator", default=None)
 
 
 def get_groq_client():
@@ -54,6 +58,18 @@ def vietnamese_llm_chat_complete(messages=(), temperature=0.7, max_tokens=512):
             result = response.json()
             content = result["choices"][0]["message"]["content"]
             logger.info("Vietnamese LLM response: {}".format(content[:200] + "..."))
+            
+            # Record usage if accumulator is active
+            usage = result.get("usage")
+            acc = usage_accumulator.get()
+            if usage and acc is not None:
+                acc.append({
+                    "provider": "vietnamese_llm",
+                    "model": "vietnamese-legal-llm",
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0)
+                })
+                
             return content
         else:
             logger.error(f"Vietnamese LLM API error: {response.status_code} - {response.text}")
@@ -88,9 +104,31 @@ def groq_chat_complete(messages=(), model=None, raw=False):
                 temperature=0.7
             )
             if raw:
+                # Still accumulate token usage if raw is requested
+                usage = getattr(response, "usage", None)
+                acc = usage_accumulator.get()
+                if usage and acc is not None:
+                    acc.append({
+                        "provider": "groq",
+                        "model": model_name,
+                        "prompt_tokens": usage.prompt_tokens,
+                        "completion_tokens": usage.completion_tokens
+                    })
                 return response.choices[0].message
             output = response.choices[0].message
             logger.info(f"Chat complete output: {output.content[:100]}")
+            
+            # Record usage if accumulator is active
+            usage = getattr(response, "usage", None)
+            acc = usage_accumulator.get()
+            if usage and acc is not None:
+                acc.append({
+                    "provider": "groq",
+                    "model": model_name,
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens
+                })
+                
             return output.content
         except Exception as e:
             logger.error(f"Groq API error: {e}")
@@ -116,6 +154,18 @@ def groq_chat_complete(messages=(), model=None, raw=False):
                 result = response.json()
                 content = result["choices"][0]["message"]["content"]
                 logger.info(f"Ollama chat complete output: {content[:100]}")
+                
+                # Record usage if accumulator is active
+                usage = result.get("usage")
+                acc = usage_accumulator.get()
+                if usage and acc is not None:
+                    acc.append({
+                        "provider": "ollama",
+                        "model": model_name,
+                        "prompt_tokens": usage.get("prompt_tokens", 0),
+                        "completion_tokens": usage.get("completion_tokens", 0)
+                    })
+                    
                 if raw:
                     from types import SimpleNamespace
                     return SimpleNamespace(content=content)
@@ -147,6 +197,18 @@ def groq_chat_complete(messages=(), model=None, raw=False):
             if response.status_code == 200:
                 result = response.json()
                 content = result["choices"][0]["message"]["content"]
+                
+                # Record usage if accumulator is active
+                usage = result.get("usage")
+                acc = usage_accumulator.get()
+                if usage and acc is not None:
+                    acc.append({
+                        "provider": "openai",
+                        "model": model_name,
+                        "prompt_tokens": usage.get("prompt_tokens", 0),
+                        "completion_tokens": usage.get("completion_tokens", 0)
+                    })
+                    
                 if raw:
                     from types import SimpleNamespace
                     return SimpleNamespace(content=content)

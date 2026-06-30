@@ -173,6 +173,136 @@ class Document(Base):
     )
 
 
+class DocumentChunk(Base):
+    __tablename__ = "document_chunks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    doc_id = Column(String(100), nullable=False, index=True)      # e.g., "doc-12" or "train-123"
+    chunk_id = Column(String(50), nullable=False, index=True)     # UUID string or integer string
+    chunk_hash = Column(String(64), nullable=False)               # MD5 hash of chunk text
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class UserEpisode(Base):
+    __tablename__ = "user_episodes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(100), nullable=False, index=True)
+    summary = Column(String)  # Summary of episodic interaction
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+def save_user_episode(user_id: str, summary: str, db: Session = None):
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        new_episode = UserEpisode(
+            user_id=user_id,
+            summary=summary
+        )
+        db.add(new_episode)
+        if session_created:
+            db.commit()
+        return new_episode
+    finally:
+        if session_created:
+            db.close()
+
+
+def get_user_episodes(user_id: str, limit: int = 20) -> list[UserEpisode]:
+    db = _new_db_session()
+    try:
+        return (
+            db.query(UserEpisode)
+            .filter(UserEpisode.user_id == user_id)
+            .order_by(UserEpisode.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+    finally:
+        db.close()
+
+
+def get_doc_chunks(doc_id: str) -> list[DocumentChunk]:
+    db = _new_db_session()
+    try:
+        return (
+            db.query(DocumentChunk)
+            .filter(DocumentChunk.doc_id == doc_id)
+            .all()
+        )
+    finally:
+        db.close()
+
+
+def save_doc_chunk(doc_id: str, chunk_id: str, chunk_hash: str, db: Session = None):
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        existing = db.query(DocumentChunk).filter(
+            DocumentChunk.doc_id == doc_id,
+            DocumentChunk.chunk_id == chunk_id
+        ).first()
+        if existing:
+            existing.chunk_hash = chunk_hash
+        else:
+            new_chunk = DocumentChunk(
+                doc_id=doc_id,
+                chunk_id=chunk_id,
+                chunk_hash=chunk_hash
+            )
+            db.add(new_chunk)
+        if session_created:
+            db.commit()
+    finally:
+        if session_created:
+            db.close()
+
+
+def delete_doc_chunks_by_ids(chunk_ids: list[str], db: Session = None):
+    if not chunk_ids:
+        return
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        db.query(DocumentChunk).filter(DocumentChunk.chunk_id.in_(chunk_ids)).delete(synchronize_session=False)
+        if session_created:
+            db.commit()
+    except Exception as e:
+        logger.error(f"Failed to delete document chunks from database: {e}")
+        if session_created:
+            db.rollback()
+        raise e
+    finally:
+        if session_created:
+            db.close()
+
+
+def clear_doc_chunks_by_doc(doc_id: str, db: Session = None):
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        db.query(DocumentChunk).filter(DocumentChunk.doc_id == doc_id).delete(synchronize_session=False)
+        if session_created:
+            db.commit()
+    except Exception as e:
+        logger.error(f"Failed to clear document chunks: {e}")
+        if session_created:
+            db.rollback()
+        raise e
+    finally:
+        if session_created:
+            db.close()
+
+
 def ensure_database_schema():
     """Create missing tables for the current database if needed."""
     try:
