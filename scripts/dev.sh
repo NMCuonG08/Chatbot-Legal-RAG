@@ -4,13 +4,23 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# Auto-activate local virtual environment if present
+if [ -d ".venv" ]; then
+  if [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+  elif [ -f ".venv/Scripts/activate" ]; then
+    source .venv/Scripts/activate
+  fi
+fi
+
 case "${1:-}" in
   up)
-    echo "[1/1] Starting infra services (Redis, MariaDB, Qdrant)..."
-    docker compose up -d redis mariadb qdrant
+    echo "[1/1] Starting infra services (Redis, MariaDB, Qdrant, Prometheus, Grafana)..."
+    docker compose up -d redis mariadb qdrant prometheus grafana
     docker compose ps
     echo
     echo "Next: scripts/dev.sh setup  (first time)  then  scripts/dev.sh app"
+    echo "To stop infra: docker compose down"
     ;;
   setup)
     echo "[1/3] Installing backend deps..."
@@ -38,16 +48,19 @@ case "${1:-}" in
     API_PID=$!
     ( cd frontend && streamlit run chat_interface.py --server.port 8501 ) &
     UI_PID=$!
-    trap "kill $CELERY_PID $API_PID $UI_PID 2>/dev/null" EXIT
+    
+    # Catch exit signals and terminate spawned background processes
+    trap "kill $CELERY_PID $API_PID $UI_PID 2>/dev/null" EXIT INT TERM
     echo
-    echo "UI:     http://localhost:8501"
-    echo "API:    http://localhost:8002/docs"
-    echo "Health: http://localhost:8002/health"
+    echo "UI:      http://localhost:8501"
+    echo "API:     http://localhost:8002/docs"
+    echo "Health:  http://localhost:8002/health"
+    echo "Grafana: http://localhost:3000 (Monitoring)"
     wait
     ;;
   *)
     echo "Usage: $0 [up | setup | app]"
-    echo "  up     - start Redis + MariaDB + Qdrant via docker compose"
+    echo "  up     - start Redis + MariaDB + Qdrant + Prometheus + Grafana via docker compose"
     echo "  setup  - pip install + create DB schema + Qdrant collections (run once)"
     echo "  app    - launch Celery worker + FastAPI + Streamlit"
     exit 1
