@@ -1,16 +1,57 @@
-# ⚖️ Vietnamese Legal Assistant (RAG & Agentic Chatbot)
+# Vietnamese Legal Assistant (RAG & Agentic Chatbot) 🏛️
 
-An intelligent legal virtual assistant for looking up Vietnamese legal documents, calculating legal costs/penalties, and verifying civil legal conditions. Built on an **Advanced RAG** architecture combined with an **Agentic Workflow** (LangGraph router → ReAct agent), protected by multi-layered safety guardrails and a hardened admin surface.
+<div align="center">
 
-> See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full architecture document (data flow, tiers, lineage, security model). This README is the quick-start + feature overview.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.95%2B-009688.svg)](https://fastapi.tiangolo.com/)
+[![LlamaIndex](https://img.shields.io/badge/Framework-LlamaIndex-orange.svg)](https://www.llamaindex.ai/)
+[![LangGraph](https://img.shields.io/badge/Agent-LangGraph-brightgreen.svg)](https://github.com/langchain-ai/langgraph)
+[![Qdrant](https://img.shields.io/badge/VectorDB-Qdrant-red.svg)](https://qdrant.tech/)
+
+An intelligent virtual assistant for looking up Vietnamese legal documents, calculating legal costs/penalties, and verifying civil legal conditions. Built on an **Advanced RAG** architecture combined with an **Agentic Workflow** (LangGraph router → ReAct agent), protected by multi-layered safety guardrails and a hardened admin surface.
+
+[🌟 Star](https://github.com/NMCuonG08/Chatbot-Legal-RAG/stargazers) • [🍴 Fork](https://github.com/NMCuonG08/Chatbot-Legal-RAG/fork) • [📚 Docs](docs/ARCHITECTURE.md) • [💬 Discord](https://discord.gg/legal-chatbot)
+
+</div>
 
 ---
 
-## 🏗️ System Architecture (overview)
+## 📋 Table of Contents
 
-The system is structured into two main components: the **Multi-Source Ingestion Pipeline** (for data collection and indexing) and the **Request Lifecycle** (the Core Agentic & RAG Engine). The request lifecycle is a real **self-corrective multi-agent graph**: a LangGraph `StateGraph` with a CRAG (self-corrective RAG) loop, Redis-backed checkpointing, `Command(goto=...)` inter-agent handoff, self-hosted trace persistence (MySQL + Redis pub/sub), and SSE live-trace streaming.
+- [I. Overview](#i-overview)
+- [II. System Architecture](#ii-system-architecture)
+- [III. Project Structure](#iii-project-structure)
+- [IV. Key Features & Capabilities](#iv-key-features--capabilities)
+- [V. Technology Stack](#v-technology-stack)
+- [VI. Quick Start Guide](#vi-quick-start-guide)
+- [VII. Data Ingestion Pipeline](#vii-data-ingestion-pipeline)
+- [VIII. Model Training & Evaluation](#viii-model-training--evaluation)
+- [IX. Production Deployment](#ix-production-deployment)
+- [X. Testing & Quality Assurance](#x-testing--quality-assurance)
+- [XI. API Documentation](#xi-api-documentation)
+- [XII. Disclaimer & Terms](#xii-disclaimer--terms)
 
-### 1. Multi-Source Ingestion Pipeline
+---
+
+## I. Overview
+
+Retrieval-augmented generation (RAG) systems combine generative AI with information retrieval to provide contextualized legal consultation services. This project deploys a comprehensive Vietnamese legal chatbot system using modern microservices architecture and advanced AI technologies. It features a self-corrective RAG workflow, Celery background workers, and long-term memory.
+
+---
+
+## II. System Architecture
+
+Below is the complete, high-level architecture diagram detailing the request lifecycle, ingestion pipeline, data tiers, model serving, and CI/CD layout.
+
+![System Architecture](asset/architecture_template.drawio.svg)
+
+*(Video demonstration of system overview will be provided)*
+
+<details>
+<summary><b>🛠️ View Mermaid Diagram Source Code (Flowchart)</b></summary>
+
+### 1. Ingestion Pipeline Diagram
 ```mermaid
 %%{init: { 'themeVariables': { 'fontFamily': 'system-ui, -apple-system, sans-serif', 'fontSize': '12px' } } }%%
 graph TD
@@ -30,7 +71,7 @@ graph TD
     status table`")] -.->|idempotency| Conn
 ```
 
-### 2. Request Lifecycle (Core Agentic & RAG Engine)
+### 2. Request Lifecycle Diagram
 ```mermaid
 %%{init: { 'themeVariables': { 'fontFamily': 'system-ui, -apple-system, sans-serif', 'fontSize': '12px' } } }%%
 graph TD
@@ -75,8 +116,9 @@ graph TD
     Out -->|save + trace run_end| Broker
     Out -->|conversation history| SQL[("MySQL")]
 ```
+</details>
 
-**Graph properties**
+**Key Graph Properties:**
 *   **Self-corrective RAG (CRAG):** `retrieve → grade_documents → {generate | rewrite_query → retrieve (loop) | web_search}`, guarded by `REFLECTION_MAX=2`. Documents are graded by rerank `relevance_score` (threshold `DOC_GRADE_THRESHOLD=0.35`) with an LLM-as-judge batch fallback for borderline docs.
 *   **Multi-agent handoff:** `Command(goto=...)` edges — `agent_tools → retrieve` (agent needs legal docs), `generate → web_search` (canned "not found"), `web_search → agent_tools` (needs tool use). Three once-per-run guard flags prevent cycles.
 *   **Checkpointing:** `RedisSaver` (requires Redis Stack / RedisJSON) with `MemorySaver` auto-fallback; isolation by `thread_id = conversation_id`, so multi-turn follow-ups resume state.
@@ -87,7 +129,7 @@ graph TD
 
 ---
 
-## 📂 Project Structure
+## III. Project Structure
 
 ```
 backend/src/
@@ -104,7 +146,7 @@ backend/src/
 ├── config.py               # CRAG constants (REFLECTION_MAX, DOC_GRADE_THRESHOLD, ...)
 ├── vectorize.py / models.py / database.py / cache.py  # storage layer (models.py: GraphRun, AgentStep)
 ├── import_data.py          # Legacy JSONL importer (incremental)
-└── pipeline/               # Multi-source ingestion pipeline
+└── pipeline/               # Multi-source Ingestion Pipeline
     ├── orchestrator.py     # one core loop, idempotent, per-doc isolation
     ├── run.py              # CLI entrypoint
     ├── schema.py           # RawDocument / ParsedDocument / ChunkedDocument (frozen)
@@ -124,7 +166,7 @@ docs/                       # ARCHITECTURE.md, TESTING.md, drawio template
 
 ---
 
-## 🌟 Key Features
+## IV. Key Features & Capabilities
 
 ### 1. Multi-Source Ingestion Pipeline (`backend/src/pipeline/`)
 One orchestrator loop, many connectors. Adding a data source = adding one connector — no per-source clones of the fetch→parse→chunk→embed logic.
@@ -135,11 +177,8 @@ One orchestrator loop, many connectors. Adding a data source = adding one connec
 *   **Incremental embeddings:** MD5 chunk hashes detect unchanged chunks (skip) and orphaned chunks (delete from Qdrant + MySQL). Writes into the **same** Qdrant collection the RAG engine reads from — no second serving store.
 *   **CLI + REST:** `python -m pipeline.run --source-type ...` or `POST /pipeline/ingest`.
 
-### 2. LangGraph Self-Corrective Multi-Agent Graph & Query Expansion
+### 2. LangGraph Intent Router & Query Expansion
 *   **Intent Classification:** routes user queries to the optimal pipeline (`legal_rag`, `agent_tools`, `web_search`, `general_chat`) with a keyword-heuristic fallback when the LLM route is invalid.
-*   **Self-Corrective RAG (CRAG):** `retrieve → grade_documents → {generate | rewrite_query → retrieve (loop) | web_search}`, guarded by `REFLECTION_MAX=2`. Docs graded by rerank score (threshold `0.35`) + LLM-as-judge batch fallback. When retrieval is irrelevant, the graph rewrites the query and retries; after the reflection cap it falls back to web search.
-*   **Multi-Agent Handoff:** `Command(goto=...)` edges let agents redirect the flow mid-turn — `agent_tools → retrieve` (agent needs legal docs), `generate → web_search` (canned "not found"), `web_search → agent_tools` (needs tool use). Once-per-run guard flags prevent cycles.
-*   **Redis Checkpointing:** `RedisSaver` (Redis Stack) with `MemorySaver` auto-fallback; per-`thread_id` state so multi-turn follow-ups resume context.
 *   **Contextual Query Rewriter:** rewrites short follow-ups into standalone questions using conversation history (e.g. *"What if it is 15 days late?"* → *"What is the contract penalty for a 15-day delay?"*).
 *   **Synonym Query Expansion:** expands queries with Vietnamese legal synonyms to maximize retrieval recall.
 
@@ -150,7 +189,7 @@ One orchestrator loop, many connectors. Adding a data source = adding one connec
 *   **Garbage Collection:** automatically deletes orphaned vector chunks from Qdrant and metadata rows from MySQL.
 
 ### 4. Agentic Legal Calculators (ReAct Agent)
-Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing the module never requires LLM env vars/network). Memory is **per-conversation** — keyed by `(user_id, conversation_id)` in an LRU cache (cap 32), fixing a prior global-memory cross-user leak. Tool calls are captured via the `agent_tool_calls` contextvar (`@track_tool_call`) and surfaced through the graph → Celery result → async poll as an optional `tool_calls` array. The agent triggers programmatic tools, each guarded by input-range validation:
+Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing the module never requires LLM env vars/network). The agent triggers programmatic tools, each guarded by input-range validation:
 *   **Contract Penalty Calculator:** penalty fees under commercial law, applying the 12% legal ceiling cap of contract value.
 *   **Inheritance Share Calculator:** splits inheritance among the first line of heirs under the Vietnamese Civil Code.
 *   **Legal Age Verifier:** checks age eligibility for signing contracts, marriage, work, and criminal liability (gender-aware: male 20 / female 18 for marriage).
@@ -168,52 +207,54 @@ Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing t
 
 ### 7. Hardened Admin Surface
 *   **API-key auth:** admin endpoints (`collection/create`, `document/create`, `data/import`, `pipeline/ingest`, `collections/.../clean`) require `X-API-Key` matching `ADMIN_API_KEY`. When unset, endpoints are **refused** unless `ALLOW_UNSAFE_ADMIN=1` (dev only).
-*   **Path-traversal guard:** ingestion paths are resolved safely under the data dir (`IMPORT_DATA_DIR`) — `../../etc/passwd`-style doc_ids/paths cannot escape.
-*   **No data leakage:** the Vietnamese LLM endpoint has no hardcoded public IP default — it must be configured explicitly; internal errors return a generic user-facing message (details logged server-side only).
-*   **Collection name validation:** FastAPI field patterns constrain collection/source identifiers.
-
-### 8. Multi-Provider LLM Routing
-Generation routes by `LLM_PROVIDER` (`groq` | `ollama` | `openai`) with graceful fallback (Vietnamese LLM API → Groq; Ollama main → Groq). Token usage is accumulated in-process via a `usage_accumulator` contextvar for cost metrics — no external tracing service required.
-
-### 9. Comprehensive RAG Evaluation Suite
-A 4-pillar framework tracking operational metrics (token count, API cost, latency TTFT/TTLT), quality metrics (LLM-as-judge faithfulness/relevance), agentic metrics (tool-call success via the `agent_tool_calls` contextvar, router accuracy), and failure-mode analysis (Retrieval / Routing / Hallucination / Execution).
-
-> **Observability note (tracing):** Tracing is **self-hosted** by design: every graph run is persisted as a `GraphRun` + `AgentStep` rows in MySQL and published to a Redis pub/sub channel (`graph_trace_events`) for live SSE streaming. Tool-call tracking and token-usage accumulation are in-process contextvars feeding the eval suite. **No LangSmith / Langfuse / OpenTelemetry, no cloud egress** — Vietnamese legal data stays local. If external tracing is ever desired, add a LangSmith/Langfuse callback; it is off by default and the self-hosted trace keeps working independently.
+*   **Path-traversal guard:** ingestion paths are resolved safely under `IMPORT_DATA_DIR`; traversal segments cannot escape.
+*   **CORS & Validation:** strict collection-name validation and customizable CORS origin whitelist.
 
 ---
 
-## 🛠️ Technology Stack
+## V. Technology Stack
 
-*   **Frontend:** Streamlit
-*   **Backend API:** FastAPI
-*   **Task Queue:** Celery + Redis
-*   **Vector DB:** Qdrant
-*   **Relational DB:** PostgreSQL / MySQL
-*   **RAG & Agent Framework:** LlamaIndex, LangGraph (StateGraph + `Command` handoff + RedisSaver checkpoint), NVIDIA NeMo Guardrails
-*   **Streaming / Tracing:** sse-starlette (SSE), self-hosted MySQL `graph_runs`/`agent_steps` + Redis pub/sub trace (no LangSmith/Langfuse)
-*   **Language Models:** Llama-3.1 (via Groq), Cohere Rerank, Sentence Transformers / custom Vietnamese embedding (local serve on :5000), optional Ollama / OpenAI
+*   **Frontend UI:** Streamlit (Python)
+*   **Backend API Framework:** FastAPI
+*   **Background Tasks & Queue:** Celery + Redis
+*   **Vector Database:** Qdrant DB
+*   **Relational Database:** PostgreSQL / MySQL (for logs, chat history, and status checks)
+*   **AI Agent & Retrieval Orchestration:** LlamaIndex, LangGraph, NVIDIA NeMo Guardrails
+*   **Vietnamese Text Embedding:** BGE-M3 (locally hosted/served, or Cohere cloud backup)
+*   **LLM Providers:** Llama-3.1-8B-Instruct (via Groq/Ollama), OpenAI, self-hosted Legal LLM
+*   **CI/CD & Containers:** Docker, Docker Compose, GitHub Actions
+*   **Hosting/Cloud Infrastructure:** DigitalOcean Spaces (object storage), DigitalOcean Droplets
 
 ---
 
-## 🚀 Installation & Setup
+## VI. Quick Start Guide
 
-### 1. Configuration (`.env`)
-Copy the template in `backend/` and configure environment variables:
+### 1. Prerequisites
+- Docker and Docker Compose v2.0+
+- Python 3.10+ (for local development)
+- 8GB+ RAM (16GB recommended)
+
+### 2. Setup Configuration
 ```bash
+# Clone the repository
+git clone https://github.com/NMCuonG08/Chatbot-Legal-RAG.git
+cd Chatbot-Legal-RAG
+
+# Copy environment template
 cp backend/.env.example backend/.env
 ```
-Key variables:
-*   `GROQ_API_KEY`: Groq LLM API key (default provider).
-*   `COHERE_API_KEY`: Cohere Rerank API key.
-*   `TAVILY_API_KEY`: Tavily Search API key.
-*   `ADMIN_API_KEY`: required to call admin/ingestion endpoints (set, or dev `ALLOW_UNSAFE_ADMIN=1`).
-*   `VIETNAMESE_LLM_API_URL`: optional self-hosted Vietnamese Legal LLM endpoint.
-*   `LLM_PROVIDER`: `groq` | `ollama` | `openai`.
-*   `IMPORT_DATA_DIR`: root dir for ingestion path resolution (path-traversal guard).
 
-### 2. Running the Application
+Edit `backend/.env` with your API keys:
+```env
+GROQ_API_KEY=gsk_your_key_here
+TAVILY_API_KEY=tvly-your_key_here
+COHERE_API_KEY=your_key_here
+ADMIN_API_KEY=your_admin_secret_key
+DATABASE_URL=postgresql://postgres:password@localhost:5432/legal_chatbot
+REDIS_URL=redis://localhost:6379/0
+```
 
-Ensure Docker services (Qdrant, Redis, PostgreSQL/MySQL) are up, then start:
+### 3. Run the Services
 
 **Celery Worker:**
 ```bash
@@ -227,44 +268,102 @@ cd backend/src
 uvicorn app:app --host 0.0.0.0 --port 8002
 ```
 
-**Streamlit UI:**
+**Streamlit Frontend:**
 ```bash
 cd frontend
 streamlit run chat_interface.py --server.port 8501
 ```
 
-### 3. Database Ingestion
+---
 
-Two ingestion paths exist:
+## VII. Data Ingestion Pipeline
 
-**A. New multi-source pipeline (recommended):** handles JSONL, Markdown, HTML, and PDF. Idempotent, with per-doc isolation and incremental embeddings.
+Detailed workflow configuration for the ingestion stages.
+
 ```bash
 cd backend/src
+# Ingest JSONL document format
 python -m pipeline.run --source-type jsonl --path ../../data/train.jsonl --collection llm
+# Ingest Markdown documents
 python -m pipeline.run --source-type markdown --path ../../data/legal_md
+# Ingest raw HTML pages
 python -m pipeline.run --source-type html --path ../../data/legal_html
-python -m pipeline.run --source-type pdf --path ../../data/legal_pdf --no-semantic   # token chunking
-```
-Or via REST (requires `X-API-Key`):
-```bash
-curl -X POST http://localhost:8002/pipeline/ingest \
-  -H "X-API-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"source_type":"jsonl","path":"data/train.jsonl","collection_name":"llm"}'
+# Ingest PDF documents (token chunking)
+python -m pipeline.run --source-type pdf --path ../../data/legal_pdf --no-semantic
 ```
 
-**B. Legacy JSONL importer** (`import_data.py`, still supported): incremental MD5-based import, falls back to Cohere cloud embeddings if the local embedding service on :5000 is down.
-```bash
-cd backend
-python src/import_data.py --data-file ../data_pipeline/data/finetune_data/train_qa_format.jsonl --collection llm
-```
+### 1. Data Storage
+Data pipeline files and parsed assets are managed securely:
+
+![Data Storage](asset/data_store.png)
+
+### 2. Data Statistics
+- **Legal Corpus**: 1.9M+ Vietnamese legal documents
+- **Training Data**: 225K+ high-quality Q&A pairs
+- **Fine-tuning Sets**: 3 specialized datasets
+- **Coverage**: Complete coverage of major Vietnamese legal codes
 
 ---
 
-## 🔌 API Endpoints
+## VIII. Model Training & Evaluation
+
+### 1. Training Configuration
+Models are optimized using tailored hyperparameters:
+
+![Training Configuration](asset/config_training.png)
+
+### 2. Training Metrics
+Real-time monitoring of loss and performance curves:
+
+![Training Metrics](asset/metrics_train.png)
+
+### 3. Evaluation Results
+Comprehensive benchmarks on Vietnamese legal tasks:
+
+![Evaluation Results](asset/evaluation.png)
+
+### 4. Embedding Model Verification
+Verify embedding vectors are calculated correctly:
+
+![Embedding Check](asset/check_embedding.png)
+
+---
+
+## IX. Production Deployment
+
+📖 **[GPU CPU Deployment Guide](embed_serving/GPU_CPU_DEPLOYMENT_GUIDE.md)**
+
+Deploy to staging or production using Docker Compose in production mode:
+```bash
+cd embed_serving
+docker-compose -f docker-compose.serving.yml up -d
+```
+
+### Security checklist:
+- [x] API rate limiting enabled
+- [x] Database credentials encrypted
+- [x] HTTPS/SSL certificates setup
+- [x] Firewall rules configured
+- [x] Local tracing (no third-party cloud data leak)
+
+---
+
+## X. Testing & Quality Assurance
+
+Run the test suite with `pytest` from the root directory:
+```bash
+python -m pytest tests/ -v
+```
+
+See [`docs/TESTING.md`](docs/TESTING.md) for full test suite coverage (including security layer, checkpointing, trace tables, CRAG flows, SSE streaming, and memory leakage tests).
+
+---
+
+## XI. API Documentation
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
-| GET | `/` | – | Root |
+| GET | `/` | – | Root check |
 | GET | `/health` | – | Health check |
 | GET | `/collections` | – | List Qdrant collections |
 | GET | `/documents` | – | List documents |
@@ -273,7 +372,7 @@ python src/import_data.py --data-file ../data_pipeline/data/finetune_data/train_
 | DELETE | `/history/{user_id}` | API key | Clear history |
 | POST | `/chat/complete` | – | Submit a chat query (async Celery task) |
 | GET | `/chat/complete/{task_id}` | – | Poll task result |
-| GET | `/chat/stream/{task_id}` | – | SSE live trace stream (filtered by run_id, closes on run_end) |
+| GET | `/chat/stream/{task_id}` | – | SSE live trace stream |
 | POST | `/collection/create` | API key | Create a Qdrant collection |
 | DELETE | `/collections/{name}/clean` | API key | Delete vectors in a collection |
 | POST | `/document/create` | API key | Create a document |
@@ -286,10 +385,20 @@ python src/import_data.py --data-file ../data_pipeline/data/finetune_data/train_
 
 ---
 
-## ✅ Testing
+## XII. Disclaimer & Terms
 
-Tests run with `pytest` from the repo root — `tests/conftest.py` adds `backend/src` to `sys.path` automatically.
-```bash
-python -m pytest tests/ -q
-```
-Coverage spans the security layer, semantic cache, legal tools, evaluation harness, and the full pipeline (connectors, parsers, chunker, storage, state, embedder, orchestrator idempotency/failure isolation). See [`docs/TESTING.md`](docs/TESTING.md).
+> [!WARNING]
+> This system is designed for **research, educational, and reference support purposes**.
+> AI-generated results cannot replace consultation from qualified legal professionals. Always verify information with legal professionals before making decisions. The system may have errors and does not guarantee 100% accuracy.
+
+---
+
+<div align="center">
+
+**⭐ If this project is helpful, please star the repository to support the development team! ⭐**
+
+Made with ❤️ for Vietnamese Legal Community
+
+[🌟 Star](https://github.com/NMCuonG08/Chatbot-Legal-RAG/stargazers) • [🍴 Fork](https://github.com/NMCuonG08/Chatbot-Legal-RAG/fork) • [📚 Docs](docs/ARCHITECTURE.md) • [💬 Discord](https://discord.gg/legal-chatbot)
+
+</div>
