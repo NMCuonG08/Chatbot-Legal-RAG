@@ -56,10 +56,17 @@ switch ($Action) {
         Start-Process powershell -ArgumentList '-NoExit', '-Command', '$Host.UI.RawUI.WindowTitle="FastAPI Backend"; Set-Location backend/src; if (Test-Path "../../.venv") { ..\..\.venv\Scripts\Activate.ps1 }; uvicorn app:app --host 0.0.0.0 --port 8002'
         Start-Process powershell -ArgumentList '-NoExit', '-Command', '$Host.UI.RawUI.WindowTitle="Streamlit UI"; Set-Location frontend; if (Test-Path "../.venv") { ..\.venv\Scripts\Activate.ps1 }; streamlit run chat_interface.py --server.port 8501'
     }
+    "stop" {
+        Write-Host "Stopping Celery Worker, FastAPI Backend, and Streamlit UI..." -ForegroundColor Red
+        $titles = "Celery Worker", "FastAPI Backend", "Streamlit UI"
+        Get-Process | Where-Object { $_.MainWindowTitle -in $titles } | Stop-Process -Force
+        Write-Host "All app services stopped!" -ForegroundColor Green
+    }
     default {
-        Write-Host "Usage: .\scripts\dev.ps1 [up | setup | app]"
+        Write-Host "Usage: .\scripts\dev.ps1 [up | setup | app | stop]"
         Write-Host "  up     - start Redis + MariaDB + Qdrant + Prometheus + Grafana via docker compose"
         Write-Host "  setup  - pip install + create DB schema + Qdrant collections"
         Write-Host "  app    - launch Celery worker + FastAPI + Streamlit"
+        Write-Host "  stop   - terminate all 3 launched app services"
     }
 }
