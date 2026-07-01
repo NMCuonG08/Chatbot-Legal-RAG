@@ -12,55 +12,69 @@ The system is structured into two main components: the **Multi-Source Ingestion 
 
 ### 1. Multi-Source Ingestion Pipeline
 ```mermaid
+%%{init: { 'themeVariables': { 'fontFamily': 'system-ui, -apple-system, sans-serif', 'fontSize': '12px' } } }%%
 graph TD
-    Dir[(JSONL / Markdown / HTML / PDF)] --> Conn[Connectors]
-    Conn -->|fetch| Raw[(Raw tier - immutable)]
-    Raw --> Parse[Parsers - by source_type]
-    Parse --> Proc[(Processed tier)]
-    Proc --> Chunk[Chunker - semantic/token]
-    Chunk --> Serv[(Serving tier)]
+    Dir["JSONL / MD / HTML / PDF"] --> Conn[Connectors]
+    Conn -->|fetch| Raw[("`Raw tier
+    (immutable)`")]
+    Raw --> Parse["`Parsers
+    (by source_type)`"]
+    Parse --> Proc[("Processed tier")]
+    Proc --> Chunk["`Chunker
+    (semantic/token)`"]
+    Chunk --> Serv[("Serving tier")]
     Chunk --> Emb[Embedder]
-    Emb --> Q1[(Qdrant collection)]
-    Emb --> Q2[(MySQL chunk metadata)]
-    State[(pipeline_documents status table)] -.->|idempotency| Conn
+    Emb --> Q1[("Qdrant collection")]
+    Emb --> Q2[("MySQL chunk metadata")]
+    State[("`pipeline_documents
+    status table`")] -.->|idempotency| Conn
 ```
 
 ### 2. Request Lifecycle (Core Agentic & RAG Engine)
 ```mermaid
+%%{init: { 'themeVariables': { 'fontFamily': 'system-ui, -apple-system, sans-serif', 'fontSize': '12px' } } }%%
 graph TD
     User([User]) -->|Submits query| UI[Streamlit Frontend]
     UI -->|POST /chat/complete| API[FastAPI Backend]
-    API -->|Celery task| Broker[(Redis broker)]
+    API -->|Celery task| Broker[("Redis broker")]
     Worker[Celery Worker] <-->|Fetch & process| Broker
 
-    Worker -->|checkpoint per thread_id| Ckpt[(RedisSaver checkpoint)]
-    Worker -->|emit_step / run_start / run_end| Trace[(MySQL graph_runs + agent_steps)]
-    Trace -->|publish| Pub[(Redis pub/sub: graph_trace_events)]
-    UI -.->|GET /chat/stream SSE, filter by run_id| Pub
+    Worker -->|Save checkpoints| Ckpt[("`RedisSaver
+    checkpoint`")]
+    Worker -->|Emit steps & runs| Trace[("`MySQL graph_runs
+    + agent_steps`")]
+    Trace -->|publish| Pub[("`Redis pub/sub
+    graph_trace_events`")]
+    UI -.->|SSE stream| Pub
 
     Worker -->|1. Input guardrails| Guard[NeMo Guardrails]
     Guard -->|2. Route| Router{LangGraph Router}
 
     Router -->|legal_rag| CRAG
-    Router -->|agent_tools| Agent[ReAct Agent + per-conv memory]
+    Router -->|agent_tools| Agent["`ReAct Agent
+    (per-conv memory)`"]
     Router -->|web_search| Web[Web Search]
     Router -->|general_chat| Gen[General Chat]
 
     subgraph CRAG [Self-Corrective RAG loop]
-        Retr[Retrieve: multi-query + hybrid] --> Grade[Grade docs: LLM-as-judge + rerank score]
-        Grade -->|relevant subset| GenRag[Generate + groundedness guard]
-        Grade -->|all irrelevant, under cap| Rew[Rewrite query]
+        Retr["`Retrieve
+        (multi-query + hybrid)`"] --> Grade["`Grade docs
+        (LLM-as-judge + rerank)`"]
+        Grade -->|relevant subset| GenRag["`Generate
+        (groundedness guard)`"]
+        Grade -->|irrelevant
+        (under cap)| Rew[Rewrite query]
         Rew --> Retr
         Grade -->|cap reached| WebF[Web fallback]
     end
 
-    Agent -->|Command handoff: needs legal lookup| Retr
-    GenRag -->|Command handoff: not found| Web
-    Web -->|Command handoff: needs tool| Agent
+    Agent -->|Handoff: legal| Retr
+    GenRag -->|Handoff: not found| Web
+    Web -->|Handoff: tool| Agent
 
-    GenRag & Agent & Web & Gen -->|Output guardrails + disclaimer| Out[Final response]
+    GenRag & Agent & Web & Gen -->|Output guardrails| Out[Final response]
     Out -->|save + trace run_end| Broker
-    Out -->|conversation history| SQL[(MySQL)]
+    Out -->|conversation history| SQL[("MySQL")]
 ```
 
 **Graph properties**
