@@ -113,10 +113,16 @@ class CustomEmbeddingService:
             return False
 
     def _cohere_batch_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate a batch of embeddings using Cohere Cloud API with retry on rate limits."""
-        cohere_api_key = os.environ.get("COHERE_API_KEY")
-        if not cohere_api_key:
-            raise ValueError("COHERE_API_KEY is not configured")
+        """Generate a batch of embeddings using Cohere Cloud API with retry and key rotation on rate limits."""
+        keys_str = os.environ.get("COHERE_API_KEYS", "")
+        if keys_str:
+            api_keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+        else:
+            single_key = os.environ.get("COHERE_API_KEY")
+            api_keys = [single_key] if single_key else []
+            
+        if not api_keys:
+            raise ValueError("Neither COHERE_API_KEYS nor COHERE_API_KEY is configured")
         
         import time
         import requests
@@ -125,18 +131,22 @@ class CustomEmbeddingService:
         sub_batch_size = 90
         all_embeddings = []
         
-        headers = {
-            "Authorization": f"Bearer {cohere_api_key}",
-            "Content-Type": "application/json"
-        }
+        if not hasattr(self.__class__, "_current_key_idx"):
+            self.__class__._current_key_idx = 0
         
         for idx in range(0, len(texts), sub_batch_size):
             sub_batch = texts[idx:idx + sub_batch_size]
-            max_retries = 6
+            max_retries = len(api_keys) * 3
             base_delay = 5 # seconds
             
             sub_embeddings = None
             for attempt in range(max_retries):
+                current_key = api_keys[self.__class__._current_key_idx % len(api_keys)]
+                headers = {
+                    "Authorization": f"Bearer {current_key}",
+                    "Content-Type": "application/json"
+                }
+                
                 try:
                     payload = {
                         "texts": sub_batch,
@@ -155,29 +165,45 @@ class CustomEmbeddingService:
                         sub_embeddings = data.get("embeddings", [])
                         break
                     elif response.status_code == 429:
-                        delay = base_delay * (2 ** attempt)
-                        logger.warning(f"⚠️ Cohere Rate Limit hit (429) via direct API. Retrying in {delay} seconds... (Attempt {attempt+1}/{max_retries})")
-                        time.sleep(delay)
+                        logger.warning(f"⚠️ Cohere Rate Limit (429) hit on key index {self.__class__._current_key_idx % len(api_keys)}. Rotating to next key...")
+                        self.__class__._current_key_idx += 1
+                        
+                        if len(api_keys) == 1:
+                            delay = base_delay * (2 ** attempt)
+                            logger.info(f"⏱️ Only 1 API key configured. Sleeping for {delay} seconds...")
+                            time.sleep(delay)
+                        else:
+                            if attempt >= len(api_keys):
+                                sleep_time = 2.0
+                                logger.info(f"⏱️ All keys recently hit rate limits. Sleeping {sleep_time}s before next attempt...")
+                                time.sleep(sleep_time)
                     else:
-                        logger.error(f"❌ Cohere direct API failed with status {response.status_code}: {response.text}")
+                        logger.error(f"❌ Cohere API failed (Status {response.status_code}) on key index {self.__class__._current_key_idx % len(api_keys)}: {response.text}")
+                        self.__class__._current_key_idx += 1
                         if attempt == max_retries - 1:
-                            raise Exception(f"Cohere API returned {response.status_code}")
+                            raise Exception(f"Cohere API returned status {response.status_code}")
                         time.sleep(2)
                         
                 except Exception as e:
-                    logger.error(f"❌ Connection error to Cohere direct API: {e}")
+                    logger.error(f"❌ Connection error to Cohere API on key index {self.__class__._current_key_idx % len(api_keys)}: {e}")
+                    self.__class__._current_key_idx += 1
                     if attempt == max_retries - 1:
                         raise e
                     time.sleep(2)
             
             if sub_embeddings is None:
-                raise Exception("Failed to get embeddings from Cohere after retries.")
+                raise Exception("Failed to get embeddings from Cohere after retries across rotated keys.")
             all_embeddings.extend(sub_embeddings)
             
-            # Sleep 6 seconds between sub-batches to respect the 10 RPM rate limit
-            if idx + sub_batch_size < len(texts):
+            # Balance load across keys for the next chunk
+            self.__class__._current_key_idx += 1
+            
+            # Delay between sub-batches
+            if len(api_keys) == 1 and idx + sub_batch_size < len(texts):
                 logger.info("⏱️ Sleeping 6 seconds before next Cohere sub-batch to respect rate limits...")
                 time.sleep(6.0)
+            elif len(api_keys) > 1:
+                time.sleep(0.5)
                 
         return all_embeddings
 

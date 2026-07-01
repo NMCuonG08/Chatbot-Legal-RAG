@@ -30,6 +30,15 @@ class Settings(BaseSettings):
     celery_result_backend: str | None = None
     redis_url: str = "redis://localhost:6379/0"
 
+    # LangGraph checkpointing (Phase B). default_ttl is in MINUTES for RedisSaver.
+    langgraph_checkpoint_ttl_seconds: int = 86400  # 24h
+    # Force in-process MemorySaver (no Redis needed) for local dev / tests.
+    use_memory_saver: bool = False
+
+    # Trace pub/sub (Phase C). Separate Redis DB index to avoid broker/checkpointer contention.
+    trace_redis_channel: str = "graph_trace_events"
+    trace_redis_url: str = "redis://localhost:6379/1"
+
     def resolve_db_url(self) -> str:
         # Priority: DATABASE_URL(any SQLAlchemy-supported URL) ->
         # MARIADB_DSN -> composed mysql URL from parts.

@@ -2,7 +2,7 @@ import asyncio
 import logging
 from xml.dom import ValidationErr
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, delete
+from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, delete
 from sqlalchemy.future import select
 from sqlalchemy.orm import DeclarativeBase, Session
 from sqlalchemy.sql import func
@@ -191,6 +191,113 @@ class UserEpisode(Base):
     user_id = Column(String(100), nullable=False, index=True)
     summary = Column(String)  # Summary of episodic interaction
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class GraphRun(Base):
+    """One LangGraph invocation (a single chat turn through the CRAG graph)."""
+    __tablename__ = "graph_runs"
+
+    id = Column(String(64), primary_key=True)  # run_id (uuid4 hex)
+    thread_id = Column(String(64), nullable=False, index=True)  # = conversation_id
+    user_id = Column(String(100), nullable=True)
+    question = Column(String)
+    route = Column(String(32), nullable=True)
+    final_response = Column(String)
+    status = Column(String(16), default="running")  # running|completed|error
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    ended_at = Column(DateTime(timezone=True), nullable=True)
+    reflection_count = Column(Integer, default=0)
+    tool_calls_json = Column(JSON)  # final ReAct tool-call accumulator
+
+
+class AgentStep(Base):
+    """One trace event within a GraphRun (node start/end, tool call, handoff, llm)."""
+    __tablename__ = "agent_steps"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(64), nullable=False, index=True)
+    node = Column(String(64), nullable=False)
+    step_index = Column(Integer, default=0)
+    event_type = Column(String(32), nullable=False)  # node_start|node_end|tool_call|handoff|llm
+    payload = Column(JSON)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+def save_graph_run(run_id: str, thread_id: str, user_id: str | None, question: str,
+                   status: str = "running", db: Session = None) -> GraphRun:
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        run = GraphRun(
+            id=run_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            question=question,
+            status=status,
+        )
+        db.add(run)
+        if session_created:
+            db.commit()
+            db.refresh(run)
+        return run
+    finally:
+        if session_created:
+            db.close()
+
+
+def update_graph_run(run_id: str, *, status: str | None = None,
+                     final_response: str | None = None, route: str | None = None,
+                     reflection_count: int | None = None,
+                     tool_calls_json=None, db: Session = None) -> None:
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        run = db.get(GraphRun, run_id)
+        if run is None:
+            return
+        if status is not None:
+            run.status = status
+        if final_response is not None:
+            run.final_response = final_response
+        if route is not None:
+            run.route = route
+        if reflection_count is not None:
+            run.reflection_count = reflection_count
+        if tool_calls_json is not None:
+            run.tool_calls_json = tool_calls_json
+        if status in ("completed", "error"):
+            run.ended_at = func.now()
+        if session_created:
+            db.commit()
+    finally:
+        if session_created:
+            db.close()
+
+
+def save_agent_step(run_id: str, node: str, step_index: int, event_type: str,
+                    payload, db: Session = None) -> None:
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        step = AgentStep(
+            run_id=run_id,
+            node=node,
+            step_index=step_index,
+            event_type=event_type,
+            payload=payload,
+        )
+        db.add(step)
+        if session_created:
+            db.commit()
+    finally:
+        if session_created:
+            db.close()
 
 
 def save_user_episode(user_id: str, summary: str, db: Session = None):

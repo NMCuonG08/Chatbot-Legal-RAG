@@ -1,6 +1,9 @@
 import asyncio
 from functools import lru_cache
 import logging
+import os
+import re
+import uuid
 from copy import copy
 from pathlib import Path
 from typing import Dict, List, TypedDict
@@ -8,6 +11,14 @@ from typing import Dict, List, TypedDict
 from celery import shared_task
 from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
+from langgraph.checkpoint.memory import MemorySaver
+
+try:
+    from langgraph.checkpoint.redis import RedisSaver
+    _REDIS_SAVER_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    RedisSaver = None  # type: ignore
+    _REDIS_SAVER_AVAILABLE = False
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -20,7 +31,12 @@ from brain import (
     openai_chat_complete,
     vietnamese_llm_chat_complete,
 )
-from config import DEFAULT_COLLECTION_NAME
+from config import (
+    DEFAULT_COLLECTION_NAME,
+    DOC_GRADE_THRESHOLD,
+    REFLECTION_MAX,
+    ALL_IRRELEVANT_THRESHOLD,
+)
 from database import get_celery_app, SessionLocal, settings
 from models import (
     ensure_database_schema,
@@ -38,6 +54,7 @@ from search import hybrid_search, search_engine  # Import new hybrid search
 from splitter import split_document
 from summarizer import summarize_text
 from tavily_tool import tavily_search_legal
+from langgraph.types import Command
 from utils import setup_logging
 from vectorize import add_vector, search_vector, delete_vectors_by_ids, delete_vectors_by_filter
 
@@ -49,6 +66,60 @@ redis_client = redis.from_url(settings.redis_url)
 
 from guardrails_manager import LegalGuardrailsManager
 guardrails_manager = LegalGuardrailsManager()
+
+from trace import emit_run_end, emit_run_start, emit_step
+
+
+def _trace_node_end(state: "ChatGraphState", node: str, payload: Dict) -> None:
+    """Best-effort node_end trace. No-op when run_id absent (e.g. legacy callers)."""
+    run_id = state.get("run_id")
+    if not run_id:
+        return
+    emit_step(run_id, state.get("thread_id", ""), node, "node_end", payload)
+
+
+def _trace_handoff(state: "ChatGraphState", src: str, dst: str, reason: str) -> None:
+    """Emit a handoff trace event (Phase D). Best-effort."""
+    run_id = state.get("run_id")
+    if not run_id:
+        return
+    emit_step(run_id, state.get("thread_id", ""), src, "handoff", {"from": src, "to": dst, "reason": reason})
+
+
+# ---- Phase D multi-agent handoff predicates ----
+# Pure string heuristics: detect canned "I don't have this" answers that should
+# trigger a handoff to a more capable agent instead of ending the turn.
+_HANDOFF_NOT_FOUND_MARKERS = (
+    "không tìm thấy", "không tìm thấy thông tin", "không có đủ thông tin",
+    "tôi không có thông tin", "không có trong tài liệu", "vượt quá khả năng",
+)
+_HANDOFF_NEEDS_LOOKUP_MARKERS = (
+    "cần tra cứu", "tra cứu văn bản", "tôi sẽ tra cứu", "hãy tham khảo văn bản",
+)
+
+
+def _should_handoff_to_rag(answer: str) -> bool:
+    """agent_tools -> retrieve: agent answer says it needs legal-doc lookup."""
+    if not answer:
+        return False
+    low = answer.lower()
+    return any(m in low for m in _HANDOFF_NEEDS_LOOKUP_MARKERS)
+
+
+def _should_handoff_to_web(answer: str) -> bool:
+    """generate -> web_search: RAG answer is a canned 'not found' message."""
+    if not answer:
+        return False
+    low = answer.lower()
+    return any(m in low for m in _HANDOFF_NOT_FOUND_MARKERS)
+
+
+def _should_handoff_to_agent(answer: str) -> bool:
+    """web_search -> agent_tools: web result looks like a question needing tool use."""
+    if not answer:
+        return False
+    low = answer.lower()
+    return any(m in low for m in _HANDOFF_NEEDS_LOOKUP_MARKERS)
 
 
 # ---- Persistent event loop for async guardrails calls inside sync Celery tasks ----
@@ -105,6 +176,22 @@ class ChatGraphState(TypedDict, total=False):
     response: str
     sources: List[Dict]
     user_id: str
+    # CRAG (self-corrective RAG)
+    documents: List[Dict]            # retrieved + reranked docs
+    graded_docs: List[Dict]          # docs tagged with relevance: "relevant"|"irrelevant"
+    rewritten_query: str             # query produced by rewrite_query_node on loop
+    web_search_fallback_used: bool
+    reflection_count: int            # CRAG loop guard (incremented in grade_documents_node)
+    # multi-agent handoff (Phase D) + ReAct surfacing (Phase E) + trace (Phase C)
+    messages: List[Dict]
+    tool_calls: List[Dict]
+    run_id: str
+    thread_id: str
+    # Phase D handoff guards — each directed edge fires at most once per run,
+    # preventing agent_tools <-> web_search <-> generate cycles.
+    agent_to_rag_done: bool
+    generate_to_web_done: bool
+    web_to_agent_done: bool
 
 celery_app = get_celery_app(__name__)
 celery_app.autodiscover_tasks()
@@ -186,6 +273,107 @@ def retrieve_with_multi_query_fallback(
     return all_docs
 
 
+def _retrieve_episodic_context(user_id: str | None, question: str) -> str:
+    """Retrieve relevant user episodic memories from the user_episodes Qdrant collection.
+
+    Returns a newline-joined bullet list of past user facts, or "" on miss/failure.
+    Extracted from generate_rag_answer so the CRAG generate_node can reuse it.
+    """
+    if not user_id:
+        return ""
+    try:
+        logger.info(f"Retrieving episodic memory for user: {user_id}")
+        query_vector = get_embedding(question)
+        episodes = search_vector(
+            collection_name="user_episodes",
+            vector=query_vector,
+            limit=3,
+            filters={"user_id": user_id},
+        )
+        if not episodes:
+            return ""
+        logger.info(f"Retrieved {len(episodes)} episodes for user: {user_id}")
+        lines = []
+        for ep in episodes:
+            summary = ep.get("content") or ep.get("summary") or ""
+            if summary:
+                lines.append(f"- {summary}")
+        return "\n".join(lines)
+    except Exception as ep_err:
+        logger.error(f"Failed to retrieve episodic memory for user {user_id}: {ep_err}")
+        return ""
+
+
+def _llm_judge_relevance(question: str, docs: List[Dict]) -> Dict[int, str]:
+    """LLM-as-judge relevance for borderline docs (those below the rerank score threshold).
+
+    Returns a mapping {content_hash -> "relevant"|"irrelevant"} for the docs the LLM
+    judged. Missing entries mean "unjudged" (caller defaults to irrelevant). Single
+    batched LLM call via the existing openai_chat_complete helper — no new client.
+    """
+    if not docs:
+        return {}
+    numbered = []
+    for i, doc in enumerate(docs):
+        content = (doc.get("content") or "")[:500]
+        numbered.append(f"[{i}] {content}")
+    prompt = (
+        "Đánh giá mỗi đoạn tài liệu dưới đây có liên quan đến câu hỏi pháp luật hay không.\n"
+        f"Câu hỏi: {question}\n"
+        f"Các đoạn:\n" + "\n".join(numbered) + "\n"
+        "Trả lời duy nhất 1 dòng cho mỗi đoạn theo định dạng: [index] yes  hoặc  [index] no\n"
+        "Không giải thích thêm."
+    )
+    try:
+        resp = openai_chat_complete([
+            {"role": "system", "content": "Bạn là bộ đánh giá relevance tài liệu pháp luật Việt Nam."},
+            {"role": "user", "content": prompt},
+        ])
+    except Exception as e:
+        logger.warning(f"LLM relevance judge failed, defaulting borderline docs to irrelevant: {e}")
+        return {}
+
+    verdicts: Dict[int, str] = {}
+    for line in resp.splitlines():
+        m = re.match(r"\[?\s*(\d+)\s*\]?\s*(yes|no)", line.strip().lower())
+        if not m:
+            continue
+        idx = int(m.group(1))
+        if 0 <= idx < len(docs):
+            verdicts[hash(docs[idx].get("content", ""))] = "relevant" if m.group(2) == "yes" else "irrelevant"
+    return verdicts
+
+
+def _tag_documents_relevance(documents: List[Dict], verdicts: Dict[int, str]) -> List[Dict]:
+    """Pure: tag each doc "relevant"|"irrelevant" using rerank score + LLM verdicts.
+
+    Docs with relevance_score >= DOC_GRADE_THRESHOLD -> relevant.
+    Otherwise consult verdicts (content_hash -> verdict); missing -> irrelevant.
+    Returns NEW dicts (no mutation of input).
+    """
+    graded = []
+    for doc in documents:
+        score = doc.get("relevance_score")
+        base = {**doc}
+        if score is not None and score >= DOC_GRADE_THRESHOLD:
+            base["relevance"] = "relevant"
+        else:
+            v = verdicts.get(hash(doc.get("content", "")))
+            base["relevance"] = v if v in ("relevant", "irrelevant") else "irrelevant"
+        graded.append(base)
+    return graded
+
+
+def _decide_after_grade(graded_docs: List[Dict], reflection_count: int) -> str:
+    """Pure routing decision after grading. Returns "generate"|"rewrite_query"|"web_search"."""
+    relevant_count = sum(1 for d in graded_docs if d.get("relevance") == "relevant")
+    if relevant_count >= ALL_IRRELEVANT_THRESHOLD:
+        return "generate"
+    if reflection_count >= REFLECTION_MAX:
+        return "web_search"
+    return "rewrite_query"
+
+
 def generate_rag_answer(history, question, user_id=None):
     """Pure function for RAG answer generation.
 
@@ -210,30 +398,8 @@ def generate_rag_answer(history, question, user_id=None):
     ranked_docs = rerank_documents(retrieved_docs, standalone_question, top_n=5)
     logger.info(f"Top {len(ranked_docs)} documents after reranking")
 
-    # Episodic memory retrieval: Retrieve relevant user history from user_episodes collection
-    episodic_context = ""
-    if user_id:
-        try:
-            logger.info(f"Retrieving episodic memory for user: {user_id}")
-            # Generate query embedding
-            query_vector = get_embedding(standalone_question)
-            episodes = search_vector(
-                collection_name="user_episodes",
-                vector=query_vector,
-                limit=3,
-                filters={"user_id": user_id}
-            )
-            if episodes:
-                logger.info(f"Retrieved {len(episodes)} episodes for user: {user_id}")
-                episodes_list = []
-                for ep in episodes:
-                    summary = ep.get("content") or ep.get("summary") or ""
-                    if summary:
-                        episodes_list.append(f"- {summary}")
-                if episodes_list:
-                    episodic_context = "\n".join(episodes_list)
-        except Exception as ep_err:
-            logger.error(f"Failed to retrieve episodic memory for user {user_id}: {ep_err}")
+    # Episodic memory retrieval (delegated to shared helper, reused by CRAG generate_node)
+    episodic_context = _retrieve_episodic_context(user_id, standalone_question)
 
     system_prompt = """Bạn là trợ lý AI chuyên về tư vấn pháp luật Việt Nam. Nhiệm vụ của bạn là:
 1. Trả lời câu hỏi dựa trên các tài liệu pháp luật được cung cấp
@@ -278,9 +444,10 @@ QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung c
     return assistant_answer, ranked_docs
 
 
-def generate_agent_answer(history, question):
+def generate_agent_answer(history, question, user_id=None, conversation_id=None):
     logger.info("Using ReAct agent with tools")
-    return ai_agent_handle(question)
+    answer, tool_calls = ai_agent_handle(question, user_id, conversation_id)
+    return answer, tool_calls
 
 
 def generate_web_search_answer(history, question):
@@ -325,6 +492,44 @@ Bạn có thể:
     return vietnamese_llm_chat_complete(openai_messages)
 
 
+@lru_cache(maxsize=1)
+def _get_checkpointer():
+    """Build (once) the LangGraph checkpoint saver.
+
+    RedisSaver when langgraph-checkpoint-redis is installed AND Redis is reachable
+    AND use_memory_saver is False; otherwise in-process MemorySaver (dev/test).
+    Isolation between conversations is by thread_id in the run config, not by
+    saver instance, so a single saver serves all threads.
+    """
+    if settings.use_memory_saver or not _REDIS_SAVER_AVAILABLE:
+        logger.info("Using MemorySaver checkpointer (dev/test fallback).")
+        return MemorySaver()
+
+    try:
+        probe = redis.from_url(settings.redis_url, socket_connect_timeout=2)
+        probe.ping()
+        # RedisSaver requires the RedisJSON module (shipped with Redis Stack),
+        # not just a plain Redis server. Verify JSON.SET actually works before
+        # committing to RedisSaver, otherwise graph.invoke will fail mid-run.
+        probe.json().set("checkpoint:probe", "$", {"ok": True})
+        probe.delete("checkpoint:probe")
+        probe.close()
+    except Exception as e:
+        logger.warning(
+            f"Redis checkpointer unavailable or missing RedisJSON/Redis Stack module ({e}); "
+            "falling back to MemorySaver."
+        )
+        return MemorySaver()
+
+    ttl_minutes = max(1, settings.langgraph_checkpoint_ttl_seconds // 60)
+    saver = RedisSaver(
+        redis_url=settings.redis_url,
+        ttl={"default_ttl": ttl_minutes},
+    )
+    logger.info(f"Using RedisSaver checkpointer (ttl={ttl_minutes}min, url={settings.redis_url}).")
+    return saver
+
+
 def _build_chat_graph():
     graph = StateGraph(ChatGraphState)
 
@@ -337,27 +542,155 @@ def _build_chat_graph():
         if route != "general_chat":
             standalone_question = follow_up_question(history, question)
 
+        _trace_node_end(state, "route", {"route": route})
         return {
             "route": route,
             "standalone_question": standalone_question,
         }
 
-    def legal_rag_node(state: ChatGraphState):
+    # ---- CRAG (self-corrective RAG) nodes ----
+    def retrieve_node(state: ChatGraphState):
+        # On a reflection loop, prefer the rewritten query; otherwise the standalone question.
+        question = (
+            state.get("rewritten_query")
+            or state.get("standalone_question")
+            or state.get("question", "")
+        )
+        query_variations = rewrite_query_to_multi_queries(question, num_queries=3)
+        try:
+            retrieved = retrieve_with_hybrid_search(query_variations, top_k=4)
+        except Exception as e:
+            logger.warning(f"Hybrid search failed, vector fallback: {e}")
+            retrieved = retrieve_with_multi_query_fallback(query_variations, top_k=4)
+        # Rerank here so docs carry relevance_score for the grade node.
+        ranked = rerank_documents(retrieved, question, top_n=5)
+        logger.info(f"Retrieve node: {len(ranked)} reranked docs for query: {question[:80]}")
+        _trace_node_end(state, "retrieve", {"query": question[:200], "doc_count": len(ranked)})
+        return {"documents": ranked}
+
+    def grade_documents_node(state: ChatGraphState):
+        documents = state.get("documents", [])
+        question = state.get("standalone_question") or state.get("question", "")
+        borderline = [
+            d for d in documents
+            if d.get("relevance_score") is None or d.get("relevance_score") < DOC_GRADE_THRESHOLD
+        ]
+        verdicts = _llm_judge_relevance(question, borderline) if borderline else {}
+        graded = _tag_documents_relevance(documents, verdicts)
+        # reflection_count is incremented ONLY here; rewrite_query does not increment,
+        # so each retrieve->grade pass counts one reflection.
+        reflection_count = state.get("reflection_count", 0) + 1
+        relevant_n = sum(1 for g in graded if g.get("relevance") == "relevant")
+        logger.info(
+            f"Grade node: {relevant_n}/{len(graded)} relevant, reflection_count={reflection_count}"
+        )
+        _trace_node_end(state, "grade_documents", {
+            "relevant": relevant_n,
+            "total": len(graded),
+            "reflection_count": reflection_count,
+        })
+        return {"graded_docs": graded, "reflection_count": reflection_count}
+
+    def decide_after_grade(state: ChatGraphState):
+        return _decide_after_grade(state.get("graded_docs", []), state.get("reflection_count", 0))
+
+    def rewrite_query_node(state: ChatGraphState):
         history = state.get("history", [])
-        question = state.get("standalone_question", state.get("question", ""))
+        question = state.get("standalone_question") or state.get("question", "")
+        rewritten = rewrite_query_with_context(question, history)
+        logger.info(f"Rewrite query (reflection loop): {rewritten}")
+        # NOTE: do not increment reflection_count here; grade_documents_node owns the counter.
+        _trace_node_end(state, "rewrite_query", {"rewritten": rewritten[:200]})
+        return {"rewritten_query": rewritten}
+
+    def generate_node(state: ChatGraphState):
+        history = state.get("history", [])
+        question = state.get("standalone_question") or state.get("question", "")
         user_id = state.get("user_id")
-        resp, sources = generate_rag_answer(history, question, user_id=user_id)
+        graded = state.get("graded_docs", [])
+        ranked_docs = [d for d in graded if d.get("relevance") == "relevant"] or list(graded)
+
+        episodic_context = _retrieve_episodic_context(user_id, question)
+
+        system_prompt = """Bạn là trợ lý AI chuyên về tư vấn pháp luật Việt Nam. Nhiệm vụ của bạn là:
+1. Trả lời câu hỏi dựa trên các tài liệu pháp luật được cung cấp
+2. Trích dẫn chính xác các điều khoản, khoản, điểm từ văn bản pháp luật
+3. Giải thích rõ ràng, dễ hiểu cho người không chuyên
+4. Nếu thông tin không đủ trong tài liệu, hãy nói rõ điều đó
+5. Luôn đưa ra câu trả lời có căn cứ pháp lý
+
+QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung cấp bên dưới."""
+
+        doc_context = gen_doc_prompt(ranked_docs)
+
+        user_context_block = ""
+        if episodic_context:
+            user_context_block = (
+                f"\n\nThông tin lịch sử liên quan đến người dùng trong các cuộc trò chuyện trước đây:\n"
+                f"{episodic_context}\n"
+            )
+
+        openai_messages = (
+            [{"role": "system", "content": system_prompt}]
+            + history
+            + [
+                {
+                    "role": "user",
+                    "content": (
+                        f"Tài liệu tham khảo:\n{doc_context}{user_context_block}\n\n"
+                        f"Câu hỏi: {question}\n\nHãy trả lời dựa trên các tài liệu pháp luật trên."
+                    ),
+                }
+            ]
+        )
+
+        assistant_answer = vietnamese_llm_chat_complete(openai_messages)
+        logger.info("CRAG generate_node reply generated")
+
+        # RAG groundedness guardrail + legal disclaimer (replaces old legal_rag_node behavior)
         if guardrails_manager.initialized:
-            resp = guardrails_manager.add_legal_disclaimer(resp)
-        return {"response": resp, "sources": sources}
+            try:
+                assistant_answer = run_async(
+                    guardrails_manager.verify_output_rag(assistant_answer, doc_context)
+                )
+            except Exception as e:
+                logger.error(f"Error running output RAG guardrails: {e}")
+            assistant_answer = guardrails_manager.add_legal_disclaimer(assistant_answer)
+
+        _trace_node_end(state, "generate", {"doc_count": len(ranked_docs), "answer_len": len(assistant_answer)})
+
+        # Phase D handoff: canned "not found" RAG answer -> escalate to web_search.
+        if _should_handoff_to_web(assistant_answer) and not state.get("generate_to_web_done"):
+            _trace_handoff(state, "generate", "web_search", "rag_not_found")
+            return Command(goto="web_search", update={"generate_to_web_done": True})
+
+        return {"response": assistant_answer, "sources": ranked_docs}
 
     def agent_tools_node(state: ChatGraphState):
         history = state.get("history", [])
         question = state.get("standalone_question", state.get("question", ""))
-        resp = generate_agent_answer(history, question)
+        user_id = state.get("user_id")
+        thread_id = state.get("thread_id")
+        resp, tool_calls = generate_agent_answer(
+            history, question, user_id=user_id, conversation_id=thread_id
+        )
         if guardrails_manager.initialized:
             resp = guardrails_manager.add_legal_disclaimer(resp)
-        return {"response": resp, "sources": []}
+        _trace_node_end(state, "agent_tools", {"answer_len": len(resp), "tool_calls": len(tool_calls)})
+
+        # Phase D handoff: agent says it needs legal-doc lookup -> hand off to RAG retrieve.
+        if _should_handoff_to_rag(resp) and not state.get("agent_to_rag_done"):
+            _trace_handoff(state, "agent_tools", "retrieve", "needs_legal_lookup")
+            return Command(
+                goto="retrieve",
+                update={
+                    "agent_to_rag_done": True,
+                    "standalone_question": question,
+                    "tool_calls": tool_calls,
+                },
+            )
+
+        return {"response": resp, "sources": [], "tool_calls": tool_calls}
 
     def web_search_node(state: ChatGraphState):
         history = state.get("history", [])
@@ -365,18 +698,29 @@ def _build_chat_graph():
         resp = generate_web_search_answer(history, question)
         if guardrails_manager.initialized:
             resp = guardrails_manager.add_legal_disclaimer(resp)
-        return {"response": resp, "sources": []}
+        _trace_node_end(state, "web_search", {"answer_len": len(resp)})
+
+        # Phase D handoff: web result looks like it needs tool use -> hand off to agent_tools.
+        if _should_handoff_to_agent(resp) and not state.get("web_to_agent_done"):
+            _trace_handoff(state, "web_search", "agent_tools", "needs_tool_use")
+            return Command(goto="agent_tools", update={"web_to_agent_done": True})
+
+        return {"response": resp, "sources": [], "web_search_fallback_used": True}
 
     def general_chat_node(state: ChatGraphState):
         history = state.get("history", [])
         question = state.get("question", "")
+        _trace_node_end(state, "general_chat", {})
         return {"response": generate_general_answer(history, question), "sources": []}
 
     def choose_route(state: ChatGraphState):
         return state.get("route", "general_chat")
 
     graph.add_node("route", route_node)
-    graph.add_node("legal_rag", legal_rag_node)
+    graph.add_node("retrieve", retrieve_node)
+    graph.add_node("grade_documents", grade_documents_node)
+    graph.add_node("generate", generate_node)
+    graph.add_node("rewrite_query", rewrite_query_node)
     graph.add_node("agent_tools", agent_tools_node)
     graph.add_node("web_search", web_search_node)
     graph.add_node("general_chat", general_chat_node)
@@ -386,19 +730,32 @@ def _build_chat_graph():
         "route",
         choose_route,
         {
-            "legal_rag": "legal_rag",
+            "legal_rag": "retrieve",
             "agent_tools": "agent_tools",
             "web_search": "web_search",
             "general_chat": "general_chat",
         },
     )
 
-    graph.add_edge("legal_rag", END)
+    # CRAG loop: retrieve -> grade -> {generate | rewrite_query (-> retrieve) | web_search}
+    graph.add_edge("retrieve", "grade_documents")
+    graph.add_conditional_edges(
+        "grade_documents",
+        decide_after_grade,
+        {
+            "generate": "generate",
+            "rewrite_query": "rewrite_query",
+            "web_search": "web_search",
+        },
+    )
+    graph.add_edge("rewrite_query", "retrieve")
+
+    graph.add_edge("generate", END)
     graph.add_edge("agent_tools", END)
     graph.add_edge("web_search", END)
     graph.add_edge("general_chat", END)
 
-    return graph.compile()
+    return graph.compile(checkpointer=_get_checkpointer())
 
 
 @lru_cache(maxsize=1)
@@ -406,13 +763,27 @@ def get_chat_graph():
     return _build_chat_graph()
 
 
-def run_chat_graph(history, question, user_id=None):
+def run_chat_graph(history, question, user_id=None, conversation_id=None, run_id=None):
     graph = get_chat_graph()
-    result = graph.invoke({"history": history, "question": question, "user_id": user_id})
+    thread_id = conversation_id or (f"user:{user_id}" if user_id else "default")
+    config = {"configurable": {"thread_id": thread_id}}
+    result = graph.invoke(
+        {
+            "history": history,
+            "question": question,
+            "user_id": user_id,
+            "thread_id": thread_id,
+            "run_id": run_id,
+        },
+        config=config,
+    )
     return {
         "response": result.get("response", ""),
         "sources": result.get("sources", []),
-        "route": result.get("route", "")
+        "route": result.get("route", ""),
+        "reflection_count": result.get("reflection_count", 0),
+        "run_id": run_id,
+        "tool_calls": result.get("tool_calls", []),
     }
 
 
@@ -661,8 +1032,8 @@ QUAN TRỌNG:
         return f"error: {str(e)}"
 
 
-@shared_task()
-def llm_handle_message(bot_id, user_id, question):
+@shared_task(bind=True)
+def llm_handle_message(self, bot_id, user_id, question):
     """
     Main message handler with intelligent routing.
 
@@ -673,6 +1044,10 @@ def llm_handle_message(bot_id, user_id, question):
     4. Generate and save response
     """
     logger.info("Start handle message")
+    # Celery task id (None when called directly in the sync path). Used to map
+    # task_id -> run_id so the SSE stream endpoint can resolve a run before the
+    # Celery result is ready.
+    celery_task_id = getattr(self, "request", None) and getattr(self.request, "id", None)
 
     # Ensure required tables exist before worker writes conversation records.
     ensure_database_schema()
@@ -709,13 +1084,40 @@ def llm_handle_message(bot_id, user_id, question):
     if blocked_response:
         response_text = blocked_response
         sources = []
+        run_id = None
+        tool_calls = []
         logger.info("Chatbot response generated (Blocked by Input Guardrails)")
     else:
         # 3. Use LangGraph-based routing to handle the question.
-        graph_result = run_chat_graph(history, question, user_id=user_id)
-        response_text = graph_result.get("response", "")
-        sources = graph_result.get("sources", [])
-        logger.info(f"Chatbot response generated")
+        run_id = uuid.uuid4().hex
+        emit_run_start(run_id, conversation_id, user_id, question)
+        # Map celery task_id -> run_id (TTL 10m) so /chat/stream/{task_id} can
+        # resolve the run and subscribe to its trace events before the Celery
+        # result is ready. Best-effort: never block the chat on Redis.
+        if celery_task_id:
+            try:
+                redis_client.setex(f"trace:run:{celery_task_id}", 600, run_id)
+            except Exception as e:
+                logger.warning(f"trace:run key set failed: {e}")
+        try:
+            graph_result = run_chat_graph(
+                history, question, user_id=user_id,
+                conversation_id=conversation_id, run_id=run_id,
+            )
+            response_text = graph_result.get("response", "")
+            sources = graph_result.get("sources", [])
+            tool_calls = graph_result.get("tool_calls", [])
+            logger.info(f"Chatbot response generated")
+            emit_run_end(
+                run_id, conversation_id, status="completed",
+                final_response=response_text,
+                route=graph_result.get("route"),
+                reflection_count=graph_result.get("reflection_count"),
+                tool_calls_json=tool_calls if tool_calls else None,
+            )
+        except Exception as graph_err:
+            emit_run_end(run_id, conversation_id, status="error")
+            raise
 
     # Save full response to history (to preserve all details like the specific age)
     update_chat_conversation(bot_id, user_id, response_text, False)
@@ -735,5 +1137,11 @@ def llm_handle_message(bot_id, user_id, question):
     except Exception as t_err:
         logger.error(f"Failed to trigger save_episodic_memory_task: {t_err}")
 
-    # Return full response
-    return {"role": "assistant", "content": response_text, "sources": sources}
+    # Return full response (tool_calls + run_id are additive optional keys;
+    # sync /chat/complete callers ignore them, async poll passes them through).
+    result = {"role": "assistant", "content": response_text, "sources": sources}
+    if tool_calls:
+        result["tool_calls"] = tool_calls
+    if run_id:
+        result["run_id"] = run_id
+    return result
