@@ -62,7 +62,7 @@ graph TD
         (LLM-as-judge + rerank)`"]
         Grade -->|relevant subset| GenRag["`Generate
         (groundedness guard)`"]
-        Grade -->|irrelevant (under cap)| Rew[Rewrite query]
+        Grade -->|irrelevant under cap| Rew[Rewrite query]
         Rew --> Retr
         Grade -->|cap reached| WebF[Web fallback]
     end
