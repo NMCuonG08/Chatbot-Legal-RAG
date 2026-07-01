@@ -132,36 +132,98 @@ graph TD
 ## III. Project Structure
 
 ```
-backend/src/
-├── app.py                  # FastAPI endpoints, lifespan, SSE /chat/stream, request models
-├── tasks.py                # Celery tasks + LangGraph StateGraph (CRAG loop, handoff, trace, checkpoint)
-├── trace.py                # Self-hosted trace: MySQL agent_steps/graph_runs + Redis pub/sub emit_*
-├── agent.py                # ReAct agent + legal/web tools, per-conversation memory LRU, tool_calls contextvar
-├── brain.py                # LLM routing (Groq/Ollama/OpenAI), intent detection, routing
-├── legal_tools.py          # Vietnamese civil/commercial law calculation logic
-├── security.py             # API-key dep, path-traversal guard, collection-name validation
-├── guardrails_manager.py   # NeMo input/output guardrails
-├── search.py               # Hybrid search index + BM25 retriever
-├── semantic_cache.py       # Qdrant-based vector caching
-├── config.py               # CRAG constants (REFLECTION_MAX, DOC_GRADE_THRESHOLD, ...)
-├── vectorize.py / models.py / database.py / cache.py  # storage layer (models.py: GraphRun, AgentStep)
-├── import_data.py          # Legacy JSONL importer (incremental)
-└── pipeline/               # Multi-source Ingestion Pipeline
-    ├── orchestrator.py     # one core loop, idempotent, per-doc isolation
-    ├── run.py              # CLI entrypoint
-    ├── schema.py           # RawDocument / ParsedDocument / ChunkedDocument (frozen)
-    ├── state.py            # pipeline_documents status table (idempotency)
-    ├── storage.py          # raw/processed/serving three-tier lake
-    ├── parsers.py          # parse by source_type (json/md/html/pdf)
-    ├── chunker.py          # semantic/token chunking (wraps splitter)
-    ├── embedder.py         # embed + upsert Qdrant + MySQL chunk metadata (dedup/orphan GC)
-    └── connectors/         # jsonl_qa, markdown, html, pdf + base
-frontend/                   # Streamlit interface (live Agent trace expander)
-data_pipeline/              # Data cleaning & preprocessing
-llm_finetuning_serving/     # Model serving & training
-embed_serving/              # Custom Vietnamese embedding serving (GPU/CPU)
-tests/                      # pytest suite: CRAG, checkpoint, trace, handoff, react toolcalls, memory, SSE
-docs/                       # ARCHITECTURE.md, TESTING.md, drawio template
+Chatbot-Legal-RAG/
+│
+├── 🖥️ backend/                    # Backend API service (FastAPI)
+│   ├── src/
+│   │   ├── app.py                # FastAPI endpoints, lifespan, SSE /chat/stream, request models
+│   │   ├── agent.py              # ReAct agent + legal/web tools, per-conversation memory LRU, tool_calls contextvar
+│   │   ├── brain.py              # LLM routing (Groq/Ollama/OpenAI), intent detection, routing
+│   │   ├── custom_embedding.py   # Custom Vietnamese embedding model integrations
+│   │   ├── legal_tools.py        # Vietnamese civil/commercial law calculation logic
+│   │   ├── models.py             # Pydantic data models & GraphRun/AgentStep DB models
+│   │   ├── search.py             # Hybrid search index + BM25 retriever
+│   │   ├── semantic_cache.py     # Qdrant-based vector caching
+│   │   ├── config.py             # CRAG constants (REFLECTION_MAX, DOC_GRADE_THRESHOLD, ...)
+│   │   ├── database.py           # Database connection & session orchestration
+│   │   ├── cache.py              # Redis cache integration
+│   │   ├── tasks.py              # Celery tasks + LangGraph StateGraph (CRAG loop, handoff, trace, checkpoint)
+│   │   ├── trace.py              # Self-hosted trace: MySQL agent_steps/graph_runs + Redis pub/sub emit_*
+│   │   ├── import_data.py        # Legacy JSONL importer (incremental)
+│   │   └── pipeline/             # Multi-source Ingestion Pipeline
+│   │       ├── orchestrator.py   # one core loop, idempotent, per-doc isolation
+│   │       ├── run.py            # CLI entrypoint
+│   │       ├── schema.py         # RawDocument / ParsedDocument / ChunkedDocument (frozen)
+│   │       ├── state.py          # pipeline_documents status table (idempotency)
+│   │       ├── storage.py        # raw/processed/serving three-tier lake
+│   │       ├── parsers.py        # parse by source_type (json/md/html/pdf)
+│   │       ├── chunker.py        # semantic/token chunking (wraps splitter)
+│   │       ├── embedder.py       # embed + upsert Qdrant + MySQL chunk metadata (dedup/orphan GC)
+│   │       └── connectors/       # jsonl_qa, markdown, html, pdf + base
+│   ├── Dockerfile                # Container configuration
+│   ├── entrypoint.sh             # Container startup script
+│   └── requirements.txt          # Python dependencies
+│
+├── 🌐 frontend/                   # Web interface (Streamlit)
+│   ├── chat_interface.py         # Main chat application with live trace expander
+│   ├── config.toml               # Streamlit styling & config
+│   ├── Dockerfile                # Container configuration
+│   └── requirements.txt          # Python dependencies
+│
+├── 🔄 data_pipeline/              # Data cleaning & preprocessing
+│   ├── utils/
+│   │   ├── download_embed_data.ipynb  # Download legal corpus
+│   │   ├── merge_instruction_data.py  # Merge instruction datasets
+│   │   └── process_finetune_data.ipynb# Process training data
+│   └── requirements.txt          # Python dependencies
+│
+├── 🤖 llm_finetuning_serving/     # LLM fine-tuning and serving
+│   ├── data_processing/          # Data processing for LLaMA model
+│   ├── docker/                   # Docker configurations for LLM serving
+│   ├── evaluation/               # Model evaluation scripts
+│   ├── finetune/                 # LLaMA fine-tuning scripts
+│   ├── serving/                  # Model serving script (vLLM/Ollama)
+│   ├── do_spaces_manager.py      # DigitalOcean Spaces manager
+│   ├── prepare_data.sh           # Data preparation script
+│   └── requirements.txt          # Python dependencies
+│
+├── 🗄️ database/                  # Database setup
+│   ├── init.sql                  # Initial schema setup for MySQL/PostgreSQL
+│   └── docker-compose.yml        # Docker compose configuration
+│
+├── 🚀 embed_serving/             # Embedding serving and deployment
+│   ├── docker-compose.serving.yml# Production deployment configurations
+│   ├── Dockerfile.cpu-serving    # CPU serving container configuration
+│   ├── requirements_serving.txt  # Serving dependencies
+│   ├── scripts/
+│   │   ├── download_model_from_spaces.py # Download model from DO Spaces
+│   │   └── serve_model.py        # Local model serving script
+│   └── GPU_CPU_DEPLOYMENT_GUIDE.md# Deployment guide
+│
+├── 🧪 tests/                      # Pytest suite
+│   ├── conftest.py               # Pytest configurations & sys.path setup
+│   ├── test_api_simple.py        # Simple API validation tests
+│   ├── test_backend_utils.py     # Backend utility tests
+│   ├── test_basic.py             # Basic flow tests
+│   ├── test_checkpoint_phase_b.py# Checkpointing tests
+│   ├── test_crag_phase_a.py      # CRAG validation tests
+│   ├── test_handoff_command.py   # Multi-agent handoff command tests
+│   ├── test_per_conversation_memory.py # Conversation memory leak tests
+│   ├── test_react_toolcalls.py   # ReAct tool-call surfacing tests
+│   ├── test_sse_stream.py        # SSE live-trace streaming tests
+│   └── test_trace_tables.py      # MySQL trace tables validation tests
+│
+├── 📝 docs/                       # Documentation
+│   ├── ARCHITECTURE.md           # System architecture guide
+│   ├── TESTING.md                # Testing documentation
+│   └── architecture_template.drawio # Draw.io architecture file
+│
+├── Makefile                      # Build automation shortcuts
+├── mypy.ini                      # MyPy configurations
+├── .pre-commit-config.yaml       # Pre-commit hooks config
+├── pyproject.toml                # Project configurations
+├── requirements_dev.txt          # Development dependencies
+└── setup.cfg                     # Setup configurations
 ```
 
 ---
