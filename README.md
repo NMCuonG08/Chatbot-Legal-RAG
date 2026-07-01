@@ -1,4 +1,4 @@
-# Vietnamese Legal Assistant (RAG & Agentic Chatbot) 🏛️
+# ⚖️ Vietnamese Legal Assistant (RAG & Agentic Chatbot)
 
 <div align="center">
 
@@ -25,12 +25,10 @@ An intelligent virtual assistant for looking up Vietnamese legal documents, calc
 - [IV. Key Features & Capabilities](#iv-key-features--capabilities)
 - [V. Technology Stack](#v-technology-stack)
 - [VI. Quick Start Guide](#vi-quick-start-guide)
-- [VII. Data Ingestion Pipeline](#vii-data-ingestion-pipeline)
-- [VIII. Model Training & Evaluation](#viii-model-training--evaluation)
-- [IX. Production Deployment](#ix-production-deployment)
-- [X. Testing & Quality Assurance](#x-testing--quality-assurance)
-- [XI. API Documentation](#xi-api-documentation)
-- [XII. Disclaimer & Terms](#xii-disclaimer--terms)
+- [VII. Ingestion & Data Pipelines](#vii-ingestion--data-pipelines)
+- [VIII. System Verification & Testing](#viii-system-verification--testing)
+- [IX. API Documentation](#ix-api-documentation)
+- [X. Disclaimer & Terms](#x-disclaimer--terms)
 
 ---
 
@@ -47,6 +45,10 @@ Below is the complete, high-level architecture diagram detailing the request lif
 ![System Architecture](asset/architecture_template.drawio.svg)
 
 *(Video demonstration of system overview will be provided)*
+
+> [!NOTE]
+> * **Data Storage:** The ingestion pipeline stores document lineages under a local three-tier storage lake (`data/pipeline_lake/{raw,processed,serving}`) and indexes vectors directly into Qdrant.
+> * **Relational Database:** The system supports PostgreSQL or MySQL for tracking conversation histories, status tables, and graph execution traces.
 
 <details>
 <summary><b>🛠️ View Mermaid Diagram Source Code (Flowchart)</b></summary>
@@ -251,7 +253,7 @@ One orchestrator loop, many connectors. Adding a data source = adding one connec
 *   **Garbage Collection:** automatically deletes orphaned vector chunks from Qdrant and metadata rows from MySQL.
 
 ### 4. Agentic Legal Calculators (ReAct Agent)
-Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing the module never requires LLM env vars/network). The agent triggers programmatic tools, each guarded by input-range validation:
+Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing the module never requires LLM env vars/network). Memory is **per-conversation** — keyed by `(user_id, conversation_id)` in an LRU cache (cap 32), fixing a prior global-memory cross-user leak. Tool calls are captured via the `agent_tool_calls` contextvar (`@track_tool_call`) and surfaced through the graph → Celery result → async poll as an optional `tool_calls` array. The agent triggers programmatic tools, each guarded by input-range validation:
 *   **Contract Penalty Calculator:** penalty fees under commercial law, applying the 12% legal ceiling cap of contract value.
 *   **Inheritance Share Calculator:** splits inheritance among the first line of heirs under the Vietnamese Civil Code.
 *   **Legal Age Verifier:** checks age eligibility for signing contracts, marriage, work, and criminal liability (gender-aware: male 20 / female 18 for marriage).
@@ -269,8 +271,17 @@ Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing t
 
 ### 7. Hardened Admin Surface
 *   **API-key auth:** admin endpoints (`collection/create`, `document/create`, `data/import`, `pipeline/ingest`, `collections/.../clean`) require `X-API-Key` matching `ADMIN_API_KEY`. When unset, endpoints are **refused** unless `ALLOW_UNSAFE_ADMIN=1` (dev only).
-*   **Path-traversal guard:** ingestion paths are resolved safely under `IMPORT_DATA_DIR`; traversal segments cannot escape.
-*   **CORS & Validation:** strict collection-name validation and customizable CORS origin whitelist.
+*   **Path-traversal guard:** ingestion paths are resolved safely under the data dir (`IMPORT_DATA_DIR`) — `../../etc/passwd`-style doc_ids/paths cannot escape.
+*   **No data leakage:** the Vietnamese LLM endpoint has no hardcoded public IP default — it must be configured explicitly; internal errors return a generic user-facing message (details logged server-side only).
+*   **Collection name validation:** FastAPI field patterns constrain collection/source identifiers.
+
+### 8. Multi-Provider LLM Routing
+Generation routes by `LLM_PROVIDER` (`groq` | `ollama` | `openai`) with graceful fallback (Vietnamese LLM API → Groq; Ollama main → Groq). Token usage is accumulated in-process via a `usage_accumulator` contextvar for cost metrics — no external tracing service required.
+
+### 9. Comprehensive RAG Evaluation Suite
+A 4-pillar framework tracking operational metrics (token count, API cost, latency TTFT/TTLT), quality metrics (LLM-as-judge faithfulness/relevance), agentic metrics (tool-call success via the `agent_tool_calls` contextvar, router accuracy), and failure-mode analysis (Retrieval / Routing / Hallucination / Execution).
+
+> **Observability note (tracing):** Tracing is **self-hosted** by design: every graph run is persisted as a `GraphRun` + `AgentStep` rows in MySQL and published to a Redis pub/sub channel (`graph_trace_events`) for live SSE streaming. Tool-call tracking and token-usage accumulation are in-process contextvars feeding the eval suite. **No LangSmith / Langfuse / OpenTelemetry, no cloud egress** — Vietnamese legal data stays local. If external tracing is ever desired, add a LangSmith/Langfuse callback; it is off by default and the self-hosted trace keeps working independently.
 
 ---
 
@@ -285,7 +296,6 @@ Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing t
 *   **Vietnamese Text Embedding:** BGE-M3 (locally hosted/served, or Cohere cloud backup)
 *   **LLM Providers:** Llama-3.1-8B-Instruct (via Groq/Ollama), OpenAI, self-hosted Legal LLM
 *   **CI/CD & Containers:** Docker, Docker Compose, GitHub Actions
-*   **Hosting/Cloud Infrastructure:** DigitalOcean Spaces (object storage), DigitalOcean Droplets
 
 ---
 
@@ -338,7 +348,7 @@ streamlit run chat_interface.py --server.port 8501
 
 ---
 
-## VII. Data Ingestion Pipeline
+## VII. Ingestion & Data Pipelines
 
 Detailed workflow configuration for the ingestion stages.
 
@@ -354,8 +364,8 @@ python -m pipeline.run --source-type html --path ../../data/legal_html
 python -m pipeline.run --source-type pdf --path ../../data/legal_pdf --no-semantic
 ```
 
-### 1. Data Storage
-Data pipeline files and parsed assets are managed securely:
+### 1. Data Storage & Linage
+Files processed by the ingestion connecters are managed securely under a local three-tier storage lake:
 
 ![Data Storage](asset/data_store.png)
 
