@@ -1,13 +1,16 @@
+import asyncio
 import logging
 import time
-from dataclasses import Field
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Optional
 
 from celery.result import AsyncResult
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from sqlalchemy import delete
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -19,6 +22,12 @@ from models import (
     list_user_conversations,
 )
 from cache import clear_conversation_id
+from security import (
+    get_cors_origins,
+    get_legal_collection_name,
+    require_api_key,
+    resolve_safe_data_path,
+)
 from tasks import index_document_v2, llm_handle_message
 from utils import setup_logging
 from vectorize import create_collection, list_collection_points, list_collections
@@ -32,11 +41,9 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 
-app = FastAPI()
-
-
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
     ensure_database_schema()
     init_semantic_cache()
     try:
@@ -47,6 +54,21 @@ async def startup_event():
             logger.info("Created Qdrant collection 'user_episodes' for Episodic Memory.")
     except Exception as e:
         logger.warning(f"Could not initialize user_episodes collection on startup: {e}")
+    yield
+    # Shutdown: no explicit cleanup needed currently.
+
+
+app = FastAPI(lifespan=lifespan)
+
+# CORS allowlist: deny-all by default. Set CORS_ALLOWED_ORIGINS in .env.
+_cors_origins = get_cors_origins()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["*"],
+)
 
 
 class CompleteRequest(BaseModel):
@@ -58,9 +80,33 @@ class CompleteRequest(BaseModel):
 
 class ImportRequest(BaseModel):
     data_file_path: Optional[str] = None
-    collection_name: Optional[str] = None
+    collection_name: Optional[str] = Field(default="llm", pattern=r"^[a-z0-9_-]{1,64}$")
     batch_size: Optional[int] = 50
     limit: Optional[int] = None
+
+
+class CreateCollectionRequest(BaseModel):
+    collection_name: str = Field(..., pattern=r"^[a-z0-9_-]{1,64}$")
+
+
+class CreateDocumentRequest(BaseModel):
+    id: Optional[str] = None
+    question: Optional[str] = None
+    content: str = Field(..., min_length=1, max_length=200_000)
+
+
+class PipelineIngestRequest(BaseModel):
+    """Multi-source pipeline ingestion request.
+
+    ``source_type`` selects a connector; ``path`` is a file (jsonl) or
+    directory (markdown/html/pdf) resolved safely under the data dir.
+    """
+
+    source_type: str = Field(..., pattern=r"^(jsonl|markdown|html|pdf)$")
+    path: Optional[str] = None
+    collection_name: Optional[str] = Field(default="llm", pattern=r"^[a-z0-9_-]{1,64}$")
+    limit: Optional[int] = None
+    use_semantic: bool = True
 
 
 @app.get("/")
@@ -147,7 +193,10 @@ async def complete(data: CompleteRequest):
         )
 
     if data.sync_request:
-        response = llm_handle_message(bot_id, user_id, user_message)
+        # llm_handle_message is sync (Celery task called directly). Run in a
+        # worker thread so the uvicorn event loop is NOT blocked for the whole
+        # generation latency.
+        response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message)
         return {
             "response": response.get("content", ""),
             "sources": response.get("sources", [])
@@ -171,30 +220,31 @@ async def get_response(task_id: str):
     return result
 
 
-@app.post("/collection/create")
-async def create_vector_collection(data: Dict):
-    collection_name = data.get("collection_name")
+@app.post("/collection/create", dependencies=[Depends(require_api_key)])
+async def create_vector_collection(data: CreateCollectionRequest):
+    collection_name = get_legal_collection_name(data.collection_name)
     create_status = create_collection(collection_name)
     logging.info(f"Create collection {collection_name} status: {create_status}")
     return {"status": create_status is not None}
 
 
 
-@app.delete("/collections/{collection_name}/clean")
+@app.delete("/collections/{collection_name}/clean", dependencies=[Depends(require_api_key)])
 async def clean_collection(collection_name: str):
     """Wipe all vector points in Qdrant collection and clean chunk metadata mapping in MySQL."""
+    collection_name = get_legal_collection_name(collection_name)
     from vectorize import wipe_collection
     from models import _new_db_session, DocumentChunk
-    
+
     # 1. Recreate the collection (which wipes all vectors)
     success = wipe_collection(collection_name)
     if not success:
         raise HTTPException(status_code=500, detail=f"Failed to wipe collection {collection_name}")
-        
+
     # 2. Clean MySQL mapping chunks
     db = _new_db_session()
     try:
-        db.query(DocumentChunk).delete()
+        db.execute(delete(DocumentChunk))
         db.commit()
     except Exception as e:
         logger.error(f"Failed to clean document chunks metadata in database: {e}")
@@ -202,32 +252,88 @@ async def clean_collection(collection_name: str):
         raise HTTPException(status_code=500, detail="Failed to clean database metadata")
     finally:
         db.close()
-        
+
     return {"status": "success", "message": f"Collection {collection_name} and all mapping metadata cleaned successfully."}
 
 
-@app.post("/document/create")
-async def create_document(data: Dict):
-    doc_id = data.get("id")
-    question = data.get("question")
-    content = data.get("content")
-    create_status = insert_document(question, content)
+@app.post("/document/create", dependencies=[Depends(require_api_key)])
+async def create_document(data: CreateDocumentRequest):
+    create_status = insert_document(data.question, data.content)
     logging.info(f"Create document status: {create_status}")
-    index_status = index_document_v2(doc_id, question, content)
+    # index_document_v2 runs embedding + Qdrant + DB sync; offload to thread
+    # so the event loop is not held for seconds.
+    index_status = await asyncio.to_thread(
+        index_document_v2, data.id, data.question, data.content
+    )
     return {"status": create_status is not None, "index_status": index_status}
 
 
-@app.post("/data/import")
+@app.post("/data/import", dependencies=[Depends(require_api_key)])
 async def import_qa_data_endpoint(data: ImportRequest):
     from import_data import import_qa_data
 
-    success = import_qa_data(
-        data_file_path=data.data_file_path,
-        collection_name=data.collection_name,
-        batch_size=data.batch_size or 50,
-        limit=data.limit,
+    # Resolve path safely (prevents path traversal).
+    safe_path = resolve_safe_data_path(data.data_file_path)
+
+    # import_qa_data is a long-running sync ingestion; offload to thread.
+    success = await asyncio.to_thread(
+        import_qa_data,
+        str(safe_path),
+        data.collection_name,
+        data.batch_size or 50,
+        data.limit,
     )
     return {"success": success}
+
+
+@app.post("/pipeline/ingest", dependencies=[Depends(require_api_key)])
+async def pipeline_ingest_endpoint(data: PipelineIngestRequest):
+    """Run the multi-source data pipeline (fetch → parse → chunk → embed).
+
+    Picks a connector by ``source_type`` and processes every doc through the
+    shared core. Idempotent: already-embedded docs are skipped.
+    """
+    from pipeline.connectors import (
+        HtmlConnector,
+        JsonlQaConnector,
+        MarkdownConnector,
+        PdfConnector,
+    )
+    from pipeline.orchestrator import run_pipeline
+
+    collection_name = get_legal_collection_name(data.collection_name)
+
+    # Resolve path safely under the data dir (prevents path traversal).
+    # For jsonl ``path`` is a file; for the others it is a directory.
+    safe_path = resolve_safe_data_path(data.path) if data.path else None
+
+    if data.source_type == "jsonl":
+        if safe_path is None or not safe_path.is_file():
+            raise HTTPException(status_code=400, detail="jsonl source requires a file path")
+        connector = JsonlQaConnector(safe_path, limit=data.limit)
+    elif data.source_type == "markdown":
+        if safe_path is None or not safe_path.is_dir():
+            raise HTTPException(status_code=400, detail="markdown source requires a directory path")
+        connector = MarkdownConnector(safe_path, limit=data.limit)
+    elif data.source_type == "html":
+        if safe_path is None or not safe_path.is_dir():
+            raise HTTPException(status_code=400, detail="html source requires a directory path")
+        connector = HtmlConnector(root_dir=safe_path, limit=data.limit)
+    elif data.source_type == "pdf":
+        if safe_path is None or not safe_path.is_dir():
+            raise HTTPException(status_code=400, detail="pdf source requires a directory path")
+        connector = PdfConnector(safe_path, limit=data.limit)
+    else:  # unreachable: pattern-validated above
+        raise HTTPException(status_code=400, detail=f"unknown source_type: {data.source_type}")
+
+    stats = await asyncio.to_thread(
+        run_pipeline,
+        [connector],
+        collection_name,
+        data.use_semantic,
+        data.limit,
+    )
+    return {"collection": collection_name, "source_type": data.source_type, "stats": stats}
 
 
 if __name__ == "__main__":

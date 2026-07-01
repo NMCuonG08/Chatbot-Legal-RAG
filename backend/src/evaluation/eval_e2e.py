@@ -23,13 +23,18 @@ class E2ERunResult:
     route: str
     expected_route: str
     latency_ms: float
-    token_usage: List[dict] = field(default_factory=field)
-    tool_calls: List[dict] = field(default_factory=field)
+    token_usage: List[dict] = field(default_factory=list)
+    tool_calls: List[dict] = field(default_factory=list)
     error: Optional[str] = None
 
 
 def get_expected_route(question: str) -> str:
-    """Determine expected route based on legal keywords (calculation/checks vs general legal RAG)."""
+    """Heuristic expected route when no human label is available.
+
+    Falls back to legal-keyword detection (calculation/checks vs general legal
+    RAG). This is a noisy proxy; prefer annotating rows with an
+    ``expected_route`` field so ``run_e2e_eval`` uses gold labels instead.
+    """
     question_lower = question.lower()
     calc_keywords = [
         "tính",
@@ -46,6 +51,13 @@ def get_expected_route(question: str) -> str:
     return "legal_rag"
 
 
+def _resolve_expected_route(sample) -> str:
+    """Use the human-provided label if present, else the heuristic fallback."""
+    if getattr(sample, "expected_route", None):
+        return sample.expected_route
+    return get_expected_route(sample.question)
+
+
 def run_e2e_eval(samples, history: Optional[List[dict]] = None) -> List[E2ERunResult]:
     """Run each question through the production chat graph."""
     from tasks import run_chat_graph
@@ -57,7 +69,7 @@ def run_e2e_eval(samples, history: Optional[List[dict]] = None) -> List[E2ERunRe
     for i, sample in enumerate(samples, 1):
         t0 = time.perf_counter()
         actual_route = ""
-        expected = get_expected_route(sample.question)
+        expected = _resolve_expected_route(sample)
         
         token_list = []
         tool_calls_list = []

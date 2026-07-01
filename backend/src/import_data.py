@@ -18,6 +18,7 @@ from splitter import split_document
 from utils import setup_logging
 from vectorize import add_vector, create_collection, delete_vectors_by_filter
 from database import SessionLocal
+from sqlalchemy import delete
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -80,7 +81,7 @@ def import_qa_data(
         f"🚀 Starting import from {data_file_path} to collection {collection_name} (reset={reset})"
     )
     # Clear and recreate collection to start fresh
-    from vectorize import client
+    from vectorize import get_client
     from models import DocumentChunk
     
     if reset:
@@ -88,7 +89,7 @@ def import_qa_data(
         db_clear = SessionLocal()
         try:
             logger.info("🗑️ Deleting all records from MySQL document_chunks table to reset incremental index state...")
-            db_clear.query(DocumentChunk).delete()
+            db_clear.execute(delete(DocumentChunk))
             db_clear.commit()
             logger.info("✅ MySQL document_chunks table cleared successfully")
         except Exception as e:
@@ -100,7 +101,7 @@ def import_qa_data(
         # 2. Recreate Qdrant collection
         try:
             logger.info(f"🗑️ Deleting existing Qdrant collection {collection_name} to clear old vector data...")
-            client.delete_collection(collection_name)
+            get_client().delete_collection(collection_name)
         except Exception as e:
             logger.warning(f"📋 Failed to delete Qdrant collection {collection_name} (it may not exist yet): {e}")
 
@@ -112,7 +113,7 @@ def import_qa_data(
     else:
         # Resume mode - only create collection if it doesn't exist
         try:
-            client.get_collection(collection_name)
+            get_client().get_collection(collection_name)
             logger.info(f"🔄 Collection {collection_name} exists, resuming indexing in incremental mode.")
         except Exception:
             try:

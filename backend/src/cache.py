@@ -21,7 +21,24 @@ def _build_redis_client():
     return redis.StrictRedis(host=host, port=port, db=db)
 
 
-redis_client = _build_redis_client()
+# Lazy module-level Redis client. Built on first use so importing this module
+# does not require a live Redis (useful for tests/eval importers). Tests may
+# inject a mock via ``set_redis_client``.
+redis_client = None
+
+
+def get_redis_client():
+    """Return the module-level Redis client, building it lazily on first use."""
+    global redis_client
+    if redis_client is None:
+        redis_client = _build_redis_client()
+    return redis_client
+
+
+def set_redis_client(client):
+    """Test seam: inject a (mock) Redis client. Pass None to force rebuild."""
+    global redis_client
+    redis_client = client
 
 
 def get_conversation_key(bot_id, user_id):
@@ -35,12 +52,13 @@ def get_conversation_id(bot_id, user_id, ttl_seconds=360):
     """
     key = get_conversation_key(bot_id, user_id)
     try:
-        if redis_client.exists(key):
-            redis_client.expire(key, ttl_seconds)
-            return redis_client.get(key).decode("utf-8")
+        rc = get_redis_client()
+        if rc.exists(key):
+            rc.expire(key, ttl_seconds)
+            return rc.get(key).decode("utf-8")
         else:
             conversation_id = generate_request_id()
-            redis_client.set(key, conversation_id, ex=ttl_seconds)
+            rc.set(key, conversation_id, ex=ttl_seconds)
             return conversation_id
     except Exception as e:
         # Handle any exceptions (e.g., connection errors)
@@ -52,7 +70,7 @@ def get_conversation_id(bot_id, user_id, ttl_seconds=360):
 def clear_conversation_id(bot_id, user_id):
     key = get_conversation_key(bot_id, user_id)
     try:
-        redis_client.delete(key)
+        get_redis_client().delete(key)
         return True
     except Exception as e:
         # Handle any exceptions (e.g., connection errors)

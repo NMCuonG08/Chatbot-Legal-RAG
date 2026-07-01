@@ -375,13 +375,13 @@ def initialize_from_vector_store(limit: int = 1000) -> bool:
         bool: True if successful
     """
     try:
-        from vectorize import client
+        from vectorize import get_client
         from config import DEFAULT_COLLECTION_NAME
-        
+
         logger.info(f"🔄 Loading documents from vector store (limit: {limit})")
-        
+
         # Get documents directly from Qdrant using scroll
-        scroll_result = client.scroll(
+        scroll_result = get_client().scroll(
             collection_name=DEFAULT_COLLECTION_NAME,
             limit=limit,
             with_payload=True,

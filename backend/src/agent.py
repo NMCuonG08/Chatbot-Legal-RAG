@@ -105,13 +105,16 @@ def contract_penalty_calculator(
 
 
 @track_tool_call
-def legal_age_checker(birth_year: int, action_type: str = "sign_contract") -> str:
+def legal_age_checker(
+    birth_year: int, action_type: str = "sign_contract", gender: str = ""
+) -> str:
     """
     Kiểm tra tuổi pháp lý để thực hiện hành vi dân sự.
 
     Args:
         birth_year: Năm sinh, ví dụ: 2005
         action_type: Loại hành vi, có thể là: "sign_contract" (ký hợp đồng), "marriage" (kết hôn), "work" (làm việc), "criminal_responsibility" (chịu trách nhiệm hình sự)
+        gender: Giới tính "male" hoặc "female". BẮT BUỘC khi action_type="marriage" vì nam phải đủ 20 tuổi, nữ phải đủ 18 tuổi (Điều 8 Luật HNGĐ 2014).
 
     Returns:
         Thông tin về khả năng pháp lý và căn cứ pháp luật
@@ -120,12 +123,20 @@ def legal_age_checker(birth_year: int, action_type: str = "sign_contract") -> st
     current_year = 2026
     if birth_year < 1900 or birth_year > current_year:
         return json.dumps({"error": f"Năm sinh không hợp lệ (phải từ 1900 đến {current_year})"}, ensure_ascii=False)
-        
+
     valid_actions = ["sign_contract", "marriage", "work", "criminal_responsibility"]
     if action_type not in valid_actions:
         return json.dumps({"error": f"Loại hành vi không hợp lệ. Các loại hợp lệ: {', '.join(valid_actions)}"}, ensure_ascii=False)
 
-    result = check_legal_entity_age(birth_year, action_type)
+    if action_type == "marriage":
+        gender_norm = (gender or "").strip().lower()
+        if gender_norm not in ("male", "female"):
+            return json.dumps(
+                {"error": "Khi kiểm tra tuổi kết hôn cần gender='male' hoặc gender='female' vì nam đủ 20, nữ đủ 18 tuổi (Điều 8 Luật HNGĐ 2014)."},
+                ensure_ascii=False,
+            )
+
+    result = check_legal_entity_age(birth_year, action_type, gender=gender)
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -286,43 +297,54 @@ all_tools = [
     quick_answer_tool_func,
 ]
 
-# Initialize LLM and Agent dynamically based on environment variables
-llm_provider = os.environ.get("LLM_PROVIDER", "groq").lower()
-llm_model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
-llm = None
+# Initialize LLM and Agent LAZILY based on environment variables.
+# Building at import time required env vars / network at import, which broke
+# test collection and any importer that does not need the agent. We now build
+# on first use via _get_ai_agent() and cache the singleton.
+_llm = None
+_ai_agent = None
 
-logger.info(f"Initializing LlamaIndex Agent LLM - Provider: {llm_provider}, Model: {llm_model}")
+logger.info("LlamaIndex Agent LLM will be initialized lazily on first use")
 
-if llm_provider == "groq":
-    from llama_index.llms.groq import Groq
-    groq_api_key = os.environ.get("GROQ_API_KEY")
-    if groq_api_key:
-        llm = Groq(model=llm_model, api_key=groq_api_key, temperature=0.1)
-    else:
+
+def _build_llm():
+    """Build the LlamaIndex LLM from env vars. Returns None if config missing."""
+    llm_provider = os.environ.get("LLM_PROVIDER", "groq").lower()
+    llm_model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
+    logger.info(f"Initializing LlamaIndex Agent LLM - Provider: {llm_provider}, Model: {llm_model}")
+
+    if llm_provider == "groq":
+        from llama_index.llms.groq import Groq
+        groq_api_key = os.environ.get("GROQ_API_KEY")
+        if groq_api_key:
+            return Groq(model=llm_model, api_key=groq_api_key, temperature=0.1)
         logger.warning("GROQ_API_KEY not set, agent initialization may fail")
-elif llm_provider == "ollama":
-    from llama_index.llms.ollama import Ollama
-    ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-    api_key = os.environ.get("OLLAMA_API_KEY")
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
-    llm = Ollama(
-        model=llm_model, 
-        base_url=ollama_url, 
-        temperature=0.1, 
-        request_timeout=60.0,
-        headers=headers
-    )
-elif llm_provider == "openai":
-    from llama_index.llms.openai import OpenAI
-    openai_key = os.environ.get("OPENAI_API_KEY")
-    openai_base = os.environ.get("OPENAI_API_BASE")
-    llm = OpenAI(model=llm_model, api_key=openai_key, api_base=openai_base, temperature=0.1)
-else:
-    logger.warning(f"Unsupported LLM provider: {llm_provider}. Falling back to Groq.")
-    from llama_index.llms.groq import Groq
-    groq_api_key = os.environ.get("GROQ_API_KEY")
-    if groq_api_key:
-        llm = Groq(model=llm_model, api_key=groq_api_key, temperature=0.1)
+        return None
+    elif llm_provider == "ollama":
+        from llama_index.llms.ollama import Ollama
+        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        api_key = os.environ.get("OLLAMA_API_KEY")
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+        return Ollama(
+            model=llm_model,
+            base_url=ollama_url,
+            temperature=0.1,
+            request_timeout=60.0,
+            headers=headers
+        )
+    elif llm_provider == "openai":
+        from llama_index.llms.openai import OpenAI
+        openai_key = os.environ.get("OPENAI_API_KEY")
+        openai_base = os.environ.get("OPENAI_API_BASE")
+        return OpenAI(model=llm_model, api_key=openai_key, api_base=openai_base, temperature=0.1)
+    else:
+        logger.warning(f"Unsupported LLM provider: {llm_provider}. Falling back to Groq.")
+        from llama_index.llms.groq import Groq
+        groq_api_key = os.environ.get("GROQ_API_KEY")
+        if groq_api_key:
+            return Groq(model=llm_model, api_key=groq_api_key, temperature=0.1)
+        return None
+
 
 # Create agent with Vietnamese legal context
 agent_system_prompt = """Bạn là trợ lý AI chuyên về tư vấn pháp luật Việt Nam với khả năng sử dụng các công cụ.
@@ -350,7 +372,8 @@ LƯU Ý:
 
 agent_memory = ChatMemoryBuffer.from_defaults(token_limit=8192)
 
-def _build_react_agent() -> ReActAgent | None:
+
+def _build_react_agent(llm) -> ReActAgent | None:
     """Build ReAct agent with compatibility across llama-index versions."""
     if llm is None:
         return None
@@ -376,9 +399,19 @@ def _build_react_agent() -> ReActAgent | None:
     )
 
 
-ai_agent = _build_react_agent()
+def _get_ai_agent():
+    """Lazily build and cache the ReAct agent singleton on first use.
 
-logger.info(f"Agent initialized with {len(all_tools)} tools")
+    Building is deferred until the first ``ai_agent_handle`` call so that
+    importing this module (e.g. for ``agent_tool_calls`` in eval) does not
+    require LLM env vars or network access.
+    """
+    global _llm, _ai_agent
+    if _ai_agent is None:
+        _llm = _build_llm()
+        _ai_agent = _build_react_agent(_llm)
+        logger.info(f"Agent initialized with {len(all_tools)} tools")
+    return _ai_agent
 
 
 @shared_task()
@@ -393,6 +426,7 @@ def ai_agent_handle(question: str) -> str:
         Agent's response
     """
     try:
+        ai_agent = _get_ai_agent()
         if ai_agent is None:
             return (
                 "Xin lỗi, hệ thống AI agent chưa sẵn sàng do thiếu cấu hình GROQ_API_KEY. "
@@ -400,7 +434,7 @@ def ai_agent_handle(question: str) -> str:
             )
 
         logger.info(f"[AGENT] Processing question: {question}")
-        
+
         # Robust execution wrapper to handle different LlamaIndex versions and event loops
         async def _safe_execute_agent():
             # Try async methods first (modern llama-index)
@@ -411,7 +445,7 @@ def ai_agent_handle(question: str) -> str:
                     result = await ai_agent.arun(input=question)
                 except Exception:
                     result = await ai_agent.arun(question)
-                
+
                 # If result is a WorkflowHandler, we need to await it to get the actual response
                 if inspect.isawaitable(result) or hasattr(result, "__await__"):
                     result = await result
@@ -419,17 +453,17 @@ def ai_agent_handle(question: str) -> str:
 
             if hasattr(ai_agent, "achat"):
                 return await ai_agent.achat(question)
-            
+
             # Sync fallbacks
             if hasattr(ai_agent, "run"):
                 result = ai_agent.run(question)
                 if inspect.isawaitable(result) or hasattr(result, "__await__"):
                     result = await result
                 return result
-                
+
             if hasattr(ai_agent, "chat"):
                 return ai_agent.chat(question)
-            
+
             raise AttributeError(f"Agent {type(ai_agent)} has no execution method (run/arun/chat/achat)")
 
         try:
@@ -448,7 +482,7 @@ def ai_agent_handle(question: str) -> str:
                 raise e
 
         logger.info(f"[AGENT] Response generated successfully")
-        
+
         # Extract text content and ensure it's a clean string (no 'assistant:' prefix)
         res_text = ""
         if isinstance(result, str):
@@ -466,11 +500,11 @@ def ai_agent_handle(question: str) -> str:
             res_text = str(result.content)
         else:
             res_text = str(result)
-            
+
         # Clean up common prefixes
         if res_text.startswith("assistant: "):
             res_text = res_text[len("assistant: "):]
-            
+
         logger.info(f"[AGENT] Clean response extracted (length: {len(res_text)})")
         return res_text
     except Exception as e:

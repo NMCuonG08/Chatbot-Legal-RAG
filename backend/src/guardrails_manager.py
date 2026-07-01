@@ -86,10 +86,13 @@ class LegalGuardrailsManager:
             logger.warning(f"🚨 [GUARDRAILS-TIER1] Input BLOCKED (Jailbreak): {user_message}")
             return "Xin lỗi, tôi không thể thực hiện yêu cầu này. Tôi chỉ có nhiệm vụ hỗ trợ bạn tìm kiếm và giải đáp thông tin pháp lý Việt Nam theo các tài liệu chính thống."
 
+        # Lưu ý: KHÔNG block từ đơn "hối lộ", "lách luật", "trốn thuế" vì người
+        # dùng có thể hỏi "Điều luật xử lý hối lộ/trốn thuế là gì?" — câu hỏi pháp
+        # lý hợp lệ. Chỉ block cụm từ chỉ ý định XIN hướng dẫn vi phạm pháp luật.
         political_keywords = [
             "chính trị Việt Nam", "phản động", "nói xấu chính quyền", "bản đồ hình lưỡi bò",
             "hoàng sa trường sa của ai", "lách luật trốn thuế", "hối lộ cảnh sát", "chạy án",
-            "hối lộ", "lách luật", "trốn thuế"
+            "hướng dẫn lách luật", "cách trốn thuế", "dạy hối lộ"
         ]
         if any(kw.lower() in message_lower for kw in political_keywords):
             logger.warning(f"🚨 [GUARDRAILS-TIER1] Input BLOCKED (Political/Illegal): {user_message}")

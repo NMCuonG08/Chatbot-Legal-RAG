@@ -116,12 +116,20 @@ def _call_judge(prompt: str, judge_fn) -> JudgeResult:
 
 
 def _faithfulness_prompt(question: str, answer: str, context: str) -> str:
-    return f"""Hãy đánh giá độ TRUNG THỰC (faithfulness) của câu trả lời so với tài liệu được cung cấp.
+    """Claim-decomposition faithfulness prompt (Ragas-style).
 
-Định nghĩa:
-- Score = 1.0 khi mọi nhận định trong câu trả lời đều có thể truy ngược được vào tài liệu.
-- Score = 0.5 khi một phần nhận định có trong tài liệu, một phần bị suy diễn hoặc bịa.
-- Score = 0.0 khi câu trả lời mâu thuẫn hoặc bịa hoàn toàn so với tài liệu.
+    The judge extracts atomic claims from the answer and marks each as
+    supported by the context. The score is computed SERVER-SIDE as
+    ``supported_claims / total_claims`` so a hallucinated aggregate score
+    cannot pass without backing claim-level evidence.
+    """
+    return f"""Hãy đánh giá độ TRUNG THỰC (faithfulness) của câu trả lời so với tài liệu.
+
+Bước 1: Phân tách câu trả lời thành các NHẬN ĐỊNH NGUYÊN TỬ (atomic claims) — mỗi claim là
+một phát biểu đơn lẻ, có thể kiểm tra độc lập (ví dụ: "Phạt vi phạm tối đa 8% giá trị hợp đồng").
+
+Bước 2: Với mỗi claim, đánh dấu "supported": true nếu claim đó ĐƯỢC CHỨNG MINH bởi tài liệu
+(có thể truy ngược trực tiếp vào tài liệu, không suy diễn/bịa), ngược lại false.
 
 Câu hỏi:
 {question}
@@ -133,7 +141,7 @@ Câu trả lời cần đánh giá:
 {answer}
 
 Trả về DUY NHẤT một JSON dạng:
-{{"score": <0.0..1.0>, "reason": "<lý do ngắn 1-2 câu>"}}"""
+{{"claims": ["<claim 1>", "<claim 2>", ...], "supported": [true, false, ...], "reason": "<lý do ngắn>"}}"""
 
 
 def _answer_relevance_prompt(question: str, answer: str) -> str:
@@ -185,16 +193,49 @@ def evaluate_faithfulness(
     contexts: List[str],
     judge_fn,
 ) -> JudgeResult:
-    """Score how grounded ``answer`` is in ``contexts`` for ``question``."""
+    """Score how grounded ``answer`` is in ``contexts`` for ``question``.
+
+    Uses claim decomposition (Ragas-style): the judge extracts atomic claims
+    from the answer and marks each as supported by the context. The score is
+    computed SERVER-SIDE as ``supported_claims / total_claims`` so a
+    hallucinated aggregate score cannot pass without claim-level evidence.
+    """
     if not answer or not answer.strip():
         return JudgeResult(score=0.0, rationale="empty_answer")
     if not contexts:
         return JudgeResult(score=0.0, rationale="no_context")
     joined_ctx = "\n\n".join(contexts)
-    return _call_judge(
-        _faithfulness_prompt(question, answer, joined_ctx),
-        judge_fn,
-    )
+    result = _call_judge(_faithfulness_prompt(question, answer, joined_ctx), judge_fn)
+
+    # Parse claims + supported arrays and compute a grounded score.
+    try:
+        parsed = _parse_judge_json(result.raw)
+        supported = parsed.get("supported", [])
+        if isinstance(supported, (list, tuple)) and supported:
+            n_supported = sum(1 for s in supported if _truthy(s))
+            n_claims = len(supported)
+            server_score = n_supported / n_claims
+            rationale = (
+                f"server_computed={n_supported}/{n_claims} claims supported; "
+                f"judge_score={result.score:.2f}; {result.rationale}"
+            )
+            return JudgeResult(score=_clamp_unit(server_score), rationale=rationale, raw=result.raw)
+    except Exception as exc:
+        logger.warning("faithfulness claim parsing failed, using judge score: %s", exc)
+
+    # Fallback: trust the judge's aggregate score (old behavior).
+    return result
+
+
+def _truthy(value) -> bool:
+    """Interpret a judge-returned support flag as bool (robust to Yes/No/1/0)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1", "y")
+    return False
 
 
 def evaluate_answer_relevance(
@@ -216,13 +257,39 @@ def evaluate_context_precision(
     contexts: List[str],
     judge_fn,
 ) -> JudgeResult:
-    """Score the proportion of retrieved contexts that are actually relevant."""
+    """Score the proportion of retrieved contexts that are actually relevant.
+
+    The prompt asks the judge for ``relevant_indices`` (1-based). We compute the
+    score SERVER-SIDE as ``len(relevant)/len(contexts)`` and cross-check against
+    the judge's aggregate ``score``. Previously only the judge's coarse score was
+    used, which let a hallucinated score pass with no relevant indices backing it.
+    """
     if not contexts:
         return JudgeResult(score=0.0, rationale="no_context")
-    return _call_judge(
-        _context_precision_prompt(question, contexts),
-        judge_fn,
-    )
+    result = _call_judge(_context_precision_prompt(question, contexts), judge_fn)
+
+    # Parse relevant_indices from the raw judge output and compute a grounded score.
+    try:
+        parsed = _parse_judge_json(result.raw)
+        indices_raw = parsed.get("relevant_indices", [])
+        if isinstance(indices_raw, (list, tuple)) and indices_raw:
+            valid_indices = {
+                int(i)
+                for i in indices_raw
+                if isinstance(i, int) or (isinstance(i, str) and i.strip().isdigit())
+            }
+            n_relevant = sum(1 for i in valid_indices if 1 <= i <= len(contexts))
+            server_score = n_relevant / len(contexts)
+            rationale = (
+                f"server_computed={n_relevant}/{len(contexts)}; "
+                f"judge_score={result.score:.2f}; {result.rationale}"
+            )
+            return JudgeResult(score=_clamp_unit(server_score), rationale=rationale, raw=result.raw)
+    except Exception as exc:
+        logger.warning("context_precision index parsing failed, using judge score: %s", exc)
+
+    # Fallback: trust the judge's aggregate score (old behavior).
+    return result
 
 
 def evaluate_generation_sample(

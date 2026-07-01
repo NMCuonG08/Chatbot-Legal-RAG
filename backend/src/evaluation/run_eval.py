@@ -24,7 +24,7 @@ import json
 import logging
 import sys
 from dataclasses import asdict, is_dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Ensure backend/src is on sys.path so relative-style imports (`from search ...`)
@@ -52,7 +52,9 @@ def _json_default(obj):
         return asdict(obj)
     if isinstance(obj, (set, tuple)):
         return list(obj)
-    return str(obj)
+    # Fail loudly on unknown types instead of silently serializing a Python
+    # repr into the JSON report (which masks bugs in the report structure).
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 def _format_table(headers, rows) -> str:
@@ -256,7 +258,7 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     payload: dict = {
-        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": args.mode,
         "n_samples": len(samples),
         "seed": args.seed,

@@ -27,6 +27,23 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
 
+def get_client():
+    """Return the module-level Qdrant client (picks up any test override).
+
+    Internal functions read the ``client`` module global at call time, so a
+    test that calls ``set_qdrant_client(mock)`` is observed by all functions
+    in this module. External callers should use this getter rather than
+    ``from vectorize import client`` so they also observe overrides.
+    """
+    return client
+
+
+def set_qdrant_client(new_client):
+    """Test seam: inject a (mock) Qdrant client."""
+    global client
+    client = new_client
+
+
 def create_collection(name, vector_size=1024):
     """
     Create a collection with enhanced configuration

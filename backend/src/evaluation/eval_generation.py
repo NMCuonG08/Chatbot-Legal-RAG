@@ -85,24 +85,28 @@ def run_generation_eval(
         t0 = time.perf_counter()
         retrieval_hit = False
         try:
-            docs = _retrieve_for_generation(sample.question, top_k)
-            contexts = [str(d.get("content", "")) for d in docs if d.get("content")]
+            try:
+                docs = _retrieve_for_generation(sample.question, top_k)
+                contexts = [str(d.get("content", "")) for d in docs if d.get("content")]
 
-            # Calculate retrieval hit
-            rank = gold_in_retrieved(sample, contexts)
-            retrieval_hit = rank > 0
+                # Calculate retrieval hit
+                rank = gold_in_retrieved(sample, contexts)
+                retrieval_hit = rank > 0
 
-            answer = _generate_answer(sample.question, contexts)
-        except Exception as exc:
-            logger.warning("Generation failed for %s: %s", sample.sample_id, exc)
-            contexts, answer = [], ""
-        latency_ms = (time.perf_counter() - t0) * 1000
+                answer = _generate_answer(sample.question, contexts)
+            except Exception as exc:
+                logger.warning("Generation failed for %s: %s", sample.sample_id, exc)
+                contexts, answer = [], ""
+            latency_ms = (time.perf_counter() - t0) * 1000
 
-        # LLM Judge calls are also wrapped by the usage_accumulator since they use judge_fn
-        scores_obj = evaluate_generation_sample(
-            sample.question, answer, contexts, judge_fn
-        )
-        usage_accumulator.reset(token)
+            # LLM Judge calls are also wrapped by the usage_accumulator since they use judge_fn
+            scores_obj = evaluate_generation_sample(
+                sample.question, answer, contexts, judge_fn
+            )
+        finally:
+            # Always reset the ContextVar, even if the judge raised — otherwise
+            # the token accumulator leaks across samples and double-counts tokens.
+            usage_accumulator.reset(token)
 
         results.append(
             GenerationRunResult(

@@ -25,13 +25,17 @@ def calculate_contract_penalty(
         Dict with penalty amount and details
     """
     try:
-        penalty_amount = contract_value * (penalty_rate / 100) * days_late
+        # Theo Điều 418 Bộ luật Dân sự 2015: phạt vi phạm không quá 8% giá trị
+        # phần nghĩa vụ hợp đồng bị vi phạm. Trần pháp định, KHÔNG phải "thông
+        # lệ" 12% như bản cũ đã ghi sai.
+        STATUTORY_PENALTY_CAP_RATE = 0.08
 
-        # Kiểm tra giới hạn phạt (tối đa 8-12% giá trị hợp đồng theo thông lệ)
-        max_penalty = contract_value * 0.12
+        penalty_amount = contract_value * (penalty_rate / 100) * days_late
+        max_penalty = contract_value * STATUTORY_PENALTY_CAP_RATE
+
         if penalty_amount > max_penalty:
             penalty_amount = max_penalty
-            note = "Đã áp dụng mức phạt tối đa 12% giá trị hợp đồng"
+            note = "Đã áp dụng mức phạt tối đa 8% giá trị hợp đồng (Điều 418 BLDS 2015)"
         else:
             note = "Tính theo tỷ lệ phạt đã thỏa thuận"
 
@@ -41,6 +45,7 @@ def calculate_contract_penalty(
             "days_late": days_late,
             "penalty_amount": f"{penalty_amount:,.0f} VNĐ",
             "note": note,
+            "legal_basis": "Điều 418 Bộ luật Dân sự 2015 - Phạt vi phạm không quá 8% giá trị nghĩa vụ bị vi phạm",
         }
 
         logger.info(f"[TOOL] Contract penalty calculated: {result}")
@@ -51,13 +56,17 @@ def calculate_contract_penalty(
         return {"error": str(e)}
 
 
-def check_legal_entity_age(birth_year: int, action_type: str = "sign_contract") -> Dict:
+def check_legal_entity_age(
+    birth_year: int, action_type: str = "sign_contract", gender: str = ""
+) -> Dict:
     """
     Kiểm tra tuổi pháp lý để thực hiện hành vi dân sự theo Bộ luật Dân sự Việt Nam.
 
     Args:
         birth_year: Năm sinh
         action_type: Loại hành vi (sign_contract, marriage, work, criminal_responsibility)
+        gender: Giới tính ("male"/"female"). BẮT BUỘC khi action_type="marriage"
+                vì tuổi kết hôn khác nhau theo giới (nam 20, nữ 18).
 
     Returns:
         Dict with eligibility status and legal details
@@ -74,11 +83,6 @@ def check_legal_entity_age(birth_year: int, action_type: str = "sign_contract") 
                 "partial_age": 15,
                 "partial_note": "Từ 15-18 tuổi cần có sự đồng ý của người đại diện hợp pháp",
             },
-            "marriage": {
-                "min_age": 18,  # Nam 20, Nữ 18
-                "description": "Nam đủ 20 tuổi, Nữ đủ 18 tuổi (Điều 8 Luật Hôn nhân và Gia đình 2014)",
-                "note": "Nam: 20 tuổi, Nữ: 18 tuổi",
-            },
             "work": {
                 "min_age": 15,
                 "description": "Đủ 15 tuổi được làm việc (Điều 143 Bộ luật Lao động 2019)",
@@ -92,7 +96,31 @@ def check_legal_entity_age(birth_year: int, action_type: str = "sign_contract") 
             },
         }
 
-        req = age_requirements.get(action_type, age_requirements["sign_contract"])
+        # Kết hôn: tuổi khác nhau theo giới (Điều 8 Luật HNGĐ 2014).
+        # Nam: đủ 20; Nữ: đủ 18. Bắt buộc có gender để tránh tư vấn sai.
+        if action_type == "marriage":
+            gender_norm = (gender or "").strip().lower()
+            if gender_norm not in ("male", "female"):
+                return {
+                    "error": (
+                        "Để kiểm tra tuổi kết hôn cần biết giới tính vì nam phải đủ 20 tuổi, "
+                        "nữ phải đủ 18 tuổi (Điều 8 Luật Hôn nhân và Gia đình 2014). "
+                        "Vui lòng truyền gender='male' hoặc gender='female'."
+                    )
+                }
+            min_age = 20 if gender_norm == "male" else 18
+            description = (
+                f"{'Nam đủ 20 tuổi' if gender_norm == 'male' else 'Nữ đủ 18 tuổi'} "
+                f"(Điều 8 Luật Hôn nhân và Gia đình 2014)"
+            )
+            req = {
+                "min_age": min_age,
+                "description": description,
+                "note": "Nam: 20 tuổi, Nữ: 18 tuổi",
+            }
+        else:
+            req = age_requirements.get(action_type, age_requirements["sign_contract"])
+
         min_age = req["min_age"]
         partial_age = req.get("partial_age", 0)
 
@@ -109,6 +137,7 @@ def check_legal_entity_age(birth_year: int, action_type: str = "sign_contract") 
         result = {
             "age": age,
             "action_type": action_type,
+            "gender": (gender or "").strip().lower() or None,
             "eligible": eligible,
             "status": status,
             "legal_basis": req["description"],
@@ -125,51 +154,114 @@ def check_legal_entity_age(birth_year: int, action_type: str = "sign_contract") 
 
 def calculate_inheritance_share(total_value: float, heirs: List[Dict]) -> Dict:
     """
-    Tính phần thừa kế theo pháp luật Việt Nam (thừa kế theo pháp luật, hàng thừa kế thứ nhất).
+    Tính phần thừa kế theo pháp luật Việt Nam (thừa kế theo pháp luật).
+
+    Áp dụng hàng thừa kế theo Điều 651 Bộ luật Dân sự 2015:
+      - Hàng thứ nhất: vợ/chồng, cha đẻ, mẹ đẻ, cha nuôi, mẹ nuôi, con đẻ, con nuôi.
+      - Hàng thứ hai: ông nội, bà nội, ông ngoại, bà ngoại, anh ruột, chị ruột,
+        em ruột (cùng cha cùng mẹ hoặc cùng cha khác mẹ hoặc cùng mẹ khác cha).
+      - Hàng thứ ba: cô ruột, dì ruột, chú ruột, bác ruột, cậu ruột.
+    Nguyên tắc: chỉ người thuộc hàng thừa kế cao nhất còn sống mới được thừa kế;
+    hàng thấp hơn chỉ được thừa kế khi KHÔNG còn ai ở hàng cao hơn.
 
     Args:
         total_value: Tổng giá trị tài sản thừa kế (VNĐ)
         heirs: Danh sách người thừa kế [{"name": str, "relation": str, "is_minor": bool}]
-               relation: spouse, child, parent
+               relation: spouse|child|parent (hàng 1), sibling|grandparent (hàng 2),
+                         uncle|aunt (hàng 3)
 
     Returns:
         Dict with inheritance shares for each heir
     """
     try:
-        # Theo Điều 651 Bộ luật Dân sự 2015
-        # Hàng thừa kế thứ nhất chia đều: vợ/chồng, con, cha mẹ
-
         if not heirs:
             return {"error": "Không có người thừa kế"}
 
-        # Đếm số người thừa kế
-        num_heirs = len(heirs)
+        # Ánh xạ relation -> hàng thừa kế (Điều 651 BLDS 2015).
+        TIER_MAP = {
+            # Hàng thứ nhất
+            "spouse": 1,
+            "child": 1,
+            "parent": 1,
+            # Hàng thứ hai
+            "sibling": 2,
+            "grandparent": 2,
+            # Hàng thứ ba
+            "uncle": 3,
+            "aunt": 3,
+        }
+
+        tier_labels = {
+            1: "hàng thừa kế thứ nhất (vợ/chồng, cha, mẹ, con)",
+            2: "hàng thừa kế thứ hai (ông bà, anh chị em ruột)",
+            3: "hàng thừa kế thứ ba (cô, dì, chú, bác, cậu ruột)",
+        }
+
+        # Gom người thừa kế theo hàng. Bỏ qua relation không hợp lệ.
+        tier_to_heirs: Dict[int, List[Dict]] = {}
+        excluded: List[Dict] = []
+        for heir in heirs:
+            relation = (heir.get("relation") or "").strip().lower()
+            tier = TIER_MAP.get(relation)
+            if tier is None:
+                excluded.append(
+                    {"name": heir.get("name", ""), "relation": relation,
+                     "reason": "Không thuộc hàng thừa kế hợp lệ theo Điều 651 BLDS 2015"}
+                )
+                continue
+            tier_to_heirs.setdefault(tier, []).append(heir)
+
+        if not tier_to_heirs:
+            return {
+                "error": "Không có người thừa kế hợp lệ trong danh sách",
+                "excluded": excluded,
+                "legal_basis": "Điều 651 Bộ luật Dân sự 2015",
+            }
+
+        # Chỉ hàng cao nhất có mặt được chia; hàng thấp hơn bị loại bỏ.
+        active_tier = min(tier_to_heirs.keys())
+        active_heirs = tier_to_heirs[active_tier]
+        skipped_lower = [
+            {"name": h.get("name", ""), "relation": h.get("relation", ""),
+             "tier": t, "reason": f"Bị loại vì có người ở hàng {active_tier} còn sống"}
+            for t, hs in tier_to_heirs.items() if t > active_tier
+            for h in hs
+        ]
+
+        num_heirs = len(active_heirs)
         share_per_heir = total_value / num_heirs
+
+        distribution = []
+        for heir in active_heirs:
+            heir_share = {
+                "name": heir.get("name", ""),
+                "relation": heir.get("relation", ""),
+                "tier": active_tier,
+                "share": f"{share_per_heir:,.0f} VNĐ",
+                "percentage": f"{(100 / num_heirs):.2f}%",
+            }
+            if heir.get("is_minor", False):
+                heir_share["note"] = (
+                    "Người chưa thành niên, cần người đại diện quản lý tài sản"
+                )
+            distribution.append(heir_share)
 
         result = {
             "total_value": f"{total_value:,.0f} VNĐ",
             "num_heirs": num_heirs,
             "share_per_heir": f"{share_per_heir:,.0f} VNĐ",
-            "distribution": [],
-            "legal_basis": "Điều 651 Bộ luật Dân sự 2015 - Người thừa kế hàng thứ nhất chia đều",
-            "note": "Áp dụng cho thừa kế theo pháp luật, hàng thừa kế thứ nhất",
+            "distribution": distribution,
+            "active_tier": active_tier,
+            "active_tier_label": tier_labels[active_tier],
+            "excluded": excluded,
+            "skipped_lower_tiers": skipped_lower,
+            "legal_basis": "Điều 651 Bộ luật Dân sự 2015 - Thừa kế theo pháp luật theo hàng thừa kế",
+            "note": (
+                f"Chỉ chia cho {tier_labels[active_tier]}. "
+                "Hàng thấp hơn chỉ được thừa kế khi không còn ai ở hàng cao hơn. "
+                "Lưu ý Điều 652: phần của người thừa kế đã chết được chuyển cho con cháu họ."
+            ),
         }
-
-        for heir in heirs:
-            heir_share = {
-                "name": heir.get("name", ""),
-                "relation": heir.get("relation", ""),
-                "share": f"{share_per_heir:,.0f} VNĐ",
-                "percentage": f"{(100/num_heirs):.2f}%",
-            }
-
-            # Lưu ý đặc biệt cho người chưa thành niên
-            if heir.get("is_minor", False):
-                heir_share["note"] = (
-                    "Người chưa thành niên, cần người đại diện quản lý tài sản"
-                )
-
-            result["distribution"].append(heir_share)
 
         logger.info(f"[TOOL] Inheritance calculated: {result}")
         return result

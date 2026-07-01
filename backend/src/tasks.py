@@ -51,6 +51,52 @@ from guardrails_manager import LegalGuardrailsManager
 guardrails_manager = LegalGuardrailsManager()
 
 
+# ---- Persistent event loop for async guardrails calls inside sync Celery tasks ----
+# Previously every guardrails call did `asyncio.run(...)`, which creates and tears
+# down a fresh event loop each time — wasteful and fragile under concurrency. Here
+# we keep one daemon-thread loop for the worker's lifetime and schedule coroutines
+# on it via run_coroutine_threadsafe.
+import threading
+
+_async_loop: asyncio.AbstractEventLoop | None = None
+_async_loop_lock = threading.Lock()
+
+
+def _get_persistent_loop() -> asyncio.AbstractEventLoop:
+    global _async_loop
+    with _async_loop_lock:
+        if _async_loop is None or _async_loop.is_closed():
+            loop = asyncio.new_event_loop()
+            threading.Thread(target=loop.run_forever, daemon=True).start()
+            _async_loop = loop
+        return _async_loop
+
+
+def run_async(coro):
+    """Run a coroutine on a persistent background event loop (sync caller)."""
+    loop = _get_persistent_loop()
+    return asyncio.run_coroutine_threadsafe(coro, loop).result()
+
+
+def _compensate_index_rollback(doc_id_str: str) -> None:
+    """Compensating rollback: wipe DB chunk metadata for a doc after a Qdrant
+    write failed post-commit. Next index run then sees no chunks and treats the
+    doc as first-time (re-cleans Qdrant + re-indexes fresh), recovering cleanly.
+    """
+    try:
+        clear_doc_chunks_by_doc(doc_id_str)
+        logger.warning(
+            f"Compensating rollback done: cleared DB chunks for document {doc_id_str}. "
+            "Next index run will re-embed and re-upsert from scratch."
+        )
+    except Exception as cleanup_err:
+        logger.critical(
+            f"Compensating rollback FAILED for document {doc_id_str}: {cleanup_err}. "
+            "DB may contain chunk metadata pointing at missing Qdrant vectors — "
+            "manual reindex recommended."
+        )
+
+
 class ChatGraphState(TypedDict, total=False):
     history: List[Dict]
     question: str
@@ -223,7 +269,7 @@ QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung c
     if guardrails_manager.initialized:
         try:
             logger.info("Verifying RAG groundedness using NeMo Guardrails")
-            assistant_answer = asyncio.run(
+            assistant_answer = run_async(
                 guardrails_manager.verify_output_rag(assistant_answer, doc_context)
             )
         except Exception as e:
@@ -445,17 +491,17 @@ def index_document_v2(id, question, content, collection_name=DEFAULT_COLLECTION_
             if old_cid != full_doc_cid and old_cid not in new_chunk_ids:
                 to_delete.append(old_cid)
 
-        # 1. Delete orphaned chunks from Qdrant and database
+        # 1. Stage orphan deletions in DB (Qdrant delete happens AFTER commit).
         if to_delete:
-            logger.info(f"Deleting {len(to_delete)} orphaned chunks for document {doc_id_str}")
-            delete_vectors_by_ids(collection_name, to_delete)
+            logger.info(f"Staging deletion of {len(to_delete)} orphaned chunks for document {doc_id_str}")
             delete_doc_chunks_by_ids(to_delete, db=db)
             status_list.append({"action": "delete", "count": len(to_delete)})
 
-        # 2. Embed and upsert added/modified chunks
+        # 2. Embed and stage DB inserts (no Qdrant writes yet).
+        vectors_payload = None
         if to_upsert:
             logger.info(f"Embedding and upserting {len(to_upsert)} chunks for document {doc_id_str}")
-            
+
             # Batch embedding optimization!
             texts_to_embed = [item[1] for item in to_upsert]
             try:
@@ -480,21 +526,37 @@ def index_document_v2(id, question, content, collection_name=DEFAULT_COLLECTION_
                 }
                 save_doc_chunk(doc_id_str, cid, chash, db=db)
 
-            add_vector_status = add_vector(
-                collection_name=collection_name,
-                vectors=vectors_payload,
-            )
-            status_list.append({"action": "upsert", "status": add_vector_status})
-            
-            # Update full document hash record
+            # Stage full document hash record (so next run can fast-path skip).
             save_doc_chunk(doc_id_str, full_doc_cid, doc_hash, db=db)
         else:
             logger.info(f"Skipped indexing for document {doc_id_str} - no changes detected.")
             status_list.append({"action": "skip", "reason": "no_changes"})
 
-        # Commit everything atomically!
+        # 3. Commit metadata FIRST. DB is the source of truth: a DB failure here
+        # leaves Qdrant completely untouched (no orphan vectors, no mismatch).
+        # Previously Qdrant was upserted BEFORE commit, so a commit failure left
+        # Qdrant holding vectors with no MySQL mapping — the bug we fix here.
         db.commit()
-        logger.info(f"Successfully committed index transactions for document {doc_id_str}")
+        logger.info(f"Committed DB metadata for document {doc_id_str}")
+
+        # 4. Apply Qdrant changes AFTER the DB commit succeeds. If Qdrant fails,
+        # run a compensating DB rollback so metadata never points at missing vectors.
+        try:
+            if to_delete:
+                delete_vectors_by_ids(collection_name, to_delete)
+            if to_upsert and vectors_payload:
+                add_vector_status = add_vector(
+                    collection_name=collection_name,
+                    vectors=vectors_payload,
+                )
+                status_list.append({"action": "upsert", "status": add_vector_status})
+        except Exception as qdrant_err:
+            logger.error(
+                f"Qdrant write failed AFTER DB commit for document {doc_id_str}; "
+                f"running compensating DB rollback: {qdrant_err}"
+            )
+            _compensate_index_rollback(doc_id_str)
+            raise
 
     except Exception as e:
         logger.error(f"Index transaction failed for document {doc_id_str}, rolling back changes: {e}")
@@ -640,7 +702,7 @@ def llm_handle_message(bot_id, user_id, question):
     if guardrails_manager.initialized:
         try:
             logger.info("Running input guardrails check...")
-            blocked_response = asyncio.run(guardrails_manager.verify_input(question))
+            blocked_response = run_async(guardrails_manager.verify_input(question))
         except Exception as e:
             logger.error(f"Error running input guardrails: {e}")
             

@@ -2,7 +2,7 @@ import logging
 import uuid
 from typing import Dict, Optional, List
 from qdrant_client.models import Distance, VectorParams, PointStruct
-from vectorize import client
+from vectorize import get_client
 from brain import get_embedding
 
 logger = logging.getLogger(__name__)
@@ -13,10 +13,10 @@ CACHE_SCORE_THRESHOLD = 0.95  # Strict threshold to ensure semantic identity
 def init_semantic_cache():
     """Ensure the semantic cache collection exists in Qdrant."""
     try:
-        collections = [c.name for c in client.get_collections().collections]
+        collections = [c.name for c in get_client().get_collections().collections]
         if CACHE_COLLECTION_NAME not in collections:
             logger.info(f"Creating Qdrant semantic cache collection: {CACHE_COLLECTION_NAME}")
-            client.create_collection(
+            get_client().create_collection(
                 collection_name=CACHE_COLLECTION_NAME,
                 vectors_config=VectorParams(size=1024, distance=Distance.DOT),  # DOT product for normalized vectors
             )
@@ -39,7 +39,7 @@ def get_cached_response(question: str) -> Optional[Dict]:
             return None
 
         # Search in Qdrant semantic_cache collection
-        results = client.search(
+        results = get_client().search(
             collection_name=CACHE_COLLECTION_NAME,
             query_vector=query_vector,
             limit=1,
@@ -76,7 +76,7 @@ def set_cached_response(question: str, response: str, sources: List[Dict]):
         point_id = str(uuid.uuid4())
 
         # Upsert point into Qdrant semantic_cache
-        client.upsert(
+        get_client().upsert(
             collection_name=CACHE_COLLECTION_NAME,
             points=[
                 PointStruct(

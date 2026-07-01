@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 import pytest
+import vectorize
 from backend.src.semantic_cache import (
     init_semantic_cache,
     get_cached_response,
@@ -9,9 +10,9 @@ from backend.src.semantic_cache import (
 
 
 def test_semantic_cache_flow():
-    # 1. Mock the QdrantClient instance 'client' imported in semantic_cache
+    # Inject a mock Qdrant client via the DI seam (no live Qdrant needed).
     mock_client = MagicMock()
-    
+
     # Mock client.get_collections().collections to return list of mock collections
     mock_collections_holder = MagicMock()
     mock_collection_item = MagicMock()
@@ -27,11 +28,11 @@ def test_semantic_cache_flow():
         "response": "Tuổi nghỉ hưu của nam năm 2026 là 61 tuổi 6 tháng.",
         "sources": [{"source": "Luật lao động", "doc_id": 99, "content": "Tuổi nghỉ hưu..."}]
     }
-    
-    # We patch the qdrant client and embedding function inside semantic_cache
-    with patch("backend.src.semantic_cache.client", mock_client), \
-         patch("backend.src.semantic_cache.get_embedding", return_value=[1.0] * 1024):
-         
+
+    # Patch the embedding function; inject mock Qdrant client via the DI seam.
+    with patch("backend.src.semantic_cache.get_embedding", return_value=[1.0] * 1024), \
+         patch.object(vectorize, "client", mock_client):
+
         # Initialize cache (collection already exists in mock)
         init_semantic_cache()
         mock_client.get_collections.assert_called_once()

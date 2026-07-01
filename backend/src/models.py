@@ -2,17 +2,17 @@ import asyncio
 import logging
 from xml.dom import ValidationErr
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, delete
 from sqlalchemy.future import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import DeclarativeBase, Session
 from sqlalchemy.sql import func
 
 from cache import get_conversation_id
 from database import engine, get_db
 from utils import setup_logging
 
-Base = declarative_base()
+class Base(DeclarativeBase):
+    pass
 
 
 def _new_db_session() -> Session:
@@ -42,12 +42,12 @@ class ChatConversation(Base):
 def load_conversation(conversation_id: str):
     db = _new_db_session()
     try:
-        return (
-            db.query(ChatConversation)
-            .filter(ChatConversation.conversation_id == conversation_id)
+        result = db.execute(
+            select(ChatConversation)
+            .where(ChatConversation.conversation_id == conversation_id)
             .order_by(ChatConversation.created_at)
-            .all()
         )
+        return result.scalars().all()
     finally:
         db.close()
 
@@ -120,14 +120,13 @@ def list_user_conversations(user_id: str, limit: int = 100, offset: int = 0):
     ensure_database_schema()
     db = _new_db_session()
     try:
-        conversations = (
-            db.query(ChatConversation)
-            .filter(ChatConversation.user_id == user_id)
+        conversations = db.execute(
+            select(ChatConversation)
+            .where(ChatConversation.user_id == user_id)
             .order_by(ChatConversation.created_at.desc())
             .offset(offset)
             .limit(limit)
-            .all()
-        )
+        ).scalars().all()
         return [
             {
                 "id": conversation.id,
@@ -150,7 +149,9 @@ def delete_user_conversations(user_id: str):
     """Delete all chat history for a specific user"""
     db = _new_db_session()
     try:
-        db.query(ChatConversation).filter(ChatConversation.user_id == user_id).delete()
+        db.execute(
+            delete(ChatConversation).where(ChatConversation.user_id == user_id)
+        )
         db.commit()
         return True
     except Exception as e:
@@ -214,13 +215,12 @@ def save_user_episode(user_id: str, summary: str, db: Session = None):
 def get_user_episodes(user_id: str, limit: int = 20) -> list[UserEpisode]:
     db = _new_db_session()
     try:
-        return (
-            db.query(UserEpisode)
-            .filter(UserEpisode.user_id == user_id)
+        return db.execute(
+            select(UserEpisode)
+            .where(UserEpisode.user_id == user_id)
             .order_by(UserEpisode.created_at.desc())
             .limit(limit)
-            .all()
-        )
+        ).scalars().all()
     finally:
         db.close()
 
@@ -228,11 +228,9 @@ def get_user_episodes(user_id: str, limit: int = 20) -> list[UserEpisode]:
 def get_doc_chunks(doc_id: str) -> list[DocumentChunk]:
     db = _new_db_session()
     try:
-        return (
-            db.query(DocumentChunk)
-            .filter(DocumentChunk.doc_id == doc_id)
-            .all()
-        )
+        return db.execute(
+            select(DocumentChunk).where(DocumentChunk.doc_id == doc_id)
+        ).scalars().all()
     finally:
         db.close()
 
@@ -243,10 +241,12 @@ def save_doc_chunk(doc_id: str, chunk_id: str, chunk_hash: str, db: Session = No
         db = _new_db_session()
         session_created = True
     try:
-        existing = db.query(DocumentChunk).filter(
-            DocumentChunk.doc_id == doc_id,
-            DocumentChunk.chunk_id == chunk_id
-        ).first()
+        existing = db.execute(
+            select(DocumentChunk).where(
+                DocumentChunk.doc_id == doc_id,
+                DocumentChunk.chunk_id == chunk_id
+            )
+        ).scalars().first()
         if existing:
             existing.chunk_hash = chunk_hash
         else:
@@ -271,7 +271,9 @@ def delete_doc_chunks_by_ids(chunk_ids: list[str], db: Session = None):
         db = _new_db_session()
         session_created = True
     try:
-        db.query(DocumentChunk).filter(DocumentChunk.chunk_id.in_(chunk_ids)).delete(synchronize_session=False)
+        db.execute(
+            delete(DocumentChunk).where(DocumentChunk.chunk_id.in_(chunk_ids))
+        )
         if session_created:
             db.commit()
     except Exception as e:
@@ -290,7 +292,9 @@ def clear_doc_chunks_by_doc(doc_id: str, db: Session = None):
         db = _new_db_session()
         session_created = True
     try:
-        db.query(DocumentChunk).filter(DocumentChunk.doc_id == doc_id).delete(synchronize_session=False)
+        db.execute(
+            delete(DocumentChunk).where(DocumentChunk.doc_id == doc_id)
+        )
         if session_created:
             db.commit()
     except Exception as e:
@@ -337,13 +341,12 @@ def list_documents(limit: int = 100, offset: int = 0):
     ensure_database_schema()
     db = _new_db_session()
     try:
-        documents = (
-            db.query(Document)
+        documents = db.execute(
+            select(Document)
             .order_by(Document.created_at.desc())
             .offset(offset)
             .limit(limit)
-            .all()
-        )
+        ).scalars().all()
         return [
             {
                 "id": document.id,

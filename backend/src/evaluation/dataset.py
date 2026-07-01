@@ -33,6 +33,12 @@ class EvalSample:
     sample_id: str
     question: str
     gold_context: str
+    # Optional human-provided expected routing label (legal_rag / agent_tools /
+    # web_search / general_chat). When absent, eval_e2e falls back to the
+    # keyword heuristic in ``get_expected_route``. Annotating train.jsonl rows
+    # with an ``expected_route`` field lets routing_accuracy measure against
+    # gold labels instead of a noisy proxy.
+    expected_route: Optional[str] = None
 
     @property
     def gold_hash(self) -> int:
@@ -87,11 +93,14 @@ def load_eval_dataset(
         context = (row.get("context") or "").strip()
         if len(question) < min_question_chars or len(context) < min_context_chars:
             continue
+        # Optional human routing label; None when the row has no annotation.
+        expected_route = (row.get("expected_route") or None)
         raw.append(
             EvalSample(
                 sample_id=f"train-{idx}",
                 question=question,
                 gold_context=context,
+                expected_route=expected_route,
             )
         )
 
@@ -121,6 +130,11 @@ def gold_in_retrieved(sample: EvalSample, retrieved_contents: List[str]) -> int:
     """
     gold = sample.gold_context.strip()
     gold_lower = gold.lower()
+    # Length-ratio guard: a substring match only counts as a hit when the two
+    # texts are of comparable length. Prevents a long retrieved chunk that
+    # merely CONTAINS the short gold string (e.g. a statute list) from counting
+    # as a correct retrieval when it is topically unrelated.
+    LENGTH_RATIO_THRESHOLD = 0.5
     for rank, retrieved in enumerate(retrieved_contents, start=1):
         if not retrieved:
             continue
@@ -130,7 +144,11 @@ def gold_in_retrieved(sample: EvalSample, retrieved_contents: List[str]) -> int:
         if retrieved_stripped == gold:
             return rank
         retrieved_lower = retrieved_stripped.lower()
-        # Either direction of substring match counts as a hit.
+        # Either direction of substring match counts as a hit, but only when the
+        # lengths are comparable (ratio >= threshold) to avoid false positives.
         if retrieved_lower in gold_lower or gold_lower in retrieved_lower:
-            return rank
+            min_len = min(len(gold_lower), len(retrieved_lower))
+            max_len = max(len(gold_lower), len(retrieved_lower))
+            if max_len == 0 or (min_len / max_len) >= LENGTH_RATIO_THRESHOLD:
+                return rank
     return 0

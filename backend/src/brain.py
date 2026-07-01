@@ -12,10 +12,44 @@ from custom_embedding import get_custom_embedding
 logger = logging.getLogger(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", default=None)
-VIETNAMESE_LLM_API_URL = os.environ.get("VIETNAMESE_LLM_API_URL", default="http://3.89.75.45:6000/v1/chat/completions")
+# Vietnamese LLM endpoint must be configured explicitly. No hardcoded public IP
+# default — sending chat traffic to an unknown third-party box is a data-leak risk.
+VIETNAMESE_LLM_API_URL = os.environ.get("VIETNAMESE_LLM_API_URL", default=None)
 
 # Stores list of dicts: {"provider": str, "model": str, "prompt_tokens": int, "completion_tokens": int}
 usage_accumulator = contextvars.ContextVar("usage_accumulator", default=None)
+
+
+def record_usage(provider: str, model: str, usage) -> None:
+    """Append a token-usage record to the active accumulator (if any).
+
+    Accepts BOTH attribute-style usage (Groq SDK: ``usage.prompt_tokens``) and
+    dict-style usage (OpenAI/Ollama JSON: ``usage['prompt_tokens']``), collapsing
+    the ~6 copy-pasted accumulator blocks that previously lived inline in each
+    provider branch.
+    """
+    if usage is None:
+        return
+    acc = usage_accumulator.get()
+    if acc is None:
+        return
+    if isinstance(usage, dict):
+        prompt = usage.get("prompt_tokens", 0)
+        completion = usage.get("completion_tokens", 0)
+    else:
+        prompt = getattr(usage, "prompt_tokens", 0)
+        completion = getattr(usage, "completion_tokens", 0)
+    acc.append({
+        "provider": provider,
+        "model": model,
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+    })
+
+
+# Generic error message returned to end users on internal failures. Exception
+# details are logged server-side only (never leaked to the chat response).
+_USER_FACING_ERROR = "Xin lỗi, đã xảy ra lỗi nội bộ khi xử lý yêu cầu. Vui lòng thử lại sau."
 
 
 def get_groq_client():
@@ -84,13 +118,21 @@ def vietnamese_llm_chat_complete(messages=(), temperature=0.7, max_tokens=512):
             return groq_chat_complete(messages)
 
     try:
+        # Guard: Vietnamese LLM endpoint must be configured explicitly.
+        # KHÔNG fallback silent ra IP công khai như bản cũ.
+        if not VIETNAMESE_LLM_API_URL:
+            logger.warning(
+                "VIETNAMESE_LLM_API_URL chưa cấu hình. Fallback sang Groq."
+            )
+            return groq_chat_complete(messages)
+
         # Chuẩn bị payload cho API call
         payload = {
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens
         }
-        
+
         # Gọi API
         response = requests.post(
             VIETNAMESE_LLM_API_URL,
@@ -103,18 +145,7 @@ def vietnamese_llm_chat_complete(messages=(), temperature=0.7, max_tokens=512):
             result = response.json()
             content = result["choices"][0]["message"]["content"]
             logger.info("Vietnamese LLM response: {}".format(content[:200] + "..."))
-            
-            # Record usage if accumulator is active
-            usage = result.get("usage")
-            acc = usage_accumulator.get()
-            if usage and acc is not None:
-                acc.append({
-                    "provider": "vietnamese_llm",
-                    "model": "vietnamese-legal-llm",
-                    "prompt_tokens": usage.get("prompt_tokens", 0),
-                    "completion_tokens": usage.get("completion_tokens", 0)
-                })
-                
+            record_usage("vietnamese_llm", "vietnamese-legal-llm", result.get("usage"))
             return content
         else:
             logger.error(f"Vietnamese LLM API error: {response.status_code} - {response.text}")
@@ -140,7 +171,7 @@ def groq_chat_complete(messages=(), model=None, raw=False):
     if llm_provider == "groq":
         if not GROQ_API_KEY:
             logger.warning("GROQ_API_KEY not set, returning empty response")
-            return "Error: GROQ_API_KEY not configured"
+            return _USER_FACING_ERROR
         try:
             response = client.chat.completions.create(
                 model=model_name,
@@ -149,35 +180,15 @@ def groq_chat_complete(messages=(), model=None, raw=False):
                 temperature=0.7
             )
             if raw:
-                # Still accumulate token usage if raw is requested
-                usage = getattr(response, "usage", None)
-                acc = usage_accumulator.get()
-                if usage and acc is not None:
-                    acc.append({
-                        "provider": "groq",
-                        "model": model_name,
-                        "prompt_tokens": usage.prompt_tokens,
-                        "completion_tokens": usage.completion_tokens
-                    })
+                record_usage("groq", model_name, getattr(response, "usage", None))
                 return response.choices[0].message
             output = response.choices[0].message
             logger.info(f"Chat complete output: {output.content[:100]}")
-            
-            # Record usage if accumulator is active
-            usage = getattr(response, "usage", None)
-            acc = usage_accumulator.get()
-            if usage and acc is not None:
-                acc.append({
-                    "provider": "groq",
-                    "model": model_name,
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens
-                })
-                
+            record_usage("groq", model_name, getattr(response, "usage", None))
             return output.content
         except Exception as e:
             logger.error(f"Groq API error: {e}")
-            return f"Error: {str(e)}"
+            return _USER_FACING_ERROR
             
     elif llm_provider == "ollama":
         ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -199,34 +210,23 @@ def groq_chat_complete(messages=(), model=None, raw=False):
                 result = response.json()
                 content = result["choices"][0]["message"]["content"]
                 logger.info(f"Ollama chat complete output: {content[:100]}")
-                
-                # Record usage if accumulator is active
-                usage = result.get("usage")
-                acc = usage_accumulator.get()
-                if usage and acc is not None:
-                    acc.append({
-                        "provider": "ollama",
-                        "model": model_name,
-                        "prompt_tokens": usage.get("prompt_tokens", 0),
-                        "completion_tokens": usage.get("completion_tokens", 0)
-                    })
-                    
+                record_usage("ollama", model_name, result.get("usage"))
                 if raw:
                     from types import SimpleNamespace
                     return SimpleNamespace(content=content)
                 return content
             else:
                 logger.error(f"Ollama API error: {response.status_code} - {response.text}")
-                return f"Error: Ollama API returned {response.status_code}"
+                return _USER_FACING_ERROR
         except Exception as e:
             logger.error(f"Ollama API error: {e}")
-            return f"Error: {str(e)}"
+            return _USER_FACING_ERROR
             
     elif llm_provider == "openai":
         openai_key = os.environ.get("OPENAI_API_KEY")
         openai_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
         if not openai_key:
-            return "Error: OPENAI_API_KEY not configured"
+            return _USER_FACING_ERROR
         try:
             headers = {
                 "Content-Type": "application/json",
@@ -242,29 +242,20 @@ def groq_chat_complete(messages=(), model=None, raw=False):
             if response.status_code == 200:
                 result = response.json()
                 content = result["choices"][0]["message"]["content"]
-                
-                # Record usage if accumulator is active
-                usage = result.get("usage")
-                acc = usage_accumulator.get()
-                if usage and acc is not None:
-                    acc.append({
-                        "provider": "openai",
-                        "model": model_name,
-                        "prompt_tokens": usage.get("prompt_tokens", 0),
-                        "completion_tokens": usage.get("completion_tokens", 0)
-                    })
-                    
+                record_usage("openai", model_name, result.get("usage"))
                 if raw:
                     from types import SimpleNamespace
                     return SimpleNamespace(content=content)
                 return content
             else:
-                return f"Error: OpenAI API returned {response.status_code}"
+                logger.error(f"OpenAI API error: {response.status_code} - {response.text}")
+                return _USER_FACING_ERROR
         except Exception as e:
-            return f"Error: {str(e)}"
+            logger.error(f"OpenAI API error: {e}")
+            return _USER_FACING_ERROR
             
     else:
-        return f"Error: Unsupported LLM provider {llm_provider}"
+        return _USER_FACING_ERROR
 
 
 # Keep openai_chat_complete as alias for backward compatibility
@@ -331,8 +322,11 @@ def detect_user_intent(history, message):
         indicator in message.lower() for indicator in follow_up_indicators
     )
 
-    # If no history or not a follow-up, return original
-    if not history or len(history) <= 1 and not is_follow_up:
+    # Skip rewrite when there is no history to draw from, OR when the history
+    # is short and this is not a follow-up. Rewrite only when there is history
+    # AND (history is long OR the message looks like a follow-up).
+    # Parens explicit to avoid operator-precedence ambiguity.
+    if not history or (len(history) <= 1 and not is_follow_up):
         logger.info("No context needed, returning original query")
         return message
 
