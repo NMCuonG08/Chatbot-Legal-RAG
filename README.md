@@ -338,24 +338,26 @@ streamlit run chat_interface.py --server.port 8501
 
 ## VII. Ingestion & Data Pipelines
 
-Detailed workflow configuration for the ingestion stages.
+Detailed workflow configuration for the multi-source ingestion pipeline:
 
 ```bash
 cd backend/src
-# Ingest JSONL document format
-python -m pipeline.run --source-type jsonl --path ../../data/train.jsonl --collection llm
-# Ingest Markdown documents
-python -m pipeline.run --source-type markdown --path ../../data/legal_md
-# Ingest raw HTML pages
-python -m pipeline.run --source-type html --path ../../data/legal_html
-# Ingest PDF documents (token chunking)
-python -m pipeline.run --source-type pdf --path ../../data/legal_pdf --no-semantic
+
+# Ingest JSONL document format (e.g. train.jsonl)
+python -m pipeline.run --source-type jsonl --path <path_to_jsonl_file> --collection llm
+
+# Ingest Markdown directory
+python -m pipeline.run --source-type markdown --path <path_to_markdown_directory>
+
+# Ingest raw HTML pages directory
+python -m pipeline.run --source-type html --path <path_to_html_directory>
+
+# Ingest PDF documents (using token chunking instead of semantic)
+python -m pipeline.run --source-type pdf --path <path_to_pdf_directory> --no-semantic
 ```
 
-### 1. Data Storage & Linage
-Files processed by the ingestion connecters are managed securely under a local three-tier storage lake:
-
-![Data Storage](asset/data_store.png)
+### 1. Data Storage & Lineage
+Files processed by the ingestion connectors are managed securely under a local three-tier storage lake structure (`data/pipeline_lake/{raw,processed,serving}`). The raw ingestion inputs and intermediate parsed outputs are preserved locally to guarantee idempotency and prevent duplicate API costs.
 
 ### 2. Data Statistics
 *   **Original Legal Dataset (`train.jsonl`):** 89,261 raw Q&A legal document entries (File size: 162.13 MB).
@@ -365,27 +367,21 @@ Files processed by the ingestion connecters are managed securely under a local t
 
 ---
 
-## VIII. Model Training & Evaluation
+## VIII. Model Training & Configuration
 
-### 1. Training Configuration
-Models are optimized using tailored hyperparameters:
+### 1. Training Architecture & Hardware Profiles
+The LLM fine-tuning setup utilizes **Unsloth** for accelerated memory-efficient training of `Llama-3.1-8B-Instruct`. Configurations are optimized for three target hardware tiers (defined in `llm_finetuning_serving/finetune/config.py`):
 
-![Training Configuration](asset/config_training.png)
+*   **H200 Profile (141GB VRAM):** Full 16-bit precision training, `lora_r=128`, `lora_alpha=256`, effective batch size of 128 (16 batch size × 8 accumulation steps), learning rate `3e-4`.
+*   **H100 Profile (80GB VRAM):** Full 16-bit precision training, `lora_r=64`, `lora_alpha=128`, effective batch size of 64 (8 batch size × 8 accumulation steps), learning rate `2e-4`.
+*   **A4000 Profile (16GB VRAM):** 4-bit quantized training using `paged_adamw_8bit`, `lora_r=16`, `lora_alpha=32`, effective batch size of 16 (2 batch size × 8 accumulation steps), learning rate `2e-4`.
 
-### 2. Training Metrics
-Real-time monitoring of loss and performance curves:
+### 2. Training Execution
+Finetuning runs through `llm_finetuning_serving/finetune/train_llama.py` with custom sequence lengths up to 8192 for processing long context legal documents. Real-time loss metrics, evaluation scores, and learning rate decay are monitored via standard training step logs.
 
-![Training Metrics](asset/metrics_train.png)
+### 3. Embedding Verification
+Verification checks are run locally before deployment to ensure computed vector embeddings map correctly to the active Qdrant collections.
 
-### 3. Evaluation Results
-Comprehensive benchmarks on Vietnamese legal tasks:
-
-![Evaluation Results](asset/evaluation.png)
-
-### 4. Embedding Model Verification
-Verify embedding vectors are calculated correctly:
-
-![Embedding Check](asset/check_embedding.png)
 
 ---
 
