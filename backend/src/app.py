@@ -159,29 +159,16 @@ async def complete(data: CompleteRequest):
 
 @app.get("/chat/complete/{task_id}")
 async def get_response(task_id: str):
-    start_time = time.time()
-    while True:
-        task_result = AsyncResult(task_id)
-        task_status = task_result.status
-        logger.info(f"Task result: {task_result.result}")
-
-        if task_status == "PENDING":
-            if time.time() - start_time > TASK_TIMEOUT:
-                return {
-                    "task_id": task_id,
-                    "task_status": task_result.status,
-                    "task_result": task_result.result,
-                    "error_message": "Service timeout, retry please",
-                }
-            else:
-                time.sleep(POLLING_INTERVAL)  # sleep for 0.5 seconds before retrying
-        else:
-            result = {
-                "task_id": task_id,
-                "task_status": task_result.status,
-                "task_result": task_result.result,
-            }
-            return result
+    task_result = AsyncResult(task_id)
+    task_status = task_result.status
+    logger.info(f"Polling task {task_id} status: {task_status}")
+    
+    result = {
+        "task_id": task_id,
+        "task_status": task_status,
+        "task_result": task_result.result if task_status != "PENDING" else None
+    }
+    return result
 
 
 @app.post("/collection/create")

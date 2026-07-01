@@ -13,7 +13,13 @@ from qdrant_client.models import (
     VectorParams,
 )
 
+from pathlib import Path
+from dotenv import load_dotenv
+
 logger = logging.getLogger(__name__)
+
+# Load env variables securely
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")

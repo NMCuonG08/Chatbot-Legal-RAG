@@ -129,6 +129,17 @@ cd frontend
 streamlit run chat_interface.py --server.port 8501
 ```
 
+### 3. Database Ingestion (Importing Data)
+Once the databases (Qdrant & PostgreSQL) are running, import the legal Q&A data into the databases:
+```bash
+cd backend
+python src/import_data.py --data-file ../data_pipeline/data/finetune_data/train_qa_format.jsonl --collection llm
+```
+*   **Incremental Mode:** The script works incrementally by checking MD5 hashes of document chunks. It automatically skips already imported documents, making updates fast and saving Cohere API costs.
+*   **Embedding Fallback:** If the custom local embedding service is not running on port `5000`, the script automatically falls back to **Cohere Cloud API** (configured via `COHERE_API_KEY` in `.env`).
+
+---
+
 *   **Frontend UI:** `http://localhost:8501`
 *   **Backend API Docs:** `http://localhost:8002/docs`
 *   **Qdrant Dashboard:** `http://localhost:6333/dashboard`

@@ -34,10 +34,55 @@ client = get_groq_client()
 
 def vietnamese_llm_chat_complete(messages=(), temperature=0.7, max_tokens=512):
     """
-    Gọi Vietnamese Legal LLM API thay vì OpenAI cho việc trả lời người dùng
+    Gọi Vietnamese Legal LLM API hoặc local Ollama cho việc trả lời người dùng
     """
-    logger.info("Vietnamese LLM chat complete for {}".format(messages))
+    logger.info("Vietnamese LLM chat complete for {}".format(str(messages)[:300]))
     
+    # Check if we should use local Ollama as main LLM directly
+    use_ollama_main = os.environ.get("USE_OLLAMA_AS_MAIN", "false").lower() == "true"
+    if use_ollama_main:
+        logger.info("USE_OLLAMA_AS_MAIN is True. Routing main generation directly to local Ollama.")
+        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        model_name = os.environ.get("OLLAMA_MODEL", "llama3.1:latest")
+        try:
+            openai_url = f"{ollama_url.rstrip('/')}/v1"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens
+            }
+            api_key = os.environ.get("OLLAMA_API_KEY")
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+                
+            response = requests.post(f"{openai_url}/chat/completions", headers=headers, json=payload, timeout=120)
+            if response.status_code == 200:
+                result = response.json()
+                content = result["choices"][0]["message"]["content"]
+                logger.info("Local Ollama response: {}".format(content[:200] + "..."))
+                
+                # Record usage if accumulator is active
+                usage = result.get("usage")
+                acc = usage_accumulator.get()
+                if usage and acc is not None:
+                    acc.append({
+                        "provider": "ollama",
+                        "model": model_name,
+                        "prompt_tokens": usage.get("prompt_tokens", 0),
+                        "completion_tokens": usage.get("completion_tokens", 0)
+                    })
+                return content
+            else:
+                logger.error(f"Local Ollama API error: {response.status_code} - {response.text}")
+                # Fallback to Groq
+                return groq_chat_complete(messages)
+        except Exception as e:
+            logger.error(f"Error calling local Ollama: {e}")
+            # Fallback to Groq
+            return groq_chat_complete(messages)
+
     try:
         # Chuẩn bị payload cho API call
         payload = {

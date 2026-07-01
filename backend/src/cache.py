@@ -8,8 +8,10 @@ from utils import generate_request_id
 
 
 
+from database import settings
+
 def _build_redis_client():
-    redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+    redis_url = settings.redis_url
     parsed_url = urlparse(redis_url)
 
     host = parsed_url.hostname or "127.0.0.1"

@@ -43,8 +43,8 @@ class CustomEmbeddingService:
         # Check service health on init
         self.service_available = self._check_health()
 
-    def _local_embedding(self, text: str) -> List[float]:
-        """Generate a deterministic local fallback embedding."""
+    def _bag_of_words_embedding(self, text: str) -> List[float]:
+        """Generate a deterministic local fallback embedding (bag-of-words)."""
         normalized = text.lower()
         tokens = re.findall(r"[\wÀ-ỹ]+", normalized, flags=re.UNICODE)
 
@@ -65,12 +65,36 @@ class CustomEmbeddingService:
 
         return vector
 
+    def _local_embedding(self, text: str) -> List[float]:
+        """Generate a local embedding using Ollama first, falling back to bag-of-words if needed."""
+        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        try:
+            # Connect to http://localhost:11434/api/embeddings
+            url = f"{ollama_url.rstrip('/')}/api/embeddings"
+            payload = {
+                "model": "mxbai-embed-large:latest",
+                "prompt": text
+            }
+            # Short timeout to fail fast if Ollama is busy or offline
+            response = requests.post(url, json=payload, timeout=8)
+            if response.status_code == 200:
+                embedding = response.json().get("embedding", [])
+                if len(embedding) == LOCAL_EMBEDDING_DIMENSION:
+                    return embedding
+        except Exception as e:
+            logger.warning(f"⚠️ Local Ollama embedding failed: {e}. Using deterministic word counter fallback.")
+            
+        return self._bag_of_words_embedding(text)
+
     def _check_health(self):
         """Check if custom embedding service is healthy"""
         try:
             response = requests.get(self.health_endpoint, timeout=5)
             if response.status_code == 200:
                 data = response.json()
+                if not isinstance(data, dict) or "embedding_dim" not in data:
+                    logger.warning("⚠️ Port is occupied by a different service (missing 'embedding_dim'), bypassing custom embedding.")
+                    return False
                 logger.info(
                     f"✅ Custom embedding service is healthy: "
                     f"device={data.get('device')}, "
@@ -87,6 +111,95 @@ class CustomEmbeddingService:
         except Exception as e:
             logger.warning(f"⚠️ Cannot connect to custom embedding service: {e}")
             return False
+
+    def _cohere_batch_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Generate a batch of embeddings using Cohere Cloud API with retry on rate limits."""
+        cohere_api_key = os.environ.get("COHERE_API_KEY")
+        if not cohere_api_key:
+            raise ValueError("COHERE_API_KEY is not configured")
+        
+        import time
+        import requests
+        
+        # Split into sub-batches of size 90 to stay within standard limits
+        sub_batch_size = 90
+        all_embeddings = []
+        
+        headers = {
+            "Authorization": f"Bearer {cohere_api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        for idx in range(0, len(texts), sub_batch_size):
+            sub_batch = texts[idx:idx + sub_batch_size]
+            max_retries = 6
+            base_delay = 5 # seconds
+            
+            sub_embeddings = None
+            for attempt in range(max_retries):
+                try:
+                    payload = {
+                        "texts": sub_batch,
+                        "model": "embed-multilingual-v3.0",
+                        "input_type": "search_document"
+                    }
+                    response = requests.post(
+                        "https://api.cohere.com/v1/embed",
+                        json=payload,
+                        headers=headers,
+                        timeout=30
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        sub_embeddings = data.get("embeddings", [])
+                        break
+                    elif response.status_code == 429:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(f"⚠️ Cohere Rate Limit hit (429) via direct API. Retrying in {delay} seconds... (Attempt {attempt+1}/{max_retries})")
+                        time.sleep(delay)
+                    else:
+                        logger.error(f"❌ Cohere direct API failed with status {response.status_code}: {response.text}")
+                        if attempt == max_retries - 1:
+                            raise Exception(f"Cohere API returned {response.status_code}")
+                        time.sleep(2)
+                        
+                except Exception as e:
+                    logger.error(f"❌ Connection error to Cohere direct API: {e}")
+                    if attempt == max_retries - 1:
+                        raise e
+                    time.sleep(2)
+            
+            if sub_embeddings is None:
+                raise Exception("Failed to get embeddings from Cohere after retries.")
+            all_embeddings.extend(sub_embeddings)
+            
+            # Sleep 6 seconds between sub-batches to respect the 10 RPM rate limit
+            if idx + sub_batch_size < len(texts):
+                logger.info("⏱️ Sleeping 6 seconds before next Cohere sub-batch to respect rate limits...")
+                time.sleep(6.0)
+                
+        return all_embeddings
+
+    def _local_batch_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Generate a batch of embeddings using local Ollama if available, fallback to sequential _local_embedding."""
+        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        try:
+            url = f"{ollama_url.rstrip('/')}/v1/embeddings"
+            payload = {
+                "model": "mxbai-embed-large:latest",
+                "input": texts
+            }
+            response = requests.post(url, json=payload, timeout=25)
+            if response.status_code == 200:
+                data = response.json().get("data", [])
+                embeddings = [item.get("embedding") for item in data]
+                if embeddings and all(len(emb) == LOCAL_EMBEDDING_DIMENSION for emb in embeddings):
+                    return embeddings
+        except Exception as e:
+            logger.warning(f"⚠️ Ollama batch embedding failed: {e}. Falling back to sequential embedding.")
+            
+        return [self._local_embedding(item) for item in texts]
 
     def get_embedding(
         self, text: Union[str, List[str]], batch_size: int = 32
@@ -111,9 +224,19 @@ class CustomEmbeddingService:
         # Clean texts
         texts = [t.replace("\n", " ").strip() for t in texts]
 
+        # Check if we can use Cohere Cloud embeddings (highly recommended: free, fast, 0% local CPU/GPU)
+        cohere_api_key = os.environ.get("COHERE_API_KEY")
+        if cohere_api_key and not self.service_available:
+            try:
+                logger.info(f"☁️ Generating {len(texts)} embeddings on Cohere Cloud to save local machine resources...")
+                embeddings = self._cohere_batch_embeddings(texts)
+                return embeddings[0] if is_single else embeddings
+            except Exception:
+                logger.warning("⚠️ Cohere cloud embedding failed, falling back to local/Ollama methods.")
+
         if USE_LOCAL_EMBEDDING_FALLBACK and not self.service_available:
             logger.warning("⚠️ Custom embedding service unavailable, using local fallback embeddings")
-            embeddings = [self._local_embedding(item) for item in texts]
+            embeddings = self._local_batch_embeddings(texts)
             return embeddings[0] if is_single else embeddings
 
         try:
