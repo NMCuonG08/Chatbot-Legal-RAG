@@ -8,7 +8,7 @@ An intelligent legal virtual assistant for looking up Vietnamese legal documents
 
 ## 🏗️ System Architecture (overview)
 
-The system is structured into two main components: the **Multi-Source Ingestion Pipeline** (for data collection and indexing) and the **Request Lifecycle** (for the Core Agentic & RAG Engine).
+The system is structured into two main components: the **Multi-Source Ingestion Pipeline** (for data collection and indexing) and the **Request Lifecycle** (the Core Agentic & RAG Engine). The request lifecycle is a real **self-corrective multi-agent graph**: a LangGraph `StateGraph` with a CRAG (self-corrective RAG) loop, Redis-backed checkpointing, `Command(goto=...)` inter-agent handoff, self-hosted trace persistence (MySQL + Redis pub/sub), and SSE live-trace streaming.
 
 ### 1. Multi-Source Ingestion Pipeline
 ```mermaid
@@ -29,33 +29,84 @@ graph TD
 ```mermaid
 graph TD
     User([User]) -->|Submits query| UI[Streamlit Frontend]
-    UI -->|Async API requests| API[FastAPI Backend]
-    API -->|Queue tasks| Broker[(Redis)]
-    Worker[Celery Worker] <-->|Fetch & process tasks| Broker
+    UI -->|POST /chat/complete| API[FastAPI Backend]
+    API -->|Celery task| Broker[(Redis broker)]
+    Worker[Celery Worker] <-->|Fetch & process| Broker
 
-    Worker -->|1. Input safety check| Guard[Guardrails Manager]
-    Guard -->|2. Intent routing| Router{LangGraph Router}
+    Worker -->|checkpoint per thread_id| Ckpt[(RedisSaver checkpoint)]
+    Worker -->|emit_step / run_start / run_end| Trace[(MySQL graph_runs + agent_steps)]
+    Trace -->|publish| Pub[(Redis pub/sub: graph_trace_events)]
+    UI -.->|GET /chat/stream SSE, filter by run_id| Pub
 
-    Router -->|legal_rag| RAG[Advanced RAG Flow]
-    Router -->|agent_tools| Agent[ReAct Agent]
+    Worker -->|1. Input guardrails| Guard[NeMo Guardrails]
+    Guard -->|2. Route| Router{LangGraph Router}
+
+    Router -->|legal_rag| CRAG
+    Router -->|agent_tools| Agent[ReAct Agent + per-conv memory]
     Router -->|web_search| Web[Web Search]
     Router -->|general_chat| Gen[General Chat]
 
-    RAG -->|Rewrite Query| Query[Multi-Query Generator]
-    Query -->|Hybrid Search| DB_V[(Qdrant Vector DB)]
-    Query -->|Keyword Search| BM25[BM25 Search]
-    DB_V & BM25 -->|Merge & Rerank| Rerank[Reranker]
-    Rerank -->|Generate answer| LLM_Legal[Vietnamese Legal LLM]
+    subgraph CRAG [Self-Corrective RAG loop]
+        Retr[Retrieve: multi-query + hybrid] --> Grade[Grade docs: LLM-as-judge + rerank score]
+        Grade -->|relevant subset| GenRag[Generate + groundedness guard]
+        Grade -->|all irrelevant, under cap| Rew[Rewrite query]
+        Rew --> Retr
+        Grade -->|cap reached| WebF[Web fallback]
+    end
 
-    Agent -->|Execute tools| Tools[Legal Tools]
-    Tools -->|Contract Penalty / Inheritance / Age / Biz Name / Statute| Agent
-    Agent --> LLM_Prov[LLM Provider - Groq/Ollama/OpenAI]
+    Agent -->|Command handoff: needs legal lookup| Retr
+    GenRag -->|Command handoff: not found| Web
+    Web -->|Command handoff: needs tool| Agent
 
-    Web -->|Search legal news| Tavily[Tavily Search API]
+    GenRag & Agent & Web & Gen -->|Output guardrails + disclaimer| Out[Final response]
+    Out -->|save + trace run_end| Broker
+    Out -->|conversation history| SQL[(MySQL)]
+```
 
-    LLM_Legal & LLM_Prov & Tavily -->|Hallucination & Groundedness check| OutputGuard[Output Guardrails]
-    OutputGuard -->|Save conversation history| SQL[(PostgreSQL / MySQL)]
-    OutputGuard -->|Return result| Broker
+**Graph properties**
+*   **Self-corrective RAG (CRAG):** `retrieve → grade_documents → {generate | rewrite_query → retrieve (loop) | web_search}`, guarded by `REFLECTION_MAX=2`. Documents are graded by rerank `relevance_score` (threshold `DOC_GRADE_THRESHOLD=0.35`) with an LLM-as-judge batch fallback for borderline docs.
+*   **Multi-agent handoff:** `Command(goto=...)` edges — `agent_tools → retrieve` (agent needs legal docs), `generate → web_search` (canned "not found"), `web_search → agent_tools` (needs tool use). Three once-per-run guard flags prevent cycles.
+*   **Checkpointing:** `RedisSaver` (requires Redis Stack / RedisJSON) with `MemorySaver` auto-fallback; isolation by `thread_id = conversation_id`, so multi-turn follow-ups resume state.
+*   **Trace (self-hosted):** every node emits `node_end`/`handoff` events → MySQL `agent_steps` + Redis pub/sub `graph_trace_events`. One `GraphRun` row per turn (`run_id`, route, final response, reflection_count, tool_calls). No LangSmith/Langfuse, no cloud egress — Vietnamese legal data stays local.
+*   **SSE streaming:** `GET /chat/stream/{task_id}` subscribes to the pub/sub channel, filters by `run_id`, and closes on `run_end`. The Streamlit UI renders a live `Agent trace` expander.
+*   **ReAct tool-call surfacing:** the `agent_tool_calls` contextvar is reset per turn, populated by `@track_tool_call`, and lifted through the graph → Celery result → async poll as an optional `tool_calls` array.
+*   **Per-conversation memory:** ReAct agent memory is keyed by `(user_id, conversation_id)` in an LRU cache (cap 32) — fixing a prior global-memory cross-user leak.
+
+---
+
+## 📂 Project Structure
+
+```
+backend/src/
+├── app.py                  # FastAPI endpoints, lifespan, SSE /chat/stream, request models
+├── tasks.py                # Celery tasks + LangGraph StateGraph (CRAG loop, handoff, trace, checkpoint)
+├── trace.py                # Self-hosted trace: MySQL agent_steps/graph_runs + Redis pub/sub emit_*
+├── agent.py                # ReAct agent + legal/web tools, per-conversation memory LRU, tool_calls contextvar
+├── brain.py                # LLM routing (Groq/Ollama/OpenAI), intent detection, routing
+├── legal_tools.py          # Vietnamese civil/commercial law calculation logic
+├── security.py             # API-key dep, path-traversal guard, collection-name validation
+├── guardrails_manager.py   # NeMo input/output guardrails
+├── search.py               # Hybrid search index + BM25 retriever
+├── semantic_cache.py       # Qdrant-based vector caching
+├── config.py               # CRAG constants (REFLECTION_MAX, DOC_GRADE_THRESHOLD, ...)
+├── vectorize.py / models.py / database.py / cache.py  # storage layer (models.py: GraphRun, AgentStep)
+├── import_data.py          # Legacy JSONL importer (incremental)
+└── pipeline/               # Multi-source ingestion pipeline
+    ├── orchestrator.py     # one core loop, idempotent, per-doc isolation
+    ├── run.py              # CLI entrypoint
+    ├── schema.py           # RawDocument / ParsedDocument / ChunkedDocument (frozen)
+    ├── state.py            # pipeline_documents status table (idempotency)
+    ├── storage.py          # raw/processed/serving three-tier lake
+    ├── parsers.py          # parse by source_type (json/md/html/pdf)
+    ├── chunker.py          # semantic/token chunking (wraps splitter)
+    ├── embedder.py         # embed + upsert Qdrant + MySQL chunk metadata (dedup/orphan GC)
+    └── connectors/         # jsonl_qa, markdown, html, pdf + base
+frontend/                   # Streamlit interface (live Agent trace expander)
+data_pipeline/              # Data cleaning & preprocessing
+llm_finetuning_serving/     # Model serving & training
+embed_serving/              # Custom Vietnamese embedding serving (GPU/CPU)
+tests/                      # pytest suite: CRAG, checkpoint, trace, handoff, react toolcalls, memory, SSE
+docs/                       # ARCHITECTURE.md, TESTING.md, drawio template
 ```
 
 ---
@@ -71,8 +122,11 @@ One orchestrator loop, many connectors. Adding a data source = adding one connec
 *   **Incremental embeddings:** MD5 chunk hashes detect unchanged chunks (skip) and orphaned chunks (delete from Qdrant + MySQL). Writes into the **same** Qdrant collection the RAG engine reads from — no second serving store.
 *   **CLI + REST:** `python -m pipeline.run --source-type ...` or `POST /pipeline/ingest`.
 
-### 2. LangGraph Intent Router & Query Expansion
+### 2. LangGraph Self-Corrective Multi-Agent Graph & Query Expansion
 *   **Intent Classification:** routes user queries to the optimal pipeline (`legal_rag`, `agent_tools`, `web_search`, `general_chat`) with a keyword-heuristic fallback when the LLM route is invalid.
+*   **Self-Corrective RAG (CRAG):** `retrieve → grade_documents → {generate | rewrite_query → retrieve (loop) | web_search}`, guarded by `REFLECTION_MAX=2`. Docs graded by rerank score (threshold `0.35`) + LLM-as-judge batch fallback. When retrieval is irrelevant, the graph rewrites the query and retries; after the reflection cap it falls back to web search.
+*   **Multi-Agent Handoff:** `Command(goto=...)` edges let agents redirect the flow mid-turn — `agent_tools → retrieve` (agent needs legal docs), `generate → web_search` (canned "not found"), `web_search → agent_tools` (needs tool use). Once-per-run guard flags prevent cycles.
+*   **Redis Checkpointing:** `RedisSaver` (Redis Stack) with `MemorySaver` auto-fallback; per-`thread_id` state so multi-turn follow-ups resume context.
 *   **Contextual Query Rewriter:** rewrites short follow-ups into standalone questions using conversation history (e.g. *"What if it is 15 days late?"* → *"What is the contract penalty for a 15-day delay?"*).
 *   **Synonym Query Expansion:** expands queries with Vietnamese legal synonyms to maximize retrieval recall.
 
@@ -83,7 +137,7 @@ One orchestrator loop, many connectors. Adding a data source = adding one connec
 *   **Garbage Collection:** automatically deletes orphaned vector chunks from Qdrant and metadata rows from MySQL.
 
 ### 4. Agentic Legal Calculators (ReAct Agent)
-Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing the module never requires LLM env vars/network). The agent triggers programmatic tools, each guarded by input-range validation:
+Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing the module never requires LLM env vars/network). Memory is **per-conversation** — keyed by `(user_id, conversation_id)` in an LRU cache (cap 32), fixing a prior global-memory cross-user leak. Tool calls are captured via the `agent_tool_calls` contextvar (`@track_tool_call`) and surfaced through the graph → Celery result → async poll as an optional `tool_calls` array. The agent triggers programmatic tools, each guarded by input-range validation:
 *   **Contract Penalty Calculator:** penalty fees under commercial law, applying the 12% legal ceiling cap of contract value.
 *   **Inheritance Share Calculator:** splits inheritance among the first line of heirs under the Vietnamese Civil Code.
 *   **Legal Age Verifier:** checks age eligibility for signing contracts, marriage, work, and criminal liability (gender-aware: male 20 / female 18 for marriage).
@@ -111,7 +165,7 @@ Generation routes by `LLM_PROVIDER` (`groq` | `ollama` | `openai`) with graceful
 ### 9. Comprehensive RAG Evaluation Suite
 A 4-pillar framework tracking operational metrics (token count, API cost, latency TTFT/TTLT), quality metrics (LLM-as-judge faithfulness/relevance), agentic metrics (tool-call success via the `agent_tool_calls` contextvar, router accuracy), and failure-mode analysis (Retrieval / Routing / Hallucination / Execution).
 
-> **Observability note (tracing):** There is no distributed tracing (LangSmith / Langfuse / OpenTelemetry) wired in. Tool-call tracking and token-usage accumulation are in-process contextvars feeding the eval suite — nothing is sent to an external tracer, so there is nothing to "turn off". If external tracing is desired later, add a LangSmith/Langfuse callback; it is off by default.
+> **Observability note (tracing):** Tracing is **self-hosted** by design: every graph run is persisted as a `GraphRun` + `AgentStep` rows in MySQL and published to a Redis pub/sub channel (`graph_trace_events`) for live SSE streaming. Tool-call tracking and token-usage accumulation are in-process contextvars feeding the eval suite. **No LangSmith / Langfuse / OpenTelemetry, no cloud egress** — Vietnamese legal data stays local. If external tracing is ever desired, add a LangSmith/Langfuse callback; it is off by default and the self-hosted trace keeps working independently.
 
 ---
 
@@ -122,7 +176,8 @@ A 4-pillar framework tracking operational metrics (token count, API cost, latenc
 *   **Task Queue:** Celery + Redis
 *   **Vector DB:** Qdrant
 *   **Relational DB:** PostgreSQL / MySQL
-*   **RAG & Agent Framework:** LlamaIndex, LangGraph, NVIDIA NeMo Guardrails
+*   **RAG & Agent Framework:** LlamaIndex, LangGraph (StateGraph + `Command` handoff + RedisSaver checkpoint), NVIDIA NeMo Guardrails
+*   **Streaming / Tracing:** sse-starlette (SSE), self-hosted MySQL `graph_runs`/`agent_steps` + Redis pub/sub trace (no LangSmith/Langfuse)
 *   **Language Models:** Llama-3.1 (via Groq), Cohere Rerank, Sentence Transformers / custom Vietnamese embedding (local serve on :5000), optional Ollama / OpenAI
 
 ---
@@ -205,6 +260,7 @@ python src/import_data.py --data-file ../data_pipeline/data/finetune_data/train_
 | DELETE | `/history/{user_id}` | API key | Clear history |
 | POST | `/chat/complete` | – | Submit a chat query (async Celery task) |
 | GET | `/chat/complete/{task_id}` | – | Poll task result |
+| GET | `/chat/stream/{task_id}` | – | SSE live trace stream (filtered by run_id, closes on run_end) |
 | POST | `/collection/create` | API key | Create a Qdrant collection |
 | DELETE | `/collections/{name}/clean` | API key | Delete vectors in a collection |
 | POST | `/document/create` | API key | Create a document |
@@ -214,41 +270,6 @@ python src/import_data.py --data-file ../data_pipeline/data/finetune_data/train_
 *   **Frontend UI:** http://localhost:8501
 *   **Backend API Docs:** http://localhost:8002/docs
 *   **Qdrant Dashboard:** http://localhost:6333/dashboard
-
----
-
-## 📂 Project Structure
-
-```
-backend/src/
-├── app.py                  # FastAPI endpoints, lifespan, request models
-├── tasks.py                # Celery tasks + LangGraph workflow orchestration
-├── brain.py                # LLM routing (Groq/Ollama/OpenAI), intent detection, routing
-├── agent.py                # ReAct agent + legal/web tools (lazy init, tool-call tracking)
-├── legal_tools.py          # Vietnamese civil/commercial law calculation logic
-├── security.py             # API-key dep, path-traversal guard, collection-name validation
-├── guardrails_manager.py   # NeMo input/output guardrails
-├── search.py               # Hybrid search index + BM25 retriever
-├── semantic_cache.py       # Qdrant-based vector caching
-├── vectorize.py / models.py / database.py / cache.py  # storage layer
-├── import_data.py          # Legacy JSONL importer (incremental)
-└── pipeline/               # Multi-source ingestion pipeline
-    ├── orchestrator.py     # one core loop, idempotent, per-doc isolation
-    ├── run.py              # CLI entrypoint
-    ├── schema.py           # RawDocument / ParsedDocument / ChunkedDocument (frozen)
-    ├── state.py            # pipeline_documents status table (idempotency)
-    ├── storage.py          # raw/processed/serving three-tier lake
-    ├── parsers.py          # parse by source_type (json/md/html/pdf)
-    ├── chunker.py          # semantic/token chunking (wraps splitter)
-    ├── embedder.py         # embed + upsert Qdrant + MySQL chunk metadata (dedup/orphan GC)
-    └── connectors/         # jsonl_qa, markdown, html, pdf + base
-frontend/                   # Streamlit interface
-data_pipeline/              # Data cleaning & preprocessing
-llm_finetuning_serving/     # Model serving & training
-embed_serving/              # Custom Vietnamese embedding serving (GPU/CPU)
-tests/                      # pytest suite (conftest auto-adds backend/src to sys.path)
-docs/                       # ARCHITECTURE.md, TESTING.md, drawio template
-```
 
 ---
 

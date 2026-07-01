@@ -1,3 +1,4 @@
+import json
 import os
 import time
 
@@ -103,6 +104,42 @@ if st.button("Gui") and prompt.strip():
                     for idx, src in enumerate(sources):
                         content_text = src.get('content') or src.get('text') or ''
                         st.markdown(f"**Tài liệu {idx+1}:** {content_text[:300]}...")
+
+            # Agent trace (Phase F): live-stream trace events from /chat/stream/{task_id}.
+            # Best-effort + graceful: if the endpoint is unavailable (404 / older
+            # backend), the expander simply reports no trace and never breaks chat.
+            with st.expander("Agent trace", expanded=False):
+                try:
+                    stream_resp = requests.get(
+                        f"{BACKEND_URL}/chat/stream/{task_id}",
+                        stream=True,
+                        timeout=15,
+                    )
+                    if stream_resp.status_code != 200:
+                        st.caption(f"Trace không khả dụng (HTTP {stream_resp.status_code}).")
+                    else:
+                        trace_lines = []
+                        for raw in stream_resp.iter_lines(decode_unicode=True):
+                            if not raw or not raw.startswith("data:"):
+                                continue
+                            data_str = raw[len("data:"):].strip()
+                            try:
+                                evt = json.loads(data_str)
+                            except (json.JSONDecodeError, ValueError):
+                                continue
+                            node = evt.get("node", "?")
+                            etype = evt.get("event_type", "step")
+                            payload = evt.get("payload", {})
+                            trace_lines.append(f"`{node}` · {etype} · {json.dumps(payload, ensure_ascii=False)[:160]}")
+                            if etype == "run_end":
+                                break
+                        if trace_lines:
+                            for line in trace_lines:
+                                st.markdown(line)
+                        else:
+                            st.caption("Không có sự kiện trace.")
+                except requests.RequestException as trace_exc:
+                    st.caption(f"Trace không khả dụng: {trace_exc}")
 
     except requests.RequestException as exc:
         st.error(f"Request failed: {exc}")

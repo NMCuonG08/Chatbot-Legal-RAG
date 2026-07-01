@@ -1,16 +1,19 @@
 import asyncio
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
+import redis.asyncio as aioredis
 from celery.result import AsyncResult
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import delete
+from sse_starlette.sse import EventSourceResponse
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -29,6 +32,7 @@ from security import (
     resolve_safe_data_path,
 )
 from tasks import index_document_v2, llm_handle_message
+from database import settings as db_settings
 from utils import setup_logging
 from vectorize import create_collection, list_collection_points, list_collections
 from semantic_cache import init_semantic_cache
@@ -218,6 +222,69 @@ async def get_response(task_id: str):
         "task_result": task_result.result if task_status != "PENDING" else None
     }
     return result
+
+
+async def _resolve_run_id(task_id: str, timeout: float = 15.0) -> Optional[str]:
+    """Resolve the trace run_id for a Celery task_id from Redis (set by the worker).
+
+    The worker sets `trace:run:{task_id}` at run start. Short-poll until it
+    appears (the SSE client may connect before the worker has started the run).
+    """
+    client = aioredis.from_url(db_settings.trace_redis_url, decode_responses=True)
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            run_id = await client.get(f"trace:run:{task_id}")
+            if run_id:
+                return run_id
+            await asyncio.sleep(0.2)
+        return None
+    finally:
+        await client.aclose()
+
+
+@app.get("/chat/stream/{task_id}")
+async def chat_stream(task_id: str):
+    """Server-Sent Events stream of agent trace for an async chat task.
+
+    Subscribes to the self-hosted Redis pub/sub trace channel, filters events
+    by the run_id bound to this task_id, and closes the stream on `run_end`.
+    Contract: the existing `/chat/complete` + `/chat` endpoints are unchanged.
+    """
+    run_id = await _resolve_run_id(task_id)
+    if not run_id:
+        raise HTTPException(status_code=404, detail=f"No trace run found for task {task_id}")
+
+    channel = db_settings.trace_redis_channel
+
+    async def event_generator():
+        client = aioredis.from_url(db_settings.trace_redis_url, decode_responses=True)
+        pubsub = client.pubsub()
+        await pubsub.subscribe(channel)
+        try:
+            # Send a ready frame so the client knows the stream is live.
+            yield {"event": "ready", "data": json.dumps({"run_id": run_id})}
+            while True:
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30.0)
+                if message is None:
+                    continue
+                if message.get("type") != "message":
+                    continue
+                try:
+                    payload = json.loads(message.get("data", ""))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if payload.get("run_id") != run_id:
+                    continue
+                yield {"event": payload.get("event_type", "step"), "data": json.dumps(payload, ensure_ascii=False)}
+                if payload.get("event_type") == "run_end":
+                    break
+        finally:
+            await pubsub.unsubscribe(channel)
+            await pubsub.aclose()
+            await client.aclose()
+
+    return EventSourceResponse(event_generator())
 
 
 @app.post("/collection/create", dependencies=[Depends(require_api_key)])

@@ -11,7 +11,8 @@ try:
     nest_asyncio.apply()
 except ImportError:
     pass
-from typing import Dict
+from collections import OrderedDict
+from typing import Dict, Optional, Tuple, List
 
 from celery import shared_task
 from llama_index.core.agent import ReActAgent
@@ -297,12 +298,11 @@ all_tools = [
     quick_answer_tool_func,
 ]
 
-# Initialize LLM and Agent LAZILY based on environment variables.
-# Building at import time required env vars / network at import, which broke
-# test collection and any importer that does not need the agent. We now build
-# on first use via _get_ai_agent() and cache the singleton.
+# Initialize the LLM LAZILY based on environment variables. Building at import
+# time required env vars / network at import, which broke test collection and
+# any importer that does not need the agent. We now build on first use via
+# _get_ai_agent(user_id, conversation_id), which caches a per-conversation agent.
 _llm = None
-_ai_agent = None
 
 logger.info("LlamaIndex Agent LLM will be initialized lazily on first use")
 
@@ -370,10 +370,31 @@ LƯU Ý:
 - Nếu công cụ trả về lỗi, giải thích và đề xuất giải pháp khác
 - Trả lời chính xác, chuyên nghiệp, dễ hiểu"""
 
-agent_memory = ChatMemoryBuffer.from_defaults(token_limit=8192)
+# Per-conversation agent memory (Phase E). Previously a single global
+# ChatMemoryBuffer was shared across ALL users/conversations — a cross-user
+# data leak. Now keyed by (user_id, conversation_id) with an LRU cap.
+_agent_memories: "OrderedDict[Tuple[Optional[str], Optional[str]], ChatMemoryBuffer]" = OrderedDict()
+_AGENT_MEMORY_CAP = 32
 
 
-def _build_react_agent(llm) -> ReActAgent | None:
+def get_agent_memory(user_id: Optional[str], conversation_id: Optional[str]) -> ChatMemoryBuffer:
+    """Return (creating if needed) the ChatMemoryBuffer for a (user, conversation).
+
+    LRU-evicts the oldest entry once the cap is exceeded.
+    """
+    key = (user_id, conversation_id)
+    mem = _agent_memories.get(key)
+    if mem is None:
+        mem = ChatMemoryBuffer.from_defaults(token_limit=8192)
+        _agent_memories[key] = mem
+        _agent_memories.move_to_end(key)
+        if len(_agent_memories) > _AGENT_MEMORY_CAP:
+            evicted_key, _ = _agent_memories.popitem(last=False)
+            logger.info(f"[AGENT] Evicted oldest agent memory for key={evicted_key}")
+    return mem
+
+
+def _build_react_agent(llm, memory: ChatMemoryBuffer) -> ReActAgent | None:
     """Build ReAct agent with compatibility across llama-index versions."""
     if llm is None:
         return None
@@ -383,7 +404,7 @@ def _build_react_agent(llm) -> ReActAgent | None:
         return ReActAgent.from_tools(
             all_tools,
             llm=llm,
-            memory=agent_memory,
+            memory=memory,
             verbose=True,
             max_iterations=10,
             context=agent_system_prompt,
@@ -392,45 +413,78 @@ def _build_react_agent(llm) -> ReActAgent | None:
     return ReActAgent(
         tools=all_tools,
         llm=llm,
-        memory=agent_memory,
+        memory=memory,
         verbose=True,
         max_iterations=10,
         system_prompt=agent_system_prompt,
     )
 
 
-def _get_ai_agent():
-    """Lazily build and cache the ReAct agent singleton on first use.
+# Per-(user, conversation) agent cache so each conversation gets its own memory.
+# A single global agent would force a single shared memory again.
+_ai_agent_cache: "OrderedDict[Tuple[Optional[str], Optional[str]], ReActAgent]" = OrderedDict()
+_AI_AGENT_CACHE_CAP = 32
+
+
+def _get_ai_agent(user_id: Optional[str] = None, conversation_id: Optional[str] = None):
+    """Lazily build and cache a per-(user, conversation) ReAct agent.
 
     Building is deferred until the first ``ai_agent_handle`` call so that
     importing this module (e.g. for ``agent_tool_calls`` in eval) does not
-    require LLM env vars or network access.
+    require LLM env vars or network access. Defaults ``(None, None)`` keep
+    legacy callers working (a shared default-memory agent).
     """
-    global _llm, _ai_agent
-    if _ai_agent is None:
+    global _llm
+    key = (user_id, conversation_id)
+    cached = _ai_agent_cache.get(key)
+    if cached is not None:
+        _ai_agent_cache.move_to_end(key)
+        return cached
+
+    if _llm is None:
         _llm = _build_llm()
-        _ai_agent = _build_react_agent(_llm)
-        logger.info(f"Agent initialized with {len(all_tools)} tools")
-    return _ai_agent
+    memory = get_agent_memory(user_id, conversation_id)
+    agent = _build_react_agent(_llm, memory)
+    if agent is None:
+        return None
+    _ai_agent_cache[key] = agent
+    _ai_agent_cache.move_to_end(key)
+    if len(_ai_agent_cache) > _AI_AGENT_CACHE_CAP:
+        evicted_key, _ = _ai_agent_cache.popitem(last=False)
+        logger.info(f"[AGENT] Evicted oldest agent for key={evicted_key}")
+    logger.info(f"Agent initialized with {len(all_tools)} tools for key={key}")
+    return agent
 
 
 @shared_task()
-def ai_agent_handle(question: str) -> str:
+def ai_agent_handle(
+    question: str,
+    user_id: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+) -> Tuple[str, List[Dict]]:
     """
     Handle user question using ReAct agent with tools.
 
     Args:
         question: User's question
+        user_id: Optional user id for per-conversation memory isolation.
+        conversation_id: Optional conversation id for per-conversation memory.
 
     Returns:
-        Agent's response
+        ``(response_text, tool_calls)`` where tool_calls is a list of
+        ``{tool_name, args, status, error, result}`` dicts captured during this
+        run via the ``agent_tool_calls`` contextvar.
     """
+    # Reset the tool-call accumulator for this run so @track_tool_call records
+    # only this turn's calls. contextvars propagate into asyncio.run coroutines.
+    token = agent_tool_calls.set([])
     try:
-        ai_agent = _get_ai_agent()
+        ai_agent = _get_ai_agent(user_id, conversation_id)
         if ai_agent is None:
             return (
                 "Xin lỗi, hệ thống AI agent chưa sẵn sàng do thiếu cấu hình GROQ_API_KEY. "
-                "Vui lòng kiểm tra biến môi trường và thử lại."
+                "Vui lòng kiểm tra biến môi trường và thử lại.",
+                [],
             )
 
         logger.info(f"[AGENT] Processing question: {question}")
@@ -506,10 +560,14 @@ def ai_agent_handle(question: str) -> str:
             res_text = res_text[len("assistant: "):]
 
         logger.info(f"[AGENT] Clean response extracted (length: {len(res_text)})")
-        return res_text
+        tool_calls = list(agent_tool_calls.get() or [])
+        logger.info(f"[AGENT] Captured {len(tool_calls)} tool calls")
+        return res_text, tool_calls
     except Exception as e:
         logger.error(f"[AGENT] Error: {e}")
-        return f"Xin lỗi, đã xảy ra lỗi khi xử lý câu hỏi: {str(e)}"
+        return f"Xin lỗi, đã xảy ra lỗi khi xử lý câu hỏi: {str(e)}", []
+    finally:
+        agent_tool_calls.reset(token)
 
 
 def get_agent_tools_summary() -> Dict:
