@@ -40,20 +40,9 @@ Retrieval-augmented generation (RAG) systems combine generative AI with informat
 
 ## II. System Architecture
 
-Below is the complete, high-level architecture diagram detailing the request lifecycle, ingestion pipeline, data tiers, model serving, and CI/CD layout.
+Below is the system architecture detailing the ingestion pipeline and the request lifecycle (the Core Agentic & RAG Engine).
 
-![System Architecture](asset/architecture_template.drawio.svg)
-
-*(Video demonstration of system overview will be provided)*
-
-> [!NOTE]
-> * **Data Storage:** The ingestion pipeline stores document lineages under a local three-tier storage lake (`data/pipeline_lake/{raw,processed,serving}`) and indexes vectors directly into Qdrant.
-> * **Relational Database:** The system supports PostgreSQL or MySQL for tracking conversation histories, status tables, and graph execution traces.
-
-<details>
-<summary><b>🛠️ View Mermaid Diagram Source Code (Flowchart)</b></summary>
-
-### 1. Ingestion Pipeline Diagram
+### 1. Multi-Source Ingestion Pipeline
 ```mermaid
 %%{init: { 'themeVariables': { 'fontFamily': 'system-ui, -apple-system, sans-serif', 'fontSize': '12px' } } }%%
 graph TD
@@ -73,7 +62,7 @@ graph TD
     status table`")] -.->|idempotency| Conn
 ```
 
-### 2. Request Lifecycle Diagram
+### 2. Request Lifecycle (Core Agentic & RAG Engine)
 ```mermaid
 %%{init: { 'themeVariables': { 'fontFamily': 'system-ui, -apple-system, sans-serif', 'fontSize': '12px' } } }%%
 graph TD
@@ -118,7 +107,6 @@ graph TD
     Out -->|save + trace run_end| Broker
     Out -->|conversation history| SQL[("MySQL")]
 ```
-</details>
 
 **Key Graph Properties:**
 *   **Self-corrective RAG (CRAG):** `retrieve → grade_documents → {generate | rewrite_query → retrieve (loop) | web_search}`, guarded by `REFLECTION_MAX=2`. Documents are graded by rerank `relevance_score` (threshold `DOC_GRADE_THRESHOLD=0.35`) with an LLM-as-judge batch fallback for borderline docs.
