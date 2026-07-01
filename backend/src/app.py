@@ -64,6 +64,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Expose Prometheus metrics (accessible at /metrics)
+from prometheus_fastapi_instrumentator import Instrumentator
+Instrumentator().instrument(app).expose(app)
+
 # CORS allowlist: deny-all by default. Set CORS_ALLOWED_ORIGINS in .env.
 _cors_origins = get_cors_origins()
 app.add_middleware(
@@ -73,6 +77,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
+
 
 
 class CompleteRequest(BaseModel):

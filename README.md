@@ -391,7 +391,8 @@ Verify embedding vectors are calculated correctly:
 
 ## IX. Production Deployment
 
-📖 **[GPU CPU Deployment Guide](embed_serving/GPU_CPU_DEPLOYMENT_GUIDE.md)**
+📖 **[GPU CPU Deployment Guide](embed_serving/GPU_CPU_DEPLOYMENT_GUIDE.md)**  
+☁️ **[AWS Single-Instance Deployment Plan](DEPLOY_AWS.md)**
 
 Deploy to staging or production using Docker Compose in production mode:
 ```bash

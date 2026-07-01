@@ -17,6 +17,7 @@ llama-index-retrievers-bm25
 nest_asyncio==1.6.0
 nemoguardrails
 qdrant-client==1.11.1
-langchain-openai
 llama-index-llms-groq
 sentence-transformers
+prometheus-fastapi-instrumentator>=6.0.0
+
