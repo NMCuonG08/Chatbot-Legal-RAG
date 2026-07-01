@@ -8,6 +8,24 @@ An intelligent legal virtual assistant for looking up Vietnamese legal documents
 
 ## 🏗️ System Architecture (overview)
 
+The system is structured into two main components: the **Multi-Source Ingestion Pipeline** (for data collection and indexing) and the **Request Lifecycle** (for the Core Agentic & RAG Engine).
+
+### 1. Multi-Source Ingestion Pipeline
+```mermaid
+graph TD
+    Dir[(JSONL / Markdown / HTML / PDF)] --> Conn[Connectors]
+    Conn -->|fetch| Raw[(Raw tier - immutable)]
+    Raw --> Parse[Parsers - by source_type]
+    Parse --> Proc[(Processed tier)]
+    Proc --> Chunk[Chunker - semantic/token]
+    Chunk --> Serv[(Serving tier)]
+    Chunk --> Emb[Embedder]
+    Emb --> Q1[(Qdrant collection)]
+    Emb --> Q2[(MySQL chunk metadata)]
+    State[(pipeline_documents status table)] -.->|idempotency| Conn
+```
+
+### 2. Request Lifecycle (Core Agentic & RAG Engine)
 ```mermaid
 graph TD
     User([User]) -->|Submits query| UI[Streamlit Frontend]
@@ -15,40 +33,25 @@ graph TD
     API -->|Queue tasks| Broker[(Redis)]
     Worker[Celery Worker] <-->|Fetch & process tasks| Broker
 
-    subgraph Ingest [Multi-Source Ingestion Pipeline]
-        Dir[(JSONL / Markdown / HTML / PDF)] --> Conn[Connectors]
-        Conn -->|fetch| Raw[(Raw tier - immutable)]
-        Raw --> Parse[Parsers - by source_type]
-        Parse --> Proc[(Processed tier)]
-        Proc --> Chunk[Chunker - semantic/token]
-        Chunk --> Serv[(Serving tier)]
-        Chunk --> Emb[Embedder]
-        Emb --> Q1[(Qdrant collection)]
-        Emb --> Q2[(MySQL chunk metadata)]
-        State[(pipeline_documents status table)] -.->|idempotency| Conn
-    end
+    Worker -->|1. Input safety check| Guard[Guardrails Manager]
+    Guard -->|2. Intent routing| Router{LangGraph Router}
 
-    subgraph Engine [Core Agentic & RAG Engine]
-        Worker -->|1. Input safety check| Guard[Guardrails Manager]
-        Guard -->|2. Intent routing| Router{LangGraph Router}
+    Router -->|legal_rag| RAG[Advanced RAG Flow]
+    Router -->|agent_tools| Agent[ReAct Agent]
+    Router -->|web_search| Web[Web Search]
+    Router -->|general_chat| Gen[General Chat]
 
-        Router -->|legal_rag| RAG[Advanced RAG Flow]
-        Router -->|agent_tools| Agent[ReAct Agent]
-        Router -->|web_search| Web[Web Search]
-        Router -->|general_chat| Gen[General Chat]
+    RAG -->|Rewrite Query| Query[Multi-Query Generator]
+    Query -->|Hybrid Search| DB_V[(Qdrant Vector DB)]
+    Query -->|Keyword Search| BM25[BM25 Search]
+    DB_V & BM25 -->|Merge & Rerank| Rerank[Reranker]
+    Rerank -->|Generate answer| LLM_Legal[Vietnamese Legal LLM]
 
-        RAG -->|Rewrite Query| Query[Multi-Query Generator]
-        Query -->|Hybrid Search| DB_V[(Qdrant Vector DB)]
-        Query -->|Keyword Search| BM25[BM25 Search]
-        DB_V & BM25 -->|Merge & Rerank| Rerank[Reranker]
-        Rerank -->|Generate answer| LLM_Legal[Vietnamese Legal LLM]
+    Agent -->|Execute tools| Tools[Legal Tools]
+    Tools -->|Contract Penalty / Inheritance / Age / Biz Name / Statute| Agent
+    Agent --> LLM_Prov[LLM Provider - Groq/Ollama/OpenAI]
 
-        Agent -->|Execute tools| Tools[Legal Tools]
-        Tools -->|Contract Penalty / Inheritance / Age / Biz Name / Statute| Agent
-        Agent --> LLM_Prov[LLM Provider - Groq/Ollama/OpenAI]
-
-        Web -->|Search legal news| Tavily[Tavily Search API]
-    end
+    Web -->|Search legal news| Tavily[Tavily Search API]
 
     LLM_Legal & LLM_Prov & Tavily -->|Hallucination & Groundedness check| OutputGuard[Output Guardrails]
     OutputGuard -->|Save conversation history| SQL[(PostgreSQL / MySQL)]
