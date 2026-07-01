@@ -3,10 +3,16 @@ from functools import lru_cache
 import logging
 import os
 import re
+import sys
 import uuid
 from copy import copy
 from pathlib import Path
 from typing import Dict, List, TypedDict
+
+# Force sys.path to include the backend/src directory for Celery runtime worker threads
+src_path = str(Path(__file__).resolve().parent)
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
 
 from celery import shared_task
 from dotenv import load_dotenv
