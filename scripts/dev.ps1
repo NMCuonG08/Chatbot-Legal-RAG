@@ -58,8 +58,14 @@ switch ($Action) {
     }
     "stop" {
         Write-Host "Stopping Celery Worker, FastAPI Backend, and Streamlit UI..." -ForegroundColor Red
-        $titles = "Celery Worker", "FastAPI Backend", "Streamlit UI"
-        Get-Process | Where-Object { $_.MainWindowTitle -in $titles } | Stop-Process -Force
+        # Find and terminate both the parent powershell instances and their children by matching command lines
+        Get-CimInstance Win32_Process | Where-Object {
+            $_.CommandLine -like "*celery -A tasks.celery_app worker*" -or
+            $_.CommandLine -like "*uvicorn app:app*" -or
+            $_.CommandLine -like "*streamlit run chat_interface.py*"
+        } | ForEach-Object {
+            Stop-Process -Id $_.ProcessId -Force 2>$null
+        }
         Write-Host "All app services stopped!" -ForegroundColor Green
     }
     default {
