@@ -34,7 +34,7 @@ switch ($Action) {
         Write-Host "[3/3] Creating DB schema + Qdrant collections..." -ForegroundColor Green
         Push-Location backend/src
         python -c "import models; models.ensure_database_schema()"
-        python -c "from vectorize import create_collection; [create_collection(c) for c in ['llm','user_episodes','semantic_cache']]"
+        python -c "from vectorize import create_collection, list_collections; existing = [c['name'] for c in list_collections()]; [create_collection(c) for c in ['llm','user_episodes','semantic_cache'] if c not in existing]"
         Pop-Location
         Write-Host "`nDONE. Now edit backend/.env:"
         Write-Host "  GROQ_API_KEY / TAVILY_API_KEY / COHERE_API_KEY = real keys"

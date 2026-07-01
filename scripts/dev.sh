@@ -30,7 +30,7 @@ case "${1:-}" in
     echo "[3/3] Creating DB schema + Qdrant collections..."
     ( cd backend/src && \
       python -c "import models; models.ensure_database_schema()" && \
-      python -c "from vectorize import create_collection; [create_collection(c) for c in ['llm','user_episodes','semantic_cache']]" )
+      python -c "from vectorize import create_collection, list_collections; existing = [c['name'] for c in list_collections()]; [create_collection(c) for c in ['llm','user_episodes','semantic_cache'] if c not in existing]" )
     echo
     echo "DONE. Now edit backend/.env:"
     echo "  GROQ_API_KEY / TAVILY_API_KEY / COHERE_API_KEY = real keys"
