@@ -67,4 +67,7 @@ llm_finetuning_serving/checkpoints/
 # Gradio cache
 .gradio/
 
+# Downloaded embedding / serving model artifacts (HF cache, multi-GB)
+embed_serving/models/
+
 
