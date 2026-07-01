@@ -8,6 +8,7 @@ from groq import Groq
 from redis import InvalidResponse
 
 from custom_embedding import get_custom_embedding
+from retry_utils import with_retry
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,21 @@ def get_groq_client():
 
 
 client = get_groq_client()
+
+
+# Thin retry-wrapped binding around the Groq chat completions create call.
+# Retries only on transient errors (429 rate limits, 5xx, connection/timeout);
+# non-retryable errors propagate to the caller's try/except fallback unchanged.
+@with_retry(max_attempts=3, base_delay=1.0, max_delay=8.0)
+def _groq_chat_create(model_name: str, messages, temperature: float = 0.7, max_tokens: int = 2048):
+    if client is None:
+        raise RuntimeError("Groq client is not initialized")
+    return client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
 
 
 def vietnamese_llm_chat_complete(messages=(), temperature=0.7, max_tokens=512):
@@ -173,12 +189,7 @@ def groq_chat_complete(messages=(), model=None, raw=False):
             logger.warning("GROQ_API_KEY not set, returning empty response")
             return _USER_FACING_ERROR
         try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                max_tokens=2048,
-                temperature=0.7
-            )
+            response = _groq_chat_create(model_name, messages, temperature=0.7, max_tokens=2048)
             if raw:
                 record_usage("groq", model_name, getattr(response, "usage", None))
                 return response.choices[0].message

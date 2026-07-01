@@ -69,10 +69,16 @@ class LegalGuardrailsManager:
         except Exception as e:
             logger.error(f"❌ Error initializing NeMo Guardrails: {e}")
 
-    async def verify_input(self, user_message: str) -> Optional[str]:
+    @staticmethod
+    def verify_input_tier1(user_message: str) -> Optional[str]:
         """
-        Validate user input against safety guidelines.
-        Returns a blocked response message if validation fails, or None if safe.
+        Deterministic keyword guardrails (Tier 1). Pure, synchronous, no LLM call,
+        no instance state required. Returns a blocked response message if a keyword
+        rule matches, else None.
+
+        Safe to call in the API process before dispatching to Celery — blocks
+        obvious jailbreak/political/toxic inputs without a broker roundtrip and
+        without initializing the NeMo engine.
         """
         message_lower = user_message.lower().strip()
 
@@ -104,6 +110,21 @@ class LegalGuardrailsManager:
         if any(kw.lower() in message_lower for kw in toxicity_keywords):
             logger.warning(f"🚨 [GUARDRAILS-TIER1] Input BLOCKED (Toxicity): {user_message}")
             return "Tôi hỗ trợ giải đáp pháp luật dựa trên tinh thần lịch sự và chuyên nghiệp. Vui lòng đặt câu hỏi lịch sự để tôi hỗ trợ bạn tốt nhất."
+
+        return None
+
+    async def verify_input(self, user_message: str) -> Optional[str]:
+        """
+        Validate user input against safety guidelines.
+        Returns a blocked response message if validation fails, or None if safe.
+
+        Runs Tier 1 (deterministic keywords) then Tier 2 (semantic NeMo LLM).
+        Tier 1 is also exposed synchronously via ``verify_input_tier1`` so the API
+        layer can short-circuit obvious violations before enqueuing to Celery.
+        """
+        tier1 = self.verify_input_tier1(user_message)
+        if tier1:
+            return tier1
 
         # --- Tier 2: Semantic/NeMo Guardrails ---
         if not self.initialized or not self.rails:

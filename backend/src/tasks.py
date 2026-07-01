@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import logging
 import os
@@ -69,6 +70,24 @@ logger = logging.getLogger(__name__)
 
 import redis
 redis_client = redis.from_url(settings.redis_url)
+
+# ---- Schema ensure guard: once per worker process ----
+# ensure_database_schema() reflects all tables and runs idempotent CREATE IF
+# NOT EXISTS. Cheap per call but unnecessary per message; a worker process lives
+# across many tasks, so guard it with a module-level flag.
+_SCHEMA_ENSURED = False
+
+
+def _ensure_schema_once() -> None:
+    global _SCHEMA_ENSURED
+    if _SCHEMA_ENSURED:
+        return
+    try:
+        ensure_database_schema()
+    except Exception as e:
+        logger.warning("Schema ensure failed on first call: %s", e)
+        return
+    _SCHEMA_ENSURED = True
 
 from guardrails_manager import LegalGuardrailsManager
 guardrails_manager = LegalGuardrailsManager()
@@ -215,6 +234,9 @@ def retrieve_with_hybrid_search(queries: List[str], top_k: int = 5) -> List[Dict
     Enhanced retrieval using hybrid search (semantic + keyword)
     This combines vector search with BM25 keyword search for better coverage.
 
+    Queries are run concurrently (each does an embedding + Qdrant + BM25 round
+    trip), so latency scales with the slowest query rather than the sum.
+
     Args:
         queries: List of query variations
         top_k: Number of documents to retrieve
@@ -222,15 +244,22 @@ def retrieve_with_hybrid_search(queries: List[str], top_k: int = 5) -> List[Dict
     Returns:
         Merged and deduplicated list of documents with hybrid scores
     """
-    all_docs = []
+    all_docs: List[Dict] = []
     seen_contents = set()
 
-    for query in queries:
-        logger.info(f"Hybrid search for query: {query}")
+    def _run_one(q: str) -> List[Dict]:
+        logger.info(f"Hybrid search for query: {q}")
+        try:
+            return hybrid_search(q, limit=top_k)
+        except Exception as e:
+            logger.warning(f"Hybrid search failed for query '{q}': {e}")
+            return []
 
-        # Use hybrid search instead of pure vector search
-        docs = hybrid_search(query, limit=top_k)
+    max_workers = min(len(queries), 4) if queries else 1
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        per_query_docs = list(pool.map(_run_one, queries))
 
+    for query, docs in zip(queries, per_query_docs):
         # Deduplicate based on content
         for doc in docs:
             content_hash = hash(doc.get("content", ""))
@@ -1056,18 +1085,19 @@ def llm_handle_message(self, bot_id, user_id, question):
     celery_task_id = getattr(self, "request", None) and getattr(self.request, "id", None)
 
     # Ensure required tables exist before worker writes conversation records.
-    ensure_database_schema()
+    # Guarded to run once per worker process (schema create is idempotent but
+    # reflects all tables = a non-trivial DB roundtrip we don't want per message).
+    # The FastAPI lifespan also runs this on startup; this covers a worker that
+    # starts before the API ever received a request.
+    _ensure_schema_once()
 
     # Update chat conversation
     conversation_id = update_chat_conversation(bot_id, user_id, question, True)
     logger.info("Conversation id: %s", conversation_id)
 
-    # Convert history to list messages
-    messages = get_conversation_messages(conversation_id)
-    logger.info("Conversation messages: %s", messages)
-    history = messages[:-1]
-
-    # 1. Check Semantic Cache
+    # 1. Check Semantic Cache BEFORE loading history. Cache lookup only needs
+    # the raw question, not the conversation history, so on a HIT we skip the
+    # extra DB read (get_conversation_messages) entirely.
     try:
         from semantic_cache import get_cached_response, set_cached_response
         cached = get_cached_response(question)
@@ -1077,6 +1107,11 @@ def llm_handle_message(self, bot_id, user_id, question):
             return {"role": "assistant", "content": cached["response"], "sources": cached["sources"]}
     except Exception as cache_err:
         logger.error(f"Semantic Cache check failed: {cache_err}")
+
+    # Convert history to list messages (only needed on cache miss)
+    messages = get_conversation_messages(conversation_id)
+    logger.info("Conversation messages: %s", messages)
+    history = messages[:-1]
 
     # 2. Run Input Guardrails check
     blocked_response = None

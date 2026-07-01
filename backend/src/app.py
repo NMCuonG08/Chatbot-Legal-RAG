@@ -25,6 +25,7 @@ from models import (
     list_user_conversations,
 )
 from cache import clear_conversation_id
+from guardrails_manager import LegalGuardrailsManager
 from security import (
     get_cors_origins,
     get_legal_collection_name,
@@ -35,7 +36,7 @@ from tasks import index_document_v2, llm_handle_message
 from database import settings as db_settings
 from utils import setup_logging
 from vectorize import create_collection, list_collection_points, list_collections
-from semantic_cache import init_semantic_cache
+from semantic_cache import clear_semantic_cache, init_semantic_cache
 
 # Constants
 TASK_TIMEOUT = 60
@@ -201,6 +202,14 @@ async def complete(data: CompleteRequest):
             status_code=400, detail="User id and user message are required"
         )
 
+    # Fast-reject gate: deterministic Tier-1 keyword guardrails (pure string
+    # match, no LLM, no NeMo init). Blocks jailbreak/political/toxic inputs
+    # before any broker dispatch or DB write. Tier-2 semantic guardrails still
+    # run inside the worker for non-obvious cases.
+    blocked = LegalGuardrailsManager.verify_input_tier1(user_message)
+    if blocked:
+        return {"response": blocked, "sources": []}
+
     if data.sync_request:
         # llm_handle_message is sync (Celery task called directly). Run in a
         # worker thread so the uvicorn event loop is NOT blocked for the whole
@@ -313,6 +322,10 @@ async def clean_collection(collection_name: str):
     if not success:
         raise HTTPException(status_code=500, detail=f"Failed to wipe collection {collection_name}")
 
+    # 1b. Invalidate semantic cache: cached answers may have been grounded in
+    # the wiped vectors and would be stale after a re-index.
+    cache_cleared = clear_semantic_cache()
+
     # 2. Clean MySQL mapping chunks
     db = _new_db_session()
     try:
@@ -325,7 +338,7 @@ async def clean_collection(collection_name: str):
     finally:
         db.close()
 
-    return {"status": "success", "message": f"Collection {collection_name} and all mapping metadata cleaned successfully."}
+    return {"status": "success", "message": f"Collection {collection_name} and all mapping metadata cleaned successfully.", "cache_cleared": cache_cleared}
 
 
 @app.post("/document/create", dependencies=[Depends(require_api_key)])
@@ -405,6 +418,13 @@ async def pipeline_ingest_endpoint(data: PipelineIngestRequest):
         data.use_semantic,
         data.limit,
     )
+    # Invalidate semantic cache: bulk (re-)ingest changes the document corpus
+    # the cache answers are grounded in, so prior cached responses may be stale.
+    if data.use_semantic:
+        try:
+            clear_semantic_cache()
+        except Exception as cache_err:
+            logger.warning(f"Semantic cache clear after pipeline ingest failed: {cache_err}")
     return {"collection": collection_name, "source_type": data.source_type, "stats": stats}
 
 
