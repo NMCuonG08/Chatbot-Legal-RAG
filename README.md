@@ -358,10 +358,10 @@ Files processed by the ingestion connecters are managed securely under a local t
 ![Data Storage](asset/data_store.png)
 
 ### 2. Data Statistics
-- **Legal Corpus**: 1.9M+ Vietnamese legal documents
-- **Training Data**: 225K+ high-quality Q&A pairs
-- **Fine-tuning Sets**: 3 specialized datasets
-- **Coverage**: Complete coverage of major Vietnamese legal codes
+*   **Original Legal Dataset (`train.jsonl`):** 89,261 raw Q&A legal document entries (File size: 162.13 MB).
+*   **Unique Processed QA Pairs (`train_qa_format.jsonl`):** 19,536 high-quality fine-tuning records (File size: 42.27 MB).
+*   **Stored Chunks (Local MySQL/PostgreSQL):** 62,854 document chunk metadata points mapped across 19,536 unique documents.
+*   **Coverage:** Hand-curated Vietnamese civil code guidelines, business naming regulations, contract penalty benchmarks, and statutes of limitations.
 
 ---
 
