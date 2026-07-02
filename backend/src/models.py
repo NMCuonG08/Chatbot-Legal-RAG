@@ -300,6 +300,29 @@ def save_agent_step(run_id: str, node: str, step_index: int, event_type: str,
             db.close()
 
 
+def load_agent_steps(run_id: str, db: Session = None) -> list[AgentStep]:
+    """Load persisted trace events for a run, ordered by emission sequence.
+
+    Used by the SSE stream endpoint to replay events that were published to
+    Redis pub/sub before a client subscribed (the common case when the UI
+    opens the trace expander only after the Celery task has finished).
+    """
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        return (
+            db.query(AgentStep)
+            .filter(AgentStep.run_id == run_id)
+            .order_by(AgentStep.step_index.asc(), AgentStep.id.asc())
+            .all()
+        )
+    finally:
+        if session_created:
+            db.close()
+
+
 def save_user_episode(user_id: str, summary: str, db: Session = None):
     session_created = False
     if db is None:

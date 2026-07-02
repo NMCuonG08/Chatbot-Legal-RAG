@@ -177,7 +177,7 @@ def vector_search_fallback(query: str, limit: int = 5) -> List[Dict]:
 
 def combine_search_results(bm25_results, vector_results, query: str) -> List[Dict]:
     """
-    Combine BM25 and vector search results with hybrid scoring
+    Combine BM25 and vector search results using Reciprocal Rank Fusion (RRF)
     
     Args:
         bm25_results: Results from BM25 search
@@ -187,106 +187,123 @@ def combine_search_results(bm25_results, vector_results, query: str) -> List[Dic
     Returns:
         List of combined documents with hybrid scores
     """
-    # Convert BM25 results to dict format
-    bm25_docs = {}
+    # RRF Constant (usually 60)
+    k = 60
     
-    for i, node in enumerate(bm25_results):
+    # Helper to normalize content text by removing the question if it's prepended
+    def get_norm_hash(content_text: str, q: str) -> int:
+        content_text = content_text.strip()
+        q = q.strip()
+        if q and content_text.startswith(q):
+            content_text = content_text[len(q):].strip()
+        return hash(content_text)
+
+    # Convert BM25 results to dict and map doc_key -> doc
+    bm25_docs = {}
+    bm25_ranks = {}
+    for rank_idx, node in enumerate(bm25_results, 1):
         content = node.node.text if hasattr(node.node, 'text') else str(node.node)
-        content_hash = hash(content)
         question = node.node.metadata.get("question", "")
+        doc_id = node.node.metadata.get("doc_id", 0)
         
-        logger.info(f"   BM25[{i+1}]: Score={node.score:.3f}, Q='{question[:50]}...'")
+        content_hash = get_norm_hash(content, question)
+        doc_key = f"id_{doc_id}" if doc_id else f"hash_{content_hash}"
         
-        bm25_docs[content_hash] = {
+        logger.info(f"   BM25[Rank {rank_idx}]: Score={node.score:.3f}, Key={doc_key}, Q='{question[:50]}...'")
+        
+        bm25_docs[doc_key] = {
             "content": content,
             "question": question,
             "source": node.node.metadata.get("source", "unknown"),
-            "doc_id": node.node.metadata.get("doc_id", 0),
+            "doc_id": doc_id,
             "bm25_score": node.score,
             "search_method": "bm25"
         }
-    
-    # Convert vector results to dict format
+        bm25_ranks[doc_key] = rank_idx
+
+    # Convert Vector results and map doc_key -> doc
     vector_docs = {}
+    vector_ranks = {}
     logger.info(f"📝 Processing {len(vector_results)} Vector results...")
-    
-    for i, doc in enumerate(vector_results):
+    for rank_idx, doc in enumerate(vector_results, 1):
         content = doc.get("content", "")
-        content_hash = hash(content)
         question = doc.get("question", "")
+        doc_id = doc.get("doc_id", 0)
         
-        logger.info(f"   Vector[{i+1}]: Score={doc.get('similarity_score', 0):.3f}, Q='{question[:50]}...'")
+        content_hash = get_norm_hash(content, question)
+        doc_key = f"id_{doc_id}" if doc_id else f"hash_{content_hash}"
         
-        vector_docs[content_hash] = {
+        logger.info(f"   Vector[Rank {rank_idx}]: Score={doc.get('similarity_score', 0):.3f}, Key={doc_key}, Q='{question[:50]}...'")
+        
+        vector_docs[doc_key] = {
             "content": content,
             "question": question,
             "source": doc.get("source", "unknown"),
-            "doc_id": doc.get("doc_id", 0),
+            "doc_id": doc_id,
             "vector_score": doc.get("similarity_score", 0),
             "search_method": "vector"
         }
-    
+        vector_ranks[doc_key] = rank_idx
+
     # Combine results
     all_docs = {}
     overlap_count = 0
     
-    logger.info(f"🔗 Combining results...")
+    logger.info(f"🔗 Combining results using RRF...")
     
     # Add BM25 results
-    for content_hash, doc in bm25_docs.items():
-        all_docs[content_hash] = doc
-    logger.info(f"   Added {len(bm25_docs)} BM25 documents")
-    
-    # Add vector results and merge if overlap
-    for content_hash, doc in vector_docs.items():
-        if content_hash in all_docs:
-            # Merge scores for documents found by both methods
-            all_docs[content_hash]["vector_score"] = doc["vector_score"]
-            all_docs[content_hash]["search_method"] = "hybrid"
-            overlap_count += 1
-            logger.info(f"   ✨ Found overlap: '{doc['question'][:40]}...' (BM25 + Vector)")
-        else:
-            all_docs[content_hash] = doc
-    
-    logger.info(f"   Added {len(vector_docs)} Vector documents ({overlap_count} overlaps)")
-    logger.info(f"   Total unique documents: {len(all_docs)}")
-    
-    # Calculate hybrid scores
-    logger.info(f"⚖️ Calculating hybrid scores...")
-    hybrid_count = bm25_only_count = vector_only_count = 0
-    
-    for doc in all_docs.values():
-        bm25_score = doc.get("bm25_score", 0)
-        vector_score = doc.get("vector_score", 0)
+    for doc_key, doc in bm25_docs.items():
+        all_docs[doc_key] = doc
         
-        # Simple hybrid scoring: weighted combination
-        # Give equal weight to both methods, boost if found by both
+    # Add vector results and merge if overlap
+    for doc_key, doc in vector_docs.items():
+        if doc_key in all_docs:
+            all_docs[doc_key]["vector_score"] = doc["vector_score"]
+            all_docs[doc_key]["search_method"] = "hybrid"
+            # Keep Vector's content as it's cleaner chunk content
+            all_docs[doc_key]["content"] = doc["content"]
+            overlap_count += 1
+            logger.info(f"   ✨ Found overlap for Key {doc_key}: '{doc['question'][:40]}...' (BM25 + Vector)")
+        else:
+            all_docs[doc_key] = doc
+            
+    # Calculate RRF Scores
+    w_vector = 1.15
+    w_bm25 = 1.0
+    hybrid_count = bm25_only_count = vector_only_count = 0
+    for doc_key, doc in all_docs.items():
+        rrf_score = 0.0
+        
+        if doc_key in bm25_ranks:
+            rrf_score += w_bm25 * (1.0 / (k + bm25_ranks[doc_key]))
+        if doc_key in vector_ranks:
+            rrf_score += w_vector * (1.0 / (k + vector_ranks[doc_key]))
+            
+        doc["hybrid_score"] = rrf_score
+        
+        # Track counts for logging
         if doc["search_method"] == "hybrid":
-            doc["hybrid_score"] = (bm25_score * 0.5) + (vector_score * 0.5) + 0.1  # Bonus for being in both
             hybrid_count += 1
         elif doc["search_method"] == "bm25":
-            doc["hybrid_score"] = bm25_score * 0.6  # Slightly lower weight for BM25 only
             bm25_only_count += 1
-        else:  # vector only
-            doc["hybrid_score"] = vector_score * 0.6  # Slightly lower weight for vector only
+        else:
             vector_only_count += 1
-    
+
     logger.info(f"   Scoring breakdown: Hybrid={hybrid_count}, BM25-only={bm25_only_count}, Vector-only={vector_only_count}")
     
-    # Sort by score for logging top results
+    # Sort by RRF score descending
     sorted_docs = sorted(all_docs.values(), key=lambda x: x.get("hybrid_score", 0), reverse=True)
     
-    logger.info(f"🏆 Top 3 combined results:")
+    logger.info(f"🏆 Top 3 combined results (RRF):")
     for i, doc in enumerate(sorted_docs[:3], 1):
         question = doc.get("question", "N/A")
         score = doc.get("hybrid_score", 0)
         method = doc.get("search_method", "unknown")
         bm25_s = doc.get("bm25_score", 0)
         vector_s = doc.get("vector_score", 0)
-        logger.info(f"   {i}. {question[:50]}... (Score: {score:.3f}, Method: {method}, BM25: {bm25_s:.3f}, Vec: {vector_s:.3f})")
-    
+        logger.info(f"   {i}. {question[:50]}... (RRF Score: {score:.5f}, Method: {method}, BM25: {bm25_s:.3f}, Vec: {vector_s:.3f})")
+        
     logger.info(f"✅ Combined search results: {len(all_docs)} total documents")
-    
     return list(all_docs.values())
 
 
@@ -364,12 +381,12 @@ def force_initialize_if_needed() -> bool:
     return False
 
 
-def initialize_from_vector_store(limit: int = 1000) -> bool:
+def initialize_from_vector_store(limit: int = 100000) -> bool:
     """
-    Initialize search index from existing vector store data
+    Initialize search index from existing vector store data using paginated scrolls
     
     Args:
-        limit: Maximum number of documents to load
+        limit: Maximum number of documents to load (default: 100,000)
         
     Returns:
         bool: True if successful
@@ -380,21 +397,34 @@ def initialize_from_vector_store(limit: int = 1000) -> bool:
 
         logger.info(f"🔄 Loading documents from vector store (limit: {limit})")
 
-        # Get documents directly from Qdrant using scroll
-        scroll_result = get_client().scroll(
-            collection_name=DEFAULT_COLLECTION_NAME,
-            limit=limit,
-            with_payload=True,
-            with_vectors=False
-        )
+        # Get documents directly from Qdrant using paginated scroll
+        points = []
+        next_offset = None
+        client = get_client()
         
-        points = scroll_result[0]  # First element is the list of points
+        while len(points) < limit:
+            scroll_result = client.scroll(
+                collection_name=DEFAULT_COLLECTION_NAME,
+                limit=10000,
+                offset=next_offset,
+                with_payload=True,
+                with_vectors=False
+            )
+            batch_points, next_offset = scroll_result
+            points.extend(batch_points)
+            logger.info(f"   Scrolled batch: loaded {len(batch_points)} points (total: {len(points)})")
+            
+            if not next_offset or not batch_points:
+                break
+        
+        # Trim points list to limit if needed
+        points = points[:limit]
         
         if not points:
             logger.warning("📋 No documents found in vector store")
             return False
         
-        logger.info(f"📄 Loaded {len(points)} documents from vector store")
+        logger.info(f"📄 Loaded {len(points)} total documents from vector store")
         
         # Convert vector store results to the format expected by initialize_search_index
         documents = []

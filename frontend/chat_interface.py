@@ -113,7 +113,7 @@ if st.button("Gui") and prompt.strip():
                     stream_resp = requests.get(
                         f"{BACKEND_URL}/chat/stream/{task_id}",
                         stream=True,
-                        timeout=15,
+                        timeout=(10, 30),
                     )
                     if stream_resp.status_code != 200:
                         st.caption(f"Trace không khả dụng (HTTP {stream_resp.status_code}).")
@@ -126,6 +126,10 @@ if st.button("Gui") and prompt.strip():
                             try:
                                 evt = json.loads(data_str)
                             except (json.JSONDecodeError, ValueError):
+                                continue
+                            # Skip non-trace control frames (ready handshake,
+                            # ping heartbeats) — they carry no event_type.
+                            if "event_type" not in evt:
                                 continue
                             node = evt.get("node", "?")
                             etype = evt.get("event_type", "step")

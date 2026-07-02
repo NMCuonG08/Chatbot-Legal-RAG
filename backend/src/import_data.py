@@ -263,7 +263,11 @@ def import_qa_data(
                 # Respect Cohere free Trial API rate limit (10 RPM) only if we actually generated embeddings
                 if to_upsert_global:
                     import time
-                    time.sleep(6.0)
+                    keys_str = os.environ.get("COHERE_API_KEYS", "")
+                    num_keys = len([k for k in keys_str.split(",") if k.strip()]) if keys_str else 1
+                    sleep_time = max(0.5, 6.0 / num_keys)
+                    logger.info(f"⏱️ Dynamic sleep: sleeping {sleep_time:.2f}s (configured keys: {num_keys})")
+                    time.sleep(sleep_time)
                     
                 batch_lines = []
 

@@ -23,6 +23,7 @@ from models import (
     insert_document,
     list_documents,
     list_user_conversations,
+    load_agent_steps,
 )
 from cache import clear_conversation_id
 from guardrails_manager import LegalGuardrailsManager
@@ -270,17 +271,57 @@ async def chat_stream(task_id: str):
         raise HTTPException(status_code=404, detail=f"No trace run found for task {task_id}")
 
     channel = db_settings.trace_redis_channel
+    # Heartbeat cadence: must be shorter than the SSE client's read timeout
+    # (the Streamlit UI uses requests with a 15s read timeout) so the
+    # connection is never idle long enough to time out between trace events.
+    heartbeat_interval = 5.0
 
     async def event_generator():
+        # Send a ready frame so the client knows the stream is live.
+        yield {"event": "ready", "data": json.dumps({"run_id": run_id})}
+
+        # Subscribe FIRST, then replay persisted steps. Ordering matters:
+        # events committed to MySQL before subscribe are delivered via replay,
+        # events published after subscribe are delivered live, and dupes
+        # (event in both DB snapshot and pubsub buffer) are skipped via
+        # seen_indices. This closes the subscribe-after-complete race where
+        # the UI opens the trace stream only after the task already finished.
         client = aioredis.from_url(db_settings.trace_redis_url, decode_responses=True)
         pubsub = client.pubsub()
         await pubsub.subscribe(channel)
+        seen_indices: set[int] = set()
         try:
-            # Send a ready frame so the client knows the stream is live.
-            yield {"event": "ready", "data": json.dumps({"run_id": run_id})}
+            try:
+                steps = await asyncio.to_thread(load_agent_steps, run_id)
+            except Exception as e:
+                logger.warning(f"trace replay load failed for {run_id}: {e}")
+                steps = []
+            for step in steps:
+                seen_indices.add(step.step_index)
+                evt = {
+                    "run_id": run_id,
+                    "node": step.node,
+                    "step_index": step.step_index,
+                    "event_type": step.event_type,
+                    "payload": step.payload,
+                }
+                yield {
+                    "event": step.event_type,
+                    "data": json.dumps(evt, ensure_ascii=False, default=str),
+                }
+                if step.event_type == "run_end":
+                    return
+
+            # Live-tail pub/sub for a run still in progress (or events not
+            # yet in the DB snapshot at replay time).
             while True:
-                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=30.0)
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=heartbeat_interval
+                )
                 if message is None:
+                    # Keep the connection alive between events so clients with
+                    # aggressive read timeouts don't drop the stream.
+                    yield {"event": "ping", "data": ""}
                     continue
                 if message.get("type") != "message":
                     continue
@@ -290,7 +331,15 @@ async def chat_stream(task_id: str):
                     continue
                 if payload.get("run_id") != run_id:
                     continue
-                yield {"event": payload.get("event_type", "step"), "data": json.dumps(payload, ensure_ascii=False)}
+                idx = payload.get("step_index")
+                if idx is not None and idx in seen_indices:
+                    continue
+                if idx is not None:
+                    seen_indices.add(idx)
+                yield {
+                    "event": payload.get("event_type", "step"),
+                    "data": json.dumps(payload, ensure_ascii=False, default=str),
+                }
                 if payload.get("event_type") == "run_end":
                     break
         finally:

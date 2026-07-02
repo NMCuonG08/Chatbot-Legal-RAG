@@ -7,9 +7,9 @@ import numpy as np
 import requests
 
 # Set up Cohere client
-COHERE_API_KEY = os.environ.get("COHERE_API_KEY") or os.environ.get("CO_API_KEY")
+# Global Cohere client instance for lazy loading
+co = None
 DEFAULT_COHERE_MODEL = "rerank-multilingual-v3.0"
-co = cohere.Client(COHERE_API_KEY) if COHERE_API_KEY else None
 
 # Global BGE model instance for lazy loading
 bge_model = None
@@ -19,6 +19,8 @@ def rerank_documents(docs, query, top_n=3, rank_model=None):
     """
     Rerank documents based on the query using either Cohere or BGE CrossEncoder.
     """
+    global co
+    
     # Check if docs list or query is empty
     if not docs:
         print("[RERANK] Docs list is empty, skipping rerank")
@@ -51,9 +53,17 @@ def rerank_documents(docs, query, top_n=3, rank_model=None):
 
     # --- Cohere Rerank ---
     if reranker_type == "cohere":
-        if not COHERE_API_KEY or co is None:
-            print("[RERANK] COHERE_API_KEY not found, returning original docs")
+        cohere_api_key = os.environ.get("COHERE_API_KEY") or os.environ.get("CO_API_KEY")
+        if not cohere_api_key:
+            print("[RERANK] COHERE_API_KEY not found in environment, returning original docs")
             return docs[:top_n]
+            
+        if co is None:
+            try:
+                co = cohere.Client(cohere_api_key)
+            except Exception as e:
+                print(f"[RERANK] Failed to initialize Cohere client: {e}")
+                return docs[:top_n]
 
         cohere_model = rank_model or DEFAULT_COHERE_MODEL
         print(
