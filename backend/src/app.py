@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete
 from sse_starlette.sse import EventSourceResponse
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
 from models import (
     delete_user_conversations,
@@ -261,11 +261,28 @@ async def _resolve_run_id(task_id: str, timeout: float = 15.0) -> Optional[str]:
 @app.get("/chat/stream/{task_id}")
 async def chat_stream(task_id: str):
     """Server-Sent Events stream of agent trace for an async chat task.
-
+    
     Subscribes to the self-hosted Redis pub/sub trace channel, filters events
     by the run_id bound to this task_id, and closes the stream on `run_end`.
     Contract: the existing `/chat/complete` + `/chat` endpoints are unchanged.
     """
+    # 0. Check if the task is already completed (e.g., Semantic Cache HIT)
+    # If completed, we do not need to wait for a run_id or subscribe to pub/sub
+    task_result = AsyncResult(task_id)
+    if task_result.status == "SUCCESS":
+        logger.info(f"⚡ Task {task_id} already completed (Cache HIT). Returning immediate run_end.")
+        async def event_generator_finished():
+            yield {
+                "event": "run_end",
+                "data": json.dumps({
+                    "run_id": "cached",
+                    "node": "__ROOT__",
+                    "event_type": "run_end",
+                    "payload": {"status": "completed", "cached": True}
+                }, ensure_ascii=False, default=str),
+            }
+        return EventSourceResponse(event_generator_finished())
+
     run_id = await _resolve_run_id(task_id)
     if not run_id:
         raise HTTPException(status_code=404, detail=f"No trace run found for task {task_id}")
@@ -319,6 +336,44 @@ async def chat_stream(task_id: str):
                     ignore_subscribe_messages=True, timeout=heartbeat_interval
                 )
                 if message is None:
+                    # Double-check if the Celery task has finished to prevent
+                    # get_message race condition hangs.
+                    from celery.result import AsyncResult
+                    task_result = AsyncResult(task_id)
+                    if task_result.status in ["SUCCESS", "FAILURE", "REVOKED"]:
+                        # Load any last-second events that might have been saved to DB
+                        try:
+                            final_steps = await asyncio.to_thread(load_agent_steps, run_id)
+                            for step in final_steps:
+                                if step.step_index not in seen_indices:
+                                    seen_indices.add(step.step_index)
+                                    yield {
+                                        "event": step.event_type,
+                                        "data": json.dumps({
+                                            "run_id": run_id,
+                                            "node": step.node,
+                                            "step_index": step.step_index,
+                                            "event_type": step.event_type,
+                                            "payload": step.payload,
+                                        }, ensure_ascii=False, default=str),
+                                    }
+                                    if step.event_type == "run_end":
+                                        return
+                        except Exception as e:
+                            logger.warning(f"Final steps loading failed: {e}")
+                        
+                        # Fallback: if run_end was not recorded in DB, send it manually to close the stream
+                        yield {
+                            "event": "run_end",
+                            "data": json.dumps({
+                                "run_id": run_id,
+                                "node": "__root__",
+                                "event_type": "run_end",
+                                "payload": {"status": "completed"}
+                            }, ensure_ascii=False, default=str),
+                        }
+                        return
+
                     # Keep the connection alive between events so clients with
                     # aggressive read timeouts don't drop the stream.
                     yield {"event": "ping", "data": ""}

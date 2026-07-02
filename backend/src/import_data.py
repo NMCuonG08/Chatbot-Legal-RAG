@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from brain import get_embedding
 from config import DEFAULT_COLLECTION_NAME
+from legal_metadata import extract_legal_metadata
 from search import initialize_search_index
 from splitter import split_document
 from utils import setup_logging
@@ -231,17 +232,21 @@ def import_qa_data(
                             
                         vectors_payload = {}
                         for (cid, text_val, chash, doc_id_str, doc_idx, question), vector in zip(to_upsert_global, embeddings):
+                            payload = {
+                                "question": question,
+                                "content": text_val,
+                                "source": "train",
+                                "doc_id": doc_idx,
+                            }
+                            # Enrich with structured law_name/article_number for exact-field
+                            # retrieval. Only recognized keys are added (no null pollution).
+                            payload.update(extract_legal_metadata(f"{question} {text_val}"))
                             vectors_payload[cid] = {
                                 "vector": vector,
-                                "payload": {
-                                    "question": question,
-                                    "content": text_val,
-                                    "source": "train",
-                                    "doc_id": doc_idx,
-                                }
+                                "payload": payload,
                             }
                             save_doc_chunk(doc_id_str, cid, chash, db=db)
-                            
+
                         add_vector(
                             collection_name=collection_name,
                             vectors=vectors_payload,
@@ -350,14 +355,18 @@ def import_qa_data(
                         
                     vectors_payload = {}
                     for (cid, text_val, chash, doc_id_str, doc_idx, question), vector in zip(to_upsert_global, embeddings):
+                        payload = {
+                            "question": question,
+                            "content": text_val,
+                            "source": "train",
+                            "doc_id": doc_idx,
+                        }
+                        # Enrich with structured law_name/article_number for exact-field
+                        # retrieval. Only recognized keys are added (no null pollution).
+                        payload.update(extract_legal_metadata(f"{question} {text_val}"))
                         vectors_payload[cid] = {
                             "vector": vector,
-                            "payload": {
-                                "question": question,
-                                "content": text_val,
-                                "source": "train",
-                                "doc_id": doc_idx,
-                            }
+                            "payload": payload,
                         }
                         save_doc_chunk(doc_id_str, cid, chash, db=db)
                         

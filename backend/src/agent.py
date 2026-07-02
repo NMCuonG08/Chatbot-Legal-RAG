@@ -1,8 +1,14 @@
+"""ReAct agent runtime: LLM, system prompt, per-conversation memory/cache, and
+the ``ai_agent_handle`` Celery task.
+
+Tool wrappers + FunctionTool instances live in ``agent_tool_wrappers.py``; the
+per-run tool-call tracker (``agent_tool_calls``, ``track_tool_call``) lives in
+``agent_tool_tracking.py``. Both are re-exported here so legacy callers that do
+``from agent import ...`` / ``agent.track_tool_call`` keep working.
+"""
+
 import asyncio
-import contextvars
-import functools
 import inspect
-import json
 import logging
 import os
 
@@ -18,285 +24,12 @@ from celery import shared_task
 from llama_index.core.agent import ReActAgent
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.llms import ChatMessage
-from llama_index.core.tools import BaseTool, FunctionTool
-from llama_index.llms.groq import Groq
 
-from legal_tools import (
-    calculate_contract_penalty,
-    calculate_inheritance_share,
-    check_business_name_rules,
-    check_legal_entity_age,
-    get_statute_of_limitations,
-)
-from search import search_engine
-from tavily_tool import tavily_qna, tavily_search_legal
+# Re-export tracking symbols for back-compat (tests/eval import via `agent.*`).
+from agent_tool_tracking import agent_tool_calls, track_tool_call  # noqa: F401
+from agent_tool_wrappers import all_tools  # noqa: F401
 
 logger = logging.getLogger(__name__)
-
-# Stores list of dicts: {"tool_name": str, "args": dict, "status": str, "error": Optional[str], "result": Optional[str]}
-agent_tool_calls = contextvars.ContextVar("agent_tool_calls", default=None)
-
-def track_tool_call(func):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        acc = agent_tool_calls.get()
-        if acc is None:
-            return func(*args, **kwargs)
-        
-        sig = inspect.signature(func)
-        bound = sig.bind_partial(*args, **kwargs)
-        bound.apply_defaults()
-        
-        call_record = {
-            "tool_name": func.__name__,
-            "args": dict(bound.arguments),
-            "status": "success",
-            "error": None,
-            "result": None
-        }
-        acc.append(call_record)
-        
-        try:
-            res = func(*args, **kwargs)
-            call_record["result"] = str(res)[:1000]
-            if isinstance(res, str):
-                try:
-                    parsed = json.loads(res)
-                    if "error" in parsed:
-                        call_record["status"] = "failed"
-                        call_record["error"] = parsed["error"]
-                except Exception:
-                    pass
-            return res
-        except Exception as exc:
-            call_record["status"] = "error"
-            call_record["error"] = f"{type(exc).__name__}: {exc}"
-            raise exc
-    return wrapper
-
-
-# ===== LEGAL CALCULATION TOOLS =====
-
-
-@track_tool_call
-def contract_penalty_calculator(
-    contract_value: float, penalty_rate: float, days_late: int
-) -> str:
-    """
-    Tính tiền phạt vi phạm hợp đồng theo Bộ luật Dân sự Việt Nam.
-
-    Args:
-        contract_value: Giá trị hợp đồng (VNĐ), ví dụ: 100000000 (100 triệu)
-        penalty_rate: Tỷ lệ phạt theo hợp đồng (% mỗi ngày), ví dụ: 0.1 (0.1%/ngày)
-        days_late: Số ngày chậm trễ, ví dụ: 30
-
-    Returns:
-        Kết quả tính toán tiền phạt chi tiết
-    """
-    # Tool Guardrail: Validate value range to prevent negative values or massive integers
-    if contract_value <= 0 or contract_value > 10**12:
-        return json.dumps({"error": "Giá trị hợp đồng không hợp lệ (phải từ 0 đến 1,000 tỷ VNĐ)"}, ensure_ascii=False)
-    if penalty_rate < 0 or penalty_rate > 100:
-        return json.dumps({"error": "Tỷ lệ phạt không hợp lệ (phải từ 0% đến 100%)"}, ensure_ascii=False)
-    if days_late < 0 or days_late > 3650:
-        return json.dumps({"error": "Số ngày chậm trễ không hợp lệ (phải từ 0 đến 3650 ngày - 10 năm)"}, ensure_ascii=False)
-
-    result = calculate_contract_penalty(contract_value, penalty_rate, days_late)
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
-@track_tool_call
-def legal_age_checker(
-    birth_year: int, action_type: str = "sign_contract", gender: str = ""
-) -> str:
-    """
-    Kiểm tra tuổi pháp lý để thực hiện hành vi dân sự.
-
-    Args:
-        birth_year: Năm sinh, ví dụ: 2005
-        action_type: Loại hành vi, có thể là: "sign_contract" (ký hợp đồng), "marriage" (kết hôn), "work" (làm việc), "criminal_responsibility" (chịu trách nhiệm hình sự)
-        gender: Giới tính "male" hoặc "female". BẮT BUỘC khi action_type="marriage" vì nam phải đủ 20 tuổi, nữ phải đủ 18 tuổi (Điều 8 Luật HNGĐ 2014).
-
-    Returns:
-        Thông tin về khả năng pháp lý và căn cứ pháp luật
-    """
-    # Tool Guardrail: Validate parameters
-    current_year = 2026
-    if birth_year < 1900 or birth_year > current_year:
-        return json.dumps({"error": f"Năm sinh không hợp lệ (phải từ 1900 đến {current_year})"}, ensure_ascii=False)
-
-    valid_actions = ["sign_contract", "marriage", "work", "criminal_responsibility"]
-    if action_type not in valid_actions:
-        return json.dumps({"error": f"Loại hành vi không hợp lệ. Các loại hợp lệ: {', '.join(valid_actions)}"}, ensure_ascii=False)
-
-    if action_type == "marriage":
-        gender_norm = (gender or "").strip().lower()
-        if gender_norm not in ("male", "female"):
-            return json.dumps(
-                {"error": "Khi kiểm tra tuổi kết hôn cần gender='male' hoặc gender='female' vì nam đủ 20, nữ đủ 18 tuổi (Điều 8 Luật HNGĐ 2014)."},
-                ensure_ascii=False,
-            )
-
-    result = check_legal_entity_age(birth_year, action_type, gender=gender)
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
-@track_tool_call
-def inheritance_calculator(total_value: float, heirs_json: str) -> str:
-    """
-    Tính phần thừa kế theo pháp luật Việt Nam (hàng thừa kế thứ nhất).
-
-    Args:
-        total_value: Tổng giá trị tài sản thừa kế (VNĐ), ví dụ: 500000000 (500 triệu)
-        heirs_json: Danh sách người thừa kế dạng JSON string, ví dụ: '[{"name":"Nguyễn Văn A","relation":"child","is_minor":false},{"name":"Trần Thị B","relation":"spouse","is_minor":false}]'
-
-    Returns:
-        Phân chia tài sản thừa kế cho từng người
-    """
-    # Tool Guardrail: Validate range
-    if total_value <= 0 or total_value > 10**12:
-        return json.dumps({"error": "Tổng giá trị tài sản không hợp lệ (phải từ 0 đến 1,000 tỷ VNĐ)"}, ensure_ascii=False)
-
-    try:
-        heirs = json.loads(heirs_json)
-        result = calculate_inheritance_share(total_value, heirs)
-        return json.dumps(result, ensure_ascii=False, indent=2)
-    except json.JSONDecodeError:
-        return json.dumps(
-            {"error": "heirs_json không đúng định dạng JSON"}, ensure_ascii=False
-        )
-
-
-@track_tool_call
-def business_name_validator(business_name: str) -> str:
-    """
-    Kiểm tra tên doanh nghiệp có hợp lệ theo Luật Doanh nghiệp Việt Nam.
-
-    Args:
-        business_name: Tên doanh nghiệp cần kiểm tra, ví dụ: "Công ty TNHH ABC"
-
-    Returns:
-        Kết quả kiểm tra tính hợp lệ và các lưu ý
-    """
-    # Tool Guardrail: Validate input length
-    if not business_name or len(business_name.strip()) == 0:
-        return json.dumps({"error": "Tên doanh nghiệp không được để trống"}, ensure_ascii=False)
-    if len(business_name) > 200:
-        return json.dumps({"error": "Tên doanh nghiệp quá dài (tối đa 200 ký tự)"}, ensure_ascii=False)
-
-    result = check_business_name_rules(business_name)
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
-@track_tool_call
-def statute_lookup(case_type: str) -> str:
-    """
-    Tra cứu thời hiệu khởi kiện theo pháp luật Việt Nam.
-
-    Args:
-        case_type: Loại vụ việc, có thể là: "civil" (dân sự), "labor" (lao động), "administrative" (hành chính), "criminal" (hình sự)
-
-    Returns:
-        Thông tin về thời hiệu và căn cứ pháp lý
-    """
-    # Tool Guardrail: Validate type
-    valid_cases = ["civil", "labor", "administrative", "criminal"]
-    if case_type not in valid_cases:
-        return json.dumps({"error": f"Loại vụ việc không hợp lệ. Các loại hợp lệ: {', '.join(valid_cases)}"}, ensure_ascii=False)
-
-    result = get_statute_of_limitations(case_type)
-    return json.dumps(result, ensure_ascii=False, indent=2)
-
-
-# ===== WEB SEARCH TOOLS =====
-
-
-@track_tool_call
-def web_search_tool(query: str, max_results: int = 5) -> str:
-    """
-    Tìm kiếm thông tin pháp luật trên internet sử dụng Google Search.
-    Dùng khi cần tìm tin tức, văn bản pháp luật mới, hoặc thông tin cập nhật.
-
-    Args:
-        query: Từ khóa tìm kiếm, ví dụ: "Luật Đất đai 2024 sửa đổi"
-        max_results: Số kết quả tối đa (mặc định 5)
-
-    Returns:
-        Kết quả tìm kiếm với tiêu đề, link và nội dung tóm tắt
-    """
-    try:
-        return search_engine(query, top_k=max_results)
-    except Exception as e:
-        logger.error(f"Web search error: {e}")
-        return f"Lỗi tìm kiếm: {str(e)}"
-
-
-@track_tool_call
-def tavily_search_tool(query: str, max_results: int = 5) -> str:
-    """
-    Tìm kiếm thông tin pháp luật sử dụng Tavily AI (tìm kiếm thông minh với AI).
-    Tavily cung cấp kết quả tốt hơn và tóm tắt tự động cho câu hỏi pháp lý.
-
-    Args:
-        query: Câu hỏi hoặc từ khóa tìm kiếm, ví dụ: "Quy định mới về BHXH 2024"
-        max_results: Số kết quả tối đa (mặc định 5)
-
-    Returns:
-        Kết quả tìm kiếm với tóm tắt AI và các nguồn liên quan
-    """
-    try:
-        return tavily_search_legal(query, max_results=max_results)
-    except Exception as e:
-        logger.error(f"Tavily search error: {e}")
-        return f"Tavily không khả dụng: {str(e)}"
-
-
-@track_tool_call
-def quick_answer_tool(question: str) -> str:
-    """
-    Trả lời nhanh câu hỏi bằng tìm kiếm web (Tavily Q&A).
-    Dùng cho câu hỏi sự kiện, thống kê, hoặc thông tin cập nhật cần web search.
-
-    Args:
-        question: Câu hỏi cần trả lời, ví dụ: "Mức lương tối thiểu vùng 1 năm 2024"
-
-    Returns:
-        Câu trả lời trực tiếp từ web search
-    """
-    try:
-        return tavily_qna(question)
-    except Exception as e:
-        logger.error(f"Quick answer error: {e}")
-        return f"Không thể trả lời: {str(e)}"
-
-
-# ===== CREATE TOOLS =====
-
-# Legal calculation tools
-contract_penalty_tool = FunctionTool.from_defaults(fn=contract_penalty_calculator)
-legal_age_tool = FunctionTool.from_defaults(fn=legal_age_checker)
-inheritance_tool = FunctionTool.from_defaults(fn=inheritance_calculator)
-business_name_tool = FunctionTool.from_defaults(fn=business_name_validator)
-statute_tool = FunctionTool.from_defaults(fn=statute_lookup)
-
-# Web search tools
-google_search_tool = FunctionTool.from_defaults(fn=web_search_tool)
-tavily_tool = FunctionTool.from_defaults(fn=tavily_search_tool)
-quick_answer_tool_func = FunctionTool.from_defaults(fn=quick_answer_tool)
-
-# All available tools for agent
-all_tools = [
-    # Legal tools
-    contract_penalty_tool,
-    legal_age_tool,
-    inheritance_tool,
-    business_name_tool,
-    statute_tool,
-    # Search tools
-    google_search_tool,
-    tavily_tool,
-    quick_answer_tool_func,
-]
 
 # Initialize the LLM LAZILY based on environment variables. Building at import
 # time required env vars / network at import, which broke test collection and
@@ -346,8 +79,14 @@ def _build_llm():
         return None
 
 
-# Create agent with Vietnamese legal context
-agent_system_prompt = """Bạn là trợ lý AI chuyên về tư vấn pháp luật Việt Nam với khả năng sử dụng các công cụ.
+def _get_agent_system_prompt() -> str:
+    from datetime import datetime
+    now = datetime.now()
+    current_year = now.year
+    current_date = now.strftime("%d/%m/%Y")
+    return f"""Bạn là trợ lý AI chuyên về tư vấn pháp luật Việt Nam với khả năng sử dụng các công cụ.
+Thời gian hệ thống hiện tại: Ngày {current_date} (Năm {current_year}).
+LƯU Ý QUAN TRỌNG VỀ THỜI GIAN: Năm hiện tại là {current_year}. Hãy dùng năm {current_year} để tính toán tuổi hoặc kiểm tra thời hiệu khởi kiện!
 
 NHIỆM VỤ:
 1. Trả lời câu hỏi pháp luật chính xác dựa trên các công cụ có sẵn
@@ -355,20 +94,39 @@ NHIỆM VỤ:
 3. Giải thích rõ ràng kết quả từ công cụ cho người dùng
 
 CÁC CÔNG CỤ KHẢ DỤNG:
-- Tính toán pháp lý: phạt hợp đồng, thừa kế, tuổi pháp lý
-- Kiểm tra: tên doanh nghiệp, thời hiệu khởi kiện
+- Tính toán pháp lý (cơ bản): phạt hợp đồng, thừa kế, tuổi pháp lý
+- Tính toán pháp lý (mở rộng): trợ cấp thôi việc, làm thêm giờ, thuế TNCN,
+  lệ phí trước bạ nhà đất/xe, án phí, cấp dưỡng con, phạt hành chính
+- Tra cứu văn bản luật: tra một điều (article_lookup), tra án lệ (precedent_lookup),
+  tìm dẫn chiếu (cross_reference), xác minh trích dẫn (verify_citation)
+- Tra cứu bảng: thời hiệu khởi kiện, phiên bản luật (law_version), thủ tục pháp lý
+  (procedure_wizard), cơ quan thụ lý (jurisdiction_resolver)
+- Tạo văn bản mẫu: đơn khởi kiện/khiếu nại, hợp đồng mua bán, đơn ly hôn
 - Tìm kiếm web: Google Search và Tavily AI cho thông tin mới
+- Tuân thủ: legal_disclaimer (kiểm tra escalate + disclaimer), tiện ích thời gian
 
 HƯỚNG DẪN SỬ DỤNG CÔNG CỤ:
-- Khi cần tính toán số liệu → dùng công cụ tính toán
-- Khi cần kiểm tra quy định cụ thể → dùng công cụ tra cứu
-- Khi cần thông tin mới/cập nhật → dùng công cụ tìm kiếm web
-- Sau khi có kết quả từ công cụ → giải thích bằng tiếng Việt dễ hiểu
+- Câu hỏi "Điều X Luật Y nói gì?" → article_lookup; nếu cần chính xác cho user, gọi thêm verify_citation.
+- "Trường hợp của tôi bị xử sao / có án lệ nào?" → precedent_lookup.
+- "Điều X dẫn chiếu điều nào?" → cross_reference.
+- Tính tiền/chi phí → công cụ tính toán phù hợp (thôi việc, OT, TNCN, trước bạ, án phí, cấp dưỡng).
+- "Làm thủ tục Z cần gì / nộp ở đâu / mất bao lâu?" → procedure_wizard + jurisdiction_resolver.
+- "Sinh đơn/hợp đồng mẫu" → generate_document_template (luôn kèm cảnh báo mẫu tham khảo).
+- "Luật này còn hiệu lực không / phiên bản nào?" → law_version.
+- Cần thông tin mới/cập nhật → web search (google/tavily).
+- Khi cần xác minh thời gian/năm hiện tại → get_current_time.
+- Sau khi có kết quả → giải thích bằng tiếng Việt dễ hiểu.
 
-LƯU Ý:
-- Luôn trích dẫn căn cứ pháp lý từ kết quả công cụ
-- Nếu công cụ trả về lỗi, giải thích và đề xuất giải pháp khác
-- Trả lời chính xác, chuyên nghiệp, dễ hiểu"""
+LƯU Ý AN TOÀN PHÁP LÝ (BẮT BUỘC):
+- Trước khi trả lời câu hỏi pháp luật, gọi legal_disclaimer để lấy disclaimer gắn cuối câu trả lời.
+- Nếu legal_disclaimer trả escalate=True (topic hình sự/bào chữa): KHÔNG tư vấn chi tiết,
+  chỉ giải thích khái niệm chung + chuyển user đến luật sư / Trung tâm trợ giúp pháp lý.
+- Trước khi khẳng định nội dung một điều luật, gọi verify_citation; nếu verdict != 'consistent',
+  không khẳng định — dùng web_search xác minh hoặc nói rõ chưa chắc chắn.
+- Luôn trích dẫn căn cứ pháp lý từ kết quả công cụ.
+- Nếu công cụ trả về lỗi, giải thích và đề xuất giải pháp khác.
+- Trả lời chính xác, chuyên nghiệp, dễ hiểu."""
+
 
 # Per-conversation agent memory (Phase E). Previously a single global
 # ChatMemoryBuffer was shared across ALL users/conversations — a cross-user
@@ -399,6 +157,8 @@ def _build_react_agent(llm, memory: ChatMemoryBuffer) -> ReActAgent | None:
     if llm is None:
         return None
 
+    prompt = _get_agent_system_prompt()
+
     # Older versions expose from_tools, newer workflow-based versions use constructor.
     if hasattr(ReActAgent, "from_tools"):
         return ReActAgent.from_tools(
@@ -407,7 +167,7 @@ def _build_react_agent(llm, memory: ChatMemoryBuffer) -> ReActAgent | None:
             memory=memory,
             verbose=True,
             max_iterations=10,
-            context=agent_system_prompt,
+            context=prompt,
         )
 
     return ReActAgent(
@@ -416,7 +176,7 @@ def _build_react_agent(llm, memory: ChatMemoryBuffer) -> ReActAgent | None:
         memory=memory,
         verbose=True,
         max_iterations=10,
-        system_prompt=agent_system_prompt,
+        system_prompt=prompt,
     )
 
 
@@ -574,16 +334,40 @@ def get_agent_tools_summary() -> Dict:
     """Get summary of available agent tools"""
     return {
         "total_tools": len(all_tools),
-        "legal_tools": [
+        "legal_calc_tools": [
             "contract_penalty_calculator - Tính phạt hợp đồng",
             "legal_age_checker - Kiểm tra tuổi pháp lý",
             "inheritance_calculator - Tính thừa kế",
             "business_name_validator - Kiểm tra tên DN",
             "statute_lookup - Tra cứu thời hiệu",
+            "severance_pay_tool - Trợ cấp thôi việc (Đ48 BLLĐ 2019)",
+            "overtime_pay_tool - Tiền làm thêm giờ (Đ107 BLLĐ 2019)",
+            "pit_monthly_tool - Thuế TNCN tháng (lũy tiến)",
+            "land_registration_fee_tool - Lệ phí trước bạ nhà đất",
+            "vehicle_registration_fee_tool - Lệ phí trước bạ xe",
+            "court_fee_tool - Án phí dân sự (NQ 326/2016)",
+            "admin_fine_lookup_tool - Phạt vi phạm hành chính",
+            "child_support_tool - Ước lượng cấp dưỡng con (Đ82 HNGĐ)",
+        ],
+        "legal_retrieval_tools": [
+            "article_lookup_tool - Tra một điều luật trong corpus",
+            "precedent_lookup_tool - Tra án lệ theo tình huống",
+            "cross_reference_tool - Tìm dẫn chiếu đến một điều",
+            "verify_citation_tool - Xác minh trích dẫn (anti-hallucination)",
+        ],
+        "legal_knowledge_tools": [
+            "procedure_wizard_tool - Hướng dẫn thủ tục pháp lý",
+            "jurisdiction_resolver_tool - Xác định cơ quan thụ lý",
+            "generate_document_template_tool - Sinh văn bản mẫu",
+            "law_version_tool - Phiên bản/lịch sử hiệu lực luật",
+            "legal_disclaimer_tool - Disclaimer + escalate luật sư",
         ],
         "search_tools": [
             "google_search_tool - Tìm kiếm Google",
             "tavily_search_tool - Tìm kiếm Tavily AI",
             "quick_answer_tool - Trả lời nhanh",
+        ],
+        "utility_tools": [
+            "get_current_time - Thời gian hệ thống",
         ],
     }

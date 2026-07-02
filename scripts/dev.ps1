@@ -51,10 +51,11 @@ switch ($Action) {
         Write-Host "Grafana: http://localhost:3000 (Monitoring)" -ForegroundColor Yellow
         Write-Host "`nSpawning separate windows for logs... Close the terminal windows to shut down individual services." -ForegroundColor Cyan
 
-        # Start Celery, FastAPI, and Streamlit in new PowerShell windows with automatic .venv activation
-        Start-Process powershell -ArgumentList '-NoExit', '-Command', '$Host.UI.RawUI.WindowTitle=''Celery-Worker''; Set-Location backend/src; if (Test-Path "../../.venv") { ..\..\.venv\Scripts\Activate.ps1 }; celery -A tasks.celery_app worker --loglevel=info -P solo'
-        Start-Process powershell -ArgumentList '-NoExit', '-Command', '$Host.UI.RawUI.WindowTitle=''FastAPI-Backend''; Set-Location backend/src; if (Test-Path "../../.venv") { ..\..\.venv\Scripts\Activate.ps1 }; uvicorn app:app --host 0.0.0.0 --port 8002'
-        Start-Process powershell -ArgumentList '-NoExit', '-Command', '$Host.UI.RawUI.WindowTitle=''Streamlit-UI''; Set-Location frontend; if (Test-Path "../.venv") { ..\.venv\Scripts\Activate.ps1 }; streamlit run chat_interface.py --server.port 8501'
+        # Start Celery, FastAPI, and Streamlit in new PowerShell windows using direct virtual environment paths
+        # to bypass PowerShell execution policy restrictions that block Activate.ps1
+        Start-Process powershell -ArgumentList '-NoExit', '-Command', '$Host.UI.RawUI.WindowTitle=''Celery-Worker''; Set-Location backend/src; ..\..\.venv\Scripts\celery -A tasks.celery_app worker --loglevel=info -P solo'
+        Start-Process powershell -ArgumentList '-NoExit', '-Command', '$Host.UI.RawUI.WindowTitle=''FastAPI-Backend''; Set-Location backend/src; ..\..\.venv\Scripts\uvicorn app:app --host 0.0.0.0 --port 8002'
+        Start-Process powershell -ArgumentList '-NoExit', '-Command', '$Host.UI.RawUI.WindowTitle=''Streamlit-UI''; Set-Location frontend; ..\.venv\Scripts\streamlit run chat_interface.py --server.port 8501'
     }
     "stop" {
         Write-Host "Stopping Celery Worker, FastAPI Backend, and Streamlit UI..." -ForegroundColor Red

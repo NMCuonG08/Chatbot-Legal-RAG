@@ -199,9 +199,42 @@ class LegalGuardrailsManager:
             logger.error(f"Error checking output hallucination guardrails: {e}")
             return response_text
 
-    def add_legal_disclaimer(self, text: str) -> str:
-        """Helper to append legal disclaimer."""
-        disclaimer = "\n\n*Lưu ý: Thông tin trên chỉ mang tính chất tham khảo cứu pháp lý và không thay thế cho ý kiến chuyên môn của Luật sư.*"
+    # Topics that require a licensed lawyer — the chatbot must escalate,
+    # not advise. Kept here (not imported from legal_knowledge_tools) to
+    # avoid a circular import: guardrails_manager is imported by tasks.py
+    # which also imports the agent which imports legal_knowledge_tools.
+    _ESCALATION_TOPICS = [
+        "bào chữa", "khởi tố hình sự", "truy tố", "tội danh",
+        "trộm cắp", "giết người", "cố ý gây thương tích",
+        "mua bán ma túy", "chống người thi hành công vụ",
+        "phúc thẩm hình sự", "thi hành án hình sự", "tử hình",
+    ]
+
+    def add_legal_disclaimer(self, text: str, question: Optional[str] = None) -> str:
+        """Append a legal disclaimer; escalate to a lawyer referral when the
+        user's question touches criminal-defense topics.
+
+        Args:
+            text: The assistant response to append the disclaimer to.
+            question: Optional original user question. When it matches an
+                escalation topic, a stronger lawyer-referral disclaimer is
+                used instead of the generic informational one.
+        """
+        q = (question or "").lower()
+        escalated = any(topic in q for topic in self._ESCALATION_TOPICS)
+
+        if escalated:
+            disclaimer = (
+                "\n\n⚠️ *Đây là vấn đề thuộc diện cần Luật sư hành nghề (hình sự/bào chữa). "
+                "Thông tin trên chỉ mang tính tham khảo, không thay thế ý kiến pháp lý chính thức. "
+                "Vui lòng liên hệ Luật sư hoặc Trung tâm trợ giúp pháp lý nhà nước.*"
+            )
+        else:
+            disclaimer = (
+                "\n\n*Lưu ý: Thông tin trên chỉ mang tính chất tham khảo cứu pháp lý "
+                "và không thay thế cho ý kiến chuyên môn của Luật sư.*"
+            )
+
         if disclaimer not in text:
             return text + disclaimer
         return text

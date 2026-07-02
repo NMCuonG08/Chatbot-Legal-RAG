@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover - optional dependency
     RedisSaver = None  # type: ignore
     _REDIS_SAVER_AVAILABLE = False
 
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
 from agent import ai_agent_handle
 from brain import (
@@ -319,11 +319,16 @@ def _retrieve_episodic_context(user_id: str | None, question: str) -> str:
     try:
         logger.info(f"Retrieving episodic memory for user: {user_id}")
         query_vector = get_embedding(question)
+        # Stricter threshold than the default 0.3: episodic context is only
+        # injected when strongly relevant to the new question, so weakly-related
+        # past facts don't nudge the model toward summarizing the user instead
+        # of answering the new question.
         episodes = search_vector(
             collection_name="user_episodes",
             vector=query_vector,
             limit=3,
             filters={"user_id": user_id},
+            score_threshold=0.5,
         )
         if not episodes:
             return ""
@@ -443,21 +448,30 @@ def generate_rag_answer(history, question, user_id=None):
 4. Nếu thông tin không đủ trong tài liệu, hãy nói rõ điều đó
 5. Luôn đưa ra câu trả lời có căn cứ pháp lý
 
-QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung cấp bên dưới."""
+QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung cấp bên dưới.
+LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG bao giờ tóm tắt, nhắc lại hay mô tả lại thông tin lịch sử của người dùng; ngữ cảnh lịch sử (nếu có) chỉ là gợi ý phụ để cá nhân hóa, tuyệt đối không dùng làm nội dung chính của câu trả lời."""
 
     doc_context = gen_doc_prompt(ranked_docs)
 
-    user_context_block = ""
+    # Episodic context moved INTO the system prompt as a clearly-labeled
+    # background hint (not in the user message). Putting it in the user message
+    # caused weak models to mimic it and output a summary OF the user instead
+    # of answering the new question.
+    background_block = ""
     if episodic_context:
-        user_context_block = f"\n\nThông tin lịch sử liên quan đến người dùng trong các cuộc trò chuyện trước đây:\n{episodic_context}\n"
+        background_block = (
+            "\n\n[Ngữ cảnh phụ — sự kiện người dùng từ các cuộc trò chuyện trước, "
+            "chỉ dùng để cá nhân hóa, KHÔNG được tóm tắt hay lặp lại trong câu trả lời]:\n"
+            f"{episodic_context}\n"
+        )
 
     openai_messages = (
-        [{"role": "system", "content": system_prompt}]
+        [{"role": "system", "content": system_prompt + background_block}]
         + history
         + [
             {
                 "role": "user",
-                "content": f"Tài liệu tham khảo:\n{doc_context}{user_context_block}\n\nCâu hỏi: {question}\n\nHãy trả lời dựa trên các tài liệu pháp luật trên.",
+                "content": f"Tài liệu tham khảo:\n{doc_context}\n\nCâu hỏi: {question}\n\nHãy trả lời dựa trên các tài liệu pháp luật trên.",
             }
         ]
     )
@@ -654,25 +668,27 @@ def _build_chat_graph():
 4. Nếu thông tin không đủ trong tài liệu, hãy nói rõ điều đó
 5. Luôn đưa ra câu trả lời có căn cứ pháp lý
 
-QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung cấp bên dưới."""
+QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung cấp bên dưới.
+LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG bao giờ tóm tắt, nhắc lại hay mô tả lại thông tin lịch sử của người dùng; ngữ cảnh lịch sử (nếu có) chỉ là gợi ý phụ để cá nhân hóa, tuyệt đối không dùng làm nội dung chính của câu trả lời."""
 
         doc_context = gen_doc_prompt(ranked_docs)
 
-        user_context_block = ""
+        background_block = ""
         if episodic_context:
-            user_context_block = (
-                f"\n\nThông tin lịch sử liên quan đến người dùng trong các cuộc trò chuyện trước đây:\n"
+            background_block = (
+                "\n\n[Ngữ cảnh phụ — sự kiện người dùng từ các cuộc trò chuyện trước, "
+                "chỉ dùng để cá nhân hóa, KHÔNG được tóm tắt hay lặp lại trong câu trả lời]:\n"
                 f"{episodic_context}\n"
             )
 
         openai_messages = (
-            [{"role": "system", "content": system_prompt}]
+            [{"role": "system", "content": system_prompt + background_block}]
             + history
             + [
                 {
                     "role": "user",
                     "content": (
-                        f"Tài liệu tham khảo:\n{doc_context}{user_context_block}\n\n"
+                        f"Tài liệu tham khảo:\n{doc_context}\n\n"
                         f"Câu hỏi: {question}\n\nHãy trả lời dựa trên các tài liệu pháp luật trên."
                     ),
                 }
@@ -690,7 +706,7 @@ QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung c
                 )
             except Exception as e:
                 logger.error(f"Error running output RAG guardrails: {e}")
-            assistant_answer = guardrails_manager.add_legal_disclaimer(assistant_answer)
+            assistant_answer = guardrails_manager.add_legal_disclaimer(assistant_answer, question)
 
         _trace_node_end(state, "generate", {"doc_count": len(ranked_docs), "answer_len": len(assistant_answer)})
 
@@ -710,7 +726,7 @@ QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung c
             history, question, user_id=user_id, conversation_id=thread_id
         )
         if guardrails_manager.initialized:
-            resp = guardrails_manager.add_legal_disclaimer(resp)
+            resp = guardrails_manager.add_legal_disclaimer(resp, question)
         _trace_node_end(state, "agent_tools", {"answer_len": len(resp), "tool_calls": len(tool_calls)})
 
         # Phase D handoff: agent says it needs legal-doc lookup -> hand off to RAG retrieve.
@@ -732,7 +748,7 @@ QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung c
         question = state.get("standalone_question", state.get("question", ""))
         resp = generate_web_search_answer(history, question)
         if guardrails_manager.initialized:
-            resp = guardrails_manager.add_legal_disclaimer(resp)
+            resp = guardrails_manager.add_legal_disclaimer(resp, question)
         _trace_node_end(state, "web_search", {"answer_len": len(resp)})
 
         # Phase D handoff: web result looks like it needs tool use -> hand off to agent_tools.
@@ -1099,6 +1115,11 @@ def llm_handle_message(self, bot_id, user_id, question):
     # the raw question, not the conversation history, so on a HIT we skip the
     # extra DB read (get_conversation_messages) entirely.
     try:
+        import sys
+        import os
+        _dir = os.path.dirname(os.path.abspath(__file__))
+        if _dir not in sys.path:
+            sys.path.insert(0, _dir)
         from semantic_cache import get_cached_response, set_cached_response
         cached = get_cached_response(question)
         if cached:
@@ -1106,7 +1127,7 @@ def llm_handle_message(self, bot_id, user_id, question):
             update_chat_conversation(bot_id, user_id, cached["response"], False)
             return {"role": "assistant", "content": cached["response"], "sources": cached["sources"]}
     except Exception as cache_err:
-        logger.error(f"Semantic Cache check failed: {cache_err}")
+        logger.exception("Semantic Cache check failed")
 
     # Convert history to list messages (only needed on cache miss)
     messages = get_conversation_messages(conversation_id)
@@ -1137,7 +1158,8 @@ def llm_handle_message(self, bot_id, user_id, question):
         # result is ready. Best-effort: never block the chat on Redis.
         if celery_task_id:
             try:
-                redis_client.setex(f"trace:run:{celery_task_id}", 600, run_id)
+                trace_redis = redis.from_url(settings.trace_redis_url)
+                trace_redis.setex(f"trace:run:{celery_task_id}", 600, run_id)
             except Exception as e:
                 logger.warning(f"trace:run key set failed: {e}")
         try:
@@ -1166,10 +1188,15 @@ def llm_handle_message(self, bot_id, user_id, question):
     # 4. Save to Semantic Cache if not blocked
     if not blocked_response:
         try:
+            import sys
+            import os
+            _dir = os.path.dirname(os.path.abspath(__file__))
+            if _dir not in sys.path:
+                sys.path.insert(0, _dir)
             from semantic_cache import set_cached_response
             set_cached_response(question, response_text, sources)
         except Exception as cache_err:
-            logger.error(f"Semantic Cache save failed: {cache_err}")
+            logger.exception("Semantic Cache save failed")
 
     # Trigger background episodic memory ingestion task asynchronously!
     try:

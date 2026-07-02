@@ -19,12 +19,12 @@ from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
 
 # Load env variables securely
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60.0)
 
 
 def get_client():

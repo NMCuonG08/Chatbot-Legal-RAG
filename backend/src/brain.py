@@ -82,194 +82,212 @@ def _groq_chat_create(model_name: str, messages, temperature: float = 0.7, max_t
     )
 
 
-def vietnamese_llm_chat_complete(messages=(), temperature=0.7, max_tokens=512):
-    """
-    Gọi Vietnamese Legal LLM API hoặc local Ollama cho việc trả lời người dùng
-    """
-    logger.info("Vietnamese LLM chat complete for {}".format(str(messages)[:300]))
-    
-    # Check if we should use local Ollama as main LLM directly
-    use_ollama_main = os.environ.get("USE_OLLAMA_AS_MAIN", "false").lower() == "true"
-    if use_ollama_main:
-        logger.info("USE_OLLAMA_AS_MAIN is True. Routing main generation directly to local Ollama.")
-        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        model_name = os.environ.get("OLLAMA_MODEL", "llama3.1:latest")
+# --------------------------------------------------------------------------- #
+# LLM provider classes
+# --------------------------------------------------------------------------- #
+# Each provider encapsulates ONE backend + its own model knob, so the model in
+# use is always unambiguous. The previous loose-function design read the model
+# from different env vars in different branches — that is how a weak model
+# silently took over generation (OLLAMA_MODEL vs OLLAMA_LLM_MODEL vs LLM_MODEL).
+# A small router (get_main_provider) wires the classes together for dispatch.
+
+class LLMProvider:
+    """Base class for chat-completion providers."""
+    name = "base"
+
+    def __init__(self, model: str):
+        self.model = model
+
+    def is_available(self) -> bool:
+        return True
+
+    def chat(self, messages, temperature: float = 0.7, max_tokens: int = 2048, raw: bool = False):
+        raise NotImplementedError
+
+
+class GroqProvider(LLMProvider):
+    """Groq via the official SDK. Model from LLM_MODEL (default weak only if unset)."""
+    name = "groq"
+
+    def is_available(self) -> bool:
+        return client is not None
+
+    def chat(self, messages, temperature=0.7, max_tokens=2048, raw=False):
+        if not self.is_available():
+            logger.warning("GROQ_API_KEY not set, cannot use Groq provider")
+            return _USER_FACING_ERROR
         try:
-            openai_url = f"{ollama_url.rstrip('/')}/v1"
-            headers = {"Content-Type": "application/json"}
-            payload = {
-                "model": model_name,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens
-            }
-            api_key = os.environ.get("OLLAMA_API_KEY")
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-                
-            response = requests.post(f"{openai_url}/chat/completions", headers=headers, json=payload, timeout=120)
-            if response.status_code == 200:
-                result = response.json()
-                content = result["choices"][0]["message"]["content"]
-                logger.info("Local Ollama response: {}".format(content[:200] + "..."))
-                
-                # Record usage if accumulator is active
-                usage = result.get("usage")
-                acc = usage_accumulator.get()
-                if usage and acc is not None:
-                    acc.append({
-                        "provider": "ollama",
-                        "model": model_name,
-                        "prompt_tokens": usage.get("prompt_tokens", 0),
-                        "completion_tokens": usage.get("completion_tokens", 0)
-                    })
-                return content
-            else:
-                logger.error(f"Local Ollama API error: {response.status_code} - {response.text}")
-                # Fallback to Groq
-                return groq_chat_complete(messages)
+            response = _groq_chat_create(self.model, messages, temperature, max_tokens)
+            usage = getattr(response, "usage", None)
+            if raw:
+                record_usage(self.name, self.model, usage)
+                return response.choices[0].message
+            output = response.choices[0].message
+            logger.info(f"Groq chat complete output: {output.content[:100]}")
+            record_usage(self.name, self.model, usage)
+            return output.content
         except Exception as e:
-            logger.error(f"Error calling local Ollama: {e}")
-            # Fallback to Groq
-            return groq_chat_complete(messages)
+            logger.error(f"Groq API error: {e}")
+            return _USER_FACING_ERROR
 
-    try:
-        # Guard: Vietnamese LLM endpoint must be configured explicitly.
-        # KHÔNG fallback silent ra IP công khai như bản cũ.
-        if not VIETNAMESE_LLM_API_URL:
-            logger.warning(
-                "VIETNAMESE_LLM_API_URL chưa cấu hình. Fallback sang Groq."
-            )
-            return groq_chat_complete(messages)
 
-        # Chuẩn bị payload cho API call
+class OllamaProvider(LLMProvider):
+    """Ollama via its OpenAI-compatible /v1 endpoint. Model from OLLAMA_LLM_MODEL
+    (OLLAMA_MODEL legacy fallback) — never from LLM_MODEL, so the weak groq
+    default can never leak into local generation."""
+    name = "ollama"
+
+    def __init__(self, base_url: str, model: str, api_key: str | None = None, timeout: int = 120):
+        super().__init__(model)
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def chat(self, messages, temperature=0.7, max_tokens=2048, raw=False):
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         payload = {
+            "model": self.model,
             "messages": messages,
             "temperature": temperature,
-            "max_tokens": max_tokens
+            "max_tokens": max_tokens,
         }
+        endpoint = f"{self.base_url}/v1/chat/completions"
+        logger.info(
+            f"Ollama request -> endpoint={endpoint} model={self.model} "
+            f"api_key={'set' if self.api_key else 'MISSING'} messages={len(messages)}"
+        )
+        try:
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                json=payload,
+                timeout=self.timeout,
+            )
+            if response.status_code != 200:
+                logger.error(
+                    f"Ollama API error: {response.status_code} - {response.text} "
+                    f"(model={self.model})"
+                )
+                return _USER_FACING_ERROR
+            result = response.json()
+            content = result["choices"][0]["message"]["content"]
+            logger.info(f"Ollama chat complete output: {content[:100]}")
+            record_usage(self.name, self.model, result.get("usage"))
+            if raw:
+                from types import SimpleNamespace
+                return SimpleNamespace(content=content)
+            return content
+        except Exception as e:
+            logger.error(f"Ollama API error: {e}")
+            return _USER_FACING_ERROR
 
-        # Gọi API
+
+# --------------------------------------------------------------------------- #
+# Provider factory + router
+# --------------------------------------------------------------------------- #
+
+def build_groq_provider(model: str | None = None) -> GroqProvider:
+    return GroqProvider(model or os.environ.get("LLM_MODEL", "llama-3.1-8b-instant"))
+
+
+def build_ollama_provider(model: str | None = None) -> OllamaProvider:
+    base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+    # Cloud Ollama (e.g. http://ollama.com) requires https. An http URL triggers
+    # a 301 redirect that `requests` follows by converting POST->GET, which then
+    # 405s on /v1/chat/completions. Upgrade non-localhost http to https; keep
+    # localhost as http (local Ollama has no TLS).
+    if base.startswith("http://") and "localhost" not in base and "127.0.0.1" not in base:
+        base = "https://" + base[len("http://"):]
+    return OllamaProvider(
+        base,
+        model or os.environ.get("OLLAMA_LLM_MODEL") or os.environ.get("OLLAMA_MODEL") or "llama3.1:latest",
+        os.environ.get("OLLAMA_API_KEY"),
+    )
+
+
+def get_main_provider() -> LLMProvider:
+    """Router: pick the main LLM provider from LLM_PROVIDER (groq|ollama).
+    Default groq. Unknown values (including the legacy 'openai' branch) fall
+    back to groq with a warning — OpenAI is not a class yet."""
+    provider = os.environ.get("LLM_PROVIDER", "groq").lower()
+    if provider == "ollama":
+        return build_ollama_provider()
+    if provider == "groq":
+        return build_groq_provider()
+    logger.warning(f"Unknown LLM_PROVIDER '{provider}', falling back to groq")
+    return build_groq_provider()
+
+
+def vietnamese_llm_chat_complete(messages=(), temperature=0.7, max_tokens=512):
+    """Main user-facing answer path.
+
+    Routing:
+    - USE_OLLAMA_AS_MAIN=true -> Ollama directly (strong local model), with
+      fallback to the routed provider on failure.
+    - else -> custom VIETNAMESE_LLM_API_URL endpoint, fallback to routed provider.
+
+    Model selection is centralized in the provider classes (no env var is read
+    inline here), so the weak-model-by-accident class of bug cannot recur.
+    """
+    logger.info("Vietnamese LLM chat complete for {}".format(str(messages)[:300]))
+
+    if os.environ.get("USE_OLLAMA_AS_MAIN", "false").lower() == "true":
+        logger.info("USE_OLLAMA_AS_MAIN is True. Routing main generation to Ollama.")
+        ollama = build_ollama_provider()
+        content = ollama.chat(messages, temperature=temperature, max_tokens=max_tokens)
+        if content != _USER_FACING_ERROR:
+            return content
+        logger.error("Ollama failed for main generation; falling back to routed provider.")
+        return get_main_provider().chat(messages, temperature=temperature, max_tokens=max_tokens)
+
+    if not VIETNAMESE_LLM_API_URL:
+        logger.warning("VIETNAMESE_LLM_API_URL chưa cấu hình. Fallback sang provider chính.")
+        return get_main_provider().chat(messages, temperature=temperature, max_tokens=max_tokens)
+
+    try:
+        payload = {"messages": messages, "temperature": temperature, "max_tokens": max_tokens}
         response = requests.post(
             VIETNAMESE_LLM_API_URL,
             headers={"Content-Type": "application/json"},
             json=payload,
-            timeout=300  # 5 phút timeout
+            timeout=300,  # 5 phút timeout
         )
-        
         if response.status_code == 200:
             result = response.json()
             content = result["choices"][0]["message"]["content"]
             logger.info("Vietnamese LLM response: {}".format(content[:200] + "..."))
             record_usage("vietnamese_llm", "vietnamese-legal-llm", result.get("usage"))
             return content
-        else:
-            logger.error(f"Vietnamese LLM API error: {response.status_code} - {response.text}")
-            # Fallback to Groq nếu Vietnamese LLM API fail
-            logger.info("Falling back to Groq API")
-            return groq_chat_complete(messages)
-            
+        logger.error(f"Vietnamese LLM API error: {response.status_code} - {response.text}")
+        logger.info("Falling back to routed provider")
+        return get_main_provider().chat(messages, temperature=temperature, max_tokens=max_tokens)
     except Exception as e:
-        logger.error(f"Error calling Vietnamese LLM API: {e}")
-        # Fallback to Groq nếu có lỗi
-        logger.info("Falling back to Groq API due to error")
-        return groq_chat_complete(messages)
+        logger.error(f"Error calling Vietnamese LLM: {e}")
+        logger.info("Falling back to routed provider due to error")
+        return get_main_provider().chat(messages, temperature=temperature, max_tokens=max_tokens)
 
 
 def groq_chat_complete(messages=(), model=None, raw=False):
-    """Generic chat completion routing to Groq, Ollama, or OpenAI based on env variables"""
-    llm_provider = os.environ.get("LLM_PROVIDER", "groq").lower()
-    default_model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
-    model_name = model or default_model
-    
-    logger.info(f"Chat complete using provider: {llm_provider}, model: {model_name}")
-    
-    if llm_provider == "groq":
-        if not GROQ_API_KEY:
-            logger.warning("GROQ_API_KEY not set, returning empty response")
-            return _USER_FACING_ERROR
-        try:
-            response = _groq_chat_create(model_name, messages, temperature=0.7, max_tokens=2048)
-            if raw:
-                record_usage("groq", model_name, getattr(response, "usage", None))
-                return response.choices[0].message
-            output = response.choices[0].message
-            logger.info(f"Chat complete output: {output.content[:100]}")
-            record_usage("groq", model_name, getattr(response, "usage", None))
-            return output.content
-        except Exception as e:
-            logger.error(f"Groq API error: {e}")
-            return _USER_FACING_ERROR
-            
-    elif llm_provider == "ollama":
-        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        try:
-            openai_url = f"{ollama_url.rstrip('/')}/v1"
-            headers = {"Content-Type": "application/json"}
-            payload = {
-                "model": model_name,
-                "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": 2048
-            }
-            api_key = os.environ.get("OLLAMA_API_KEY")
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-                
-            response = requests.post(f"{openai_url}/chat/completions", headers=headers, json=payload, timeout=60)
-            if response.status_code == 200:
-                result = response.json()
-                content = result["choices"][0]["message"]["content"]
-                logger.info(f"Ollama chat complete output: {content[:100]}")
-                record_usage("ollama", model_name, result.get("usage"))
-                if raw:
-                    from types import SimpleNamespace
-                    return SimpleNamespace(content=content)
-                return content
-            else:
-                logger.error(f"Ollama API error: {response.status_code} - {response.text}")
-                return _USER_FACING_ERROR
-        except Exception as e:
-            logger.error(f"Ollama API error: {e}")
-            return _USER_FACING_ERROR
-            
-    elif llm_provider == "openai":
-        openai_key = os.environ.get("OPENAI_API_KEY")
-        openai_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
-        if not openai_key:
-            return _USER_FACING_ERROR
-        try:
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {openai_key}"
-            }
-            payload = {
-                "model": model_name,
-                "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": 2048
-            }
-            response = requests.post(f"{openai_base}/chat/completions", headers=headers, json=payload, timeout=60)
-            if response.status_code == 200:
-                result = response.json()
-                content = result["choices"][0]["message"]["content"]
-                record_usage("openai", model_name, result.get("usage"))
-                if raw:
-                    from types import SimpleNamespace
-                    return SimpleNamespace(content=content)
-                return content
-            else:
-                logger.error(f"OpenAI API error: {response.status_code} - {response.text}")
-                return _USER_FACING_ERROR
-        except Exception as e:
-            logger.error(f"OpenAI API error: {e}")
-            return _USER_FACING_ERROR
-            
+    """Backward-compatible chat completion.
+
+    Routes through the centralized provider router (groq|ollama) so model
+    selection is no longer scattered across branches. Honors an explicit
+    ``model`` override by building a one-off provider for that call only.
+    Kept as the public entrypoint because tasks.py / query_rewriter / eval
+    call it (and the ``openai_chat_complete`` alias) by name.
+    """
+    base = get_main_provider()
+    if model:
+        provider = build_ollama_provider(model) if isinstance(base, OllamaProvider) else build_groq_provider(model)
     else:
-        return _USER_FACING_ERROR
+        provider = base
+    logger.info(f"Chat complete using provider: {provider.name}, model: {provider.model}")
+    return provider.chat(messages, raw=raw)
 
 
-# Keep openai_chat_complete as alias for backward compatibility
+# Alias kept for backward compatibility (tasks.py / query_rewriter import this).
 openai_chat_complete = groq_chat_complete
 
 
@@ -426,14 +444,22 @@ CÁC CÔNG CỤ KHẢ DỤNG:
    - Giải thích khái niệm pháp lý
    Ví dụ: "Thủ tục ly hôn theo Bộ luật Dân sự?", "Quyền của người lao động theo Luật Lao động?"
 
-2. "agent_tools" - Agent với công cụ tính toán và xác thực
+2. "agent_tools" - Agent với công cụ tính toán, tra cứu, xác thực và sinh văn bản
    Sử dụng khi:
-   - Tính toán: phạt hợp đồng, chia thừa kế, lãi suất, chi phí
+   - Tính toán: phạt hợp đồng, chia thừa kế, trợ cấp thôi việc, làm thêm giờ,
+     thuế TNCN, lệ phí trước bạ nhà đất/xe, án phí, cấp dưỡng con
    - Kiểm tra: tuổi pháp lý, tên doanh nghiệp, thời hiệu khởi kiện
-   - Câu hỏi dạng "tính", "kiểm tra", "có hợp lệ không", "có đủ tuổi không"
-   - Cần xử lý số liệu và logic phức tạp
-   - Cần sử dụng nhiều bước suy luận
-   Ví dụ: "Tính tiền phạt hợp đồng 100 triệu chậm 30 ngày với lãi 0.1%/ngày", "Năm sinh 2005 có đủ tuổi ký hợp đồng không?"
+   - Tra cứu văn bản: nội dung một điều luật, án lệ, dẫn chiếu, xác minh trích dẫn
+   - Tra cứu bảng: thời hiệu, phiên bản luật, phạt vi phạm hành chính
+   - Thủ tục & thẩm quyền: hướng dẫn thủ tục (ly hôn, thành lập DN, đăng ký đất,
+     khiếu nại, khởi kiện), xác định tòa/cơ quan thụ lý
+   - Sinh văn bản mẫu: đơn khởi kiện, đơn khiếu nại, hợp đồng mua bán, đơn ly hôn
+   - Câu hỏi dạng "tính", "kiểm tra", "có hợp lệ không", "thủ tục...", "nộp ở đâu",
+     "sinh đơn", "Điều X nói gì", "có án lệ nào"
+   - Cần xử lý số liệu và logic phức tạp, nhiều bước suy luận
+   Ví dụ: "Tính tiền phạt hợp đồng 100 triệu chậm 30 ngày với lãi 0.1%/ngày",
+     "Thủ tục ly hôn cần giấy tờ gì, nộp ở đâu?", "Sinh đơn khởi kiện đòi nợ",
+     "Điều 418 Bộ luật Dân sự nói gì?", "Trợ cấp thôi việc sau 3 năm làm việc"
 
 3. "web_search" - Tìm kiếm web cho thông tin mới
    Sử dụng khi:
