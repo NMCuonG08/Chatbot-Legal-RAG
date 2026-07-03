@@ -11,6 +11,7 @@ import asyncio
 import inspect
 import logging
 import os
+import traceback
 
 try:
     import nest_asyncio
@@ -23,10 +24,11 @@ from typing import Dict, Optional, Tuple, List
 from celery import shared_task
 from llama_index.core.agent import ReActAgent
 from llama_index.core.memory import ChatMemoryBuffer
-from llama_index.core.llms import ChatMessage
+from llama_index.core.llms import ChatMessage, CustomLLM, CompletionResponse, ChatResponse, LLMMetadata, MessageRole
+from llama_index.core.llms.callbacks import llm_chat_callback, llm_completion_callback
 
 # Re-export tracking symbols for back-compat (tests/eval import via `agent.*`).
-from agent_tool_tracking import agent_tool_calls, track_tool_call  # noqa: F401
+from agent_tool_tracking import agent_tool_calls, track_tool_call, agent_user_id  # noqa: F401
 from agent_tool_wrappers import all_tools  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -40,51 +42,133 @@ _llm = None
 logger.info("LlamaIndex Agent LLM will be initialized lazily on first use")
 
 
-def _build_llm():
-    """Build the LlamaIndex LLM from env vars. Returns None if config missing."""
-    llm_provider = os.environ.get("LLM_PROVIDER", "groq").lower()
-    llm_model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
-    logger.info(f"Initializing LlamaIndex Agent LLM - Provider: {llm_provider}, Model: {llm_model}")
+class FallbackLLM(CustomLLM):
+    primary_llm: object
+    fallback_llm: object
 
-    if llm_provider == "groq":
-        from llama_index.llms.groq import Groq
-        groq_api_key = os.environ.get("GROQ_API_KEY")
-        if groq_api_key:
-            return Groq(model=llm_model, api_key=groq_api_key, temperature=0.1)
-        logger.warning("GROQ_API_KEY not set, agent initialization may fail")
-        return None
-    elif llm_provider == "ollama":
-        from llama_index.llms.ollama import Ollama
-        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        api_key = os.environ.get("OLLAMA_API_KEY")
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
-        return Ollama(
-            model=llm_model,
-            base_url=ollama_url,
-            temperature=0.1,
-            request_timeout=60.0,
-            headers=headers
-        )
+    def __init__(self, primary_llm, fallback_llm):
+        super().__init__(primary_llm=primary_llm, fallback_llm=fallback_llm)
+
+    @property
+    def metadata(self) -> LLMMetadata:
+        return self.primary_llm.metadata
+
+    @llm_chat_callback()
+    def chat(self, messages: List[ChatMessage], **kwargs) -> ChatResponse:
+        try:
+            logger.info(f"[FallbackLLM] Attempting chat using primary LLM ({type(self.primary_llm).__name__})...")
+            return self.primary_llm.chat(messages, **kwargs)
+        except Exception as e:
+            logger.warning(f"[FallbackLLM] Primary LLM failed: {e}. Falling back to ({type(self.fallback_llm).__name__})...")
+            return self.fallback_llm.chat(messages, **kwargs)
+
+    @llm_chat_callback()
+    async def achat(self, messages: List[ChatMessage], **kwargs) -> ChatResponse:
+        try:
+            logger.info(f"[FallbackLLM] Attempting async chat using primary LLM ({type(self.primary_llm).__name__})...")
+            return await self.primary_llm.achat(messages, **kwargs)
+        except Exception as e:
+            logger.warning(f"[FallbackLLM] Primary LLM failed: {e}. Falling back to ({type(self.fallback_llm).__name__})...")
+            return await self.fallback_llm.achat(messages, **kwargs)
+
+    @llm_completion_callback()
+    def complete(self, prompt: str, **kwargs) -> CompletionResponse:
+        try:
+            logger.info(f"[FallbackLLM] Attempting complete using primary LLM ({type(self.primary_llm).__name__})...")
+            return self.primary_llm.complete(prompt, **kwargs)
+        except Exception as e:
+            logger.warning(f"[FallbackLLM] Primary LLM failed: {e}. Falling back to ({type(self.fallback_llm).__name__})...")
+            return self.fallback_llm.complete(prompt, **kwargs)
+
+    @llm_completion_callback()
+    async def acomplete(self, prompt: str, **kwargs) -> CompletionResponse:
+        try:
+            logger.info(f"[FallbackLLM] Attempting async complete using primary LLM ({type(self.primary_llm).__name__})...")
+            return await self.primary_llm.acomplete(prompt, **kwargs)
+        except Exception as e:
+            logger.warning(f"[FallbackLLM] Primary LLM failed: {e}. Falling back to ({type(self.fallback_llm).__name__})...")
+            return await self.fallback_llm.acomplete(prompt, **kwargs)
+
+    @llm_chat_callback()
+    def stream_chat(self, messages: List[ChatMessage], **kwargs):
+        """Stream chat via primary LLM, fall back on error.
+
+        Workflow ReActAgent uses streaming (_get_streaming_response), so this
+        MUST be implemented - raising NotImplementedError crashes every agent run.
+        """
+        try:
+            logger.info(f"[FallbackLLM] Streaming chat via primary ({type(self.primary_llm).__name__})...")
+            yield from self.primary_llm.stream_chat(messages, **kwargs)
+        except Exception as e:
+            logger.warning(f"[FallbackLLM] Primary stream failed: {e}. Falling back to ({type(self.fallback_llm).__name__})...")
+            yield from self.fallback_llm.stream_chat(messages, **kwargs)
+
+    @llm_completion_callback()
+    def stream_complete(self, prompt: str, **kwargs):
+        try:
+            logger.info(f"[FallbackLLM] Streaming complete via primary ({type(self.primary_llm).__name__})...")
+            yield from self.primary_llm.stream_complete(prompt, **kwargs)
+        except Exception as e:
+            logger.warning(f"[FallbackLLM] Primary stream failed: {e}. Falling back to ({type(self.fallback_llm).__name__})...")
+            yield from self.fallback_llm.stream_complete(prompt, **kwargs)
+
+
+def _build_llm():
+    """Build the LlamaIndex LLM from env vars. Returns None if config missing.
+    Supports fallback if USE_OLLAMA_AS_MAIN=true.
+    """
+    # 1. Build Groq (as fallback or primary)
+    from llama_index.llms.groq import Groq
+    groq_api_key = os.environ.get("GROQ_API_KEY")
+    groq_model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
+    groq_llm = None
+    if groq_api_key:
+        groq_llm = Groq(model=groq_model, api_key=groq_api_key, temperature=0.1)
+
+    # 2. Build Ollama
+    from llama_index.llms.ollama import Ollama
+    ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+    ollama_key = os.environ.get("OLLAMA_API_KEY")
+    ollama_model = os.environ.get("OLLAMA_LLM_MODEL", "glm-5.2:cloud")
+    headers = {"Authorization": f"Bearer {ollama_key}"} if ollama_key else None
+    ollama_llm = Ollama(
+        model=ollama_model,
+        base_url=ollama_url,
+        temperature=0.1,
+        request_timeout=60.0,
+        headers=headers
+    )
+
+    # Check routing
+    use_ollama_as_main = os.environ.get("USE_OLLAMA_AS_MAIN", "false").lower() == "true"
+    
+    if use_ollama_as_main:
+        if groq_llm:
+            logger.info("Using FallbackLLM: Primary = Ollama, Fallback = Groq")
+            return FallbackLLM(primary_llm=ollama_llm, fallback_llm=groq_llm)
+        else:
+            logger.info("Ollama is main, but Groq is not configured. Using Ollama only.")
+            return ollama_llm
+
+    # Default routing behavior based on LLM_PROVIDER
+    llm_provider = os.environ.get("LLM_PROVIDER", "groq").lower()
+    if llm_provider == "ollama":
+        return ollama_llm
     elif llm_provider == "openai":
         from llama_index.llms.openai import OpenAI
         openai_key = os.environ.get("OPENAI_API_KEY")
         openai_base = os.environ.get("OPENAI_API_BASE")
-        return OpenAI(model=llm_model, api_key=openai_key, api_base=openai_base, temperature=0.1)
+        return OpenAI(model=os.environ.get("LLM_MODEL"), api_key=openai_key, api_base=openai_base, temperature=0.1)
     else:
-        logger.warning(f"Unsupported LLM provider: {llm_provider}. Falling back to Groq.")
-        from llama_index.llms.groq import Groq
-        groq_api_key = os.environ.get("GROQ_API_KEY")
-        if groq_api_key:
-            return Groq(model=llm_model, api_key=groq_api_key, temperature=0.1)
-        return None
+        return groq_llm
 
 
-def _get_agent_system_prompt() -> str:
+def _get_agent_system_prompt(history_summary: str = "") -> str:
     from datetime import datetime
     now = datetime.now()
     current_year = now.year
     current_date = now.strftime("%d/%m/%Y")
-    return f"""Bạn là trợ lý AI chuyên về tư vấn pháp luật Việt Nam với khả năng sử dụng các công cụ.
+    base = f"""Bạn là trợ lý AI chuyên về tư vấn pháp luật Việt Nam với khả năng sử dụng các công cụ.
 Thời gian hệ thống hiện tại: Ngày {current_date} (Năm {current_year}).
 LƯU Ý QUAN TRỌNG VỀ THỜI GIAN: Năm hiện tại là {current_year}. Hãy dùng năm {current_year} để tính toán tuổi hoặc kiểm tra thời hiệu khởi kiện!
 
@@ -103,6 +187,7 @@ CÁC CÔNG CỤ KHẢ DỤNG:
   (procedure_wizard), cơ quan thụ lý (jurisdiction_resolver)
 - Tạo văn bản mẫu: đơn khởi kiện/khiếu nại, hợp đồng mua bán, đơn ly hôn
 - Tìm kiếm web: Google Search và Tavily AI cho thông tin mới
+- Nhớ lại fact cũ: recall_user_memory (năm sinh, giới tính, tình huống đã trao đổi) - chỉ gọi khi câu hỏi tham chiếu ngữ cảnh cũ
 - Tuân thủ: legal_disclaimer (kiểm tra escalate + disclaimer), tiện ích thời gian
 
 HƯỚNG DẪN SỬ DỤNG CÔNG CỤ:
@@ -122,14 +207,30 @@ LƯU Ý AN TOÀN PHÁP LÝ (BẮT BUỘC):
 - Nếu legal_disclaimer trả escalate=True (topic hình sự/bào chữa): KHÔNG tư vấn chi tiết,
   chỉ giải thích khái niệm chung + chuyển user đến luật sư / Trung tâm trợ giúp pháp lý.
 - Trước khi khẳng định nội dung một điều luật, gọi verify_citation; nếu verdict != 'consistent',
-  không khẳng định — dùng web_search xác minh hoặc nói rõ chưa chắc chắn.
+  không khẳng định - dùng web_search xác minh hoặc nói rõ chưa chắc chắn.
 - Luôn trích dẫn căn cứ pháp lý từ kết quả công cụ.
 - Nếu công cụ trả về lỗi, giải thích và đề xuất giải pháp khác.
-- Trả lời chính xác, chuyên nghiệp, dễ hiểu."""
+- Trả lời chính xác, chuyên nghiệp, dễ hiểu.
+
+GROUNDING MẠNH (BẮT BUỘC):
+- Câu hỏi mới nhất của người dùng (ở dưới, là user_msg) LUÔN là chủ đề chính. Trả lời TRỰC TIẾP nó.
+- Mọi thông tin khác (tóm tắt ngữ cảnh dưới đây, kết quả công cụ) chỉ là PHỤ, dùng để bổ sung факт nền.
+- KHÔNG để ngữ cảnh cũ đổi chủ đề câu trả lời. Nếu câu hỏi hiện tại hỏi chủ đề mới, trả lời chủ đề mới.
+- Chỉ dùng ngữ cảnh cũ khi câu hỏi hiện tại explicitly tham chiếu ("việc đó", "như đã nói", "câu trước").
+"""
+
+    if history_summary:
+        base += (
+            "\nNGỮ CẢNH HỘI THOẠI TRƯỚC (CHỈ THAM KHẢO - KHÔNG PHẢI CÂU HỎI HIỆN TẠI):\n"
+            f"{history_summary}\n"
+            "\nDùng ngữ cảnh trên chỉ để bổ sung факт nền (năm sinh, giới tính, tình huống). "
+            "Câu hỏi chính là câu mới nhất của người dùng - trả lời trực tiếp câu đó."
+        )
+    return base
 
 
 # Per-conversation agent memory (Phase E). Previously a single global
-# ChatMemoryBuffer was shared across ALL users/conversations — a cross-user
+# ChatMemoryBuffer was shared across ALL users/conversations - a cross-user
 # data leak. Now keyed by (user_id, conversation_id) with an LRU cap.
 _agent_memories: "OrderedDict[Tuple[Optional[str], Optional[str]], ChatMemoryBuffer]" = OrderedDict()
 _AGENT_MEMORY_CAP = 32
@@ -152,17 +253,299 @@ def get_agent_memory(user_id: Optional[str], conversation_id: Optional[str]) -> 
     return mem
 
 
-def _build_react_agent(llm, memory: ChatMemoryBuffer) -> ReActAgent | None:
+def clear_user_runtime_caches(user_id: Optional[str], conversation_id: Optional[str] = None) -> int:
+    """Drop in-process memory entries for a user (and optional conversation).
+
+    Clears the rolling-summary cache and the ChatMemoryBuffer for the given
+    (user_id, conversation_id) — or ALL conversations for that user when
+    ``conversation_id`` is None. Returns the number of cache entries removed.
+
+    Note: only affects the process it runs in. With a separate Celery worker,
+    the worker's own copies are NOT cleared from the web process call site;
+    call this from the worker too (or restart it) for a full purge.
+    """
+    removed = 0
+    for store in (_agent_memories, _conv_summaries, _conv_summarized_counts):
+        keys_to_drop = [
+            (u, c) for (u, c) in list(store.keys())
+            if u == user_id and (conversation_id is None or c == conversation_id)
+        ]
+        for k in keys_to_drop:
+            store.pop(k, None)
+            removed += 1
+    logger.info(
+        f"[AGENT] Cleared runtime caches for user={user_id} "
+        f"conv={conversation_id} entries_removed={removed}"
+    )
+    return removed
+
+
+# Per-conversation rolling summary of chat history. Injected into the agent
+# system prompt as grounding context so the agent stays focused on the CURRENT
+# question while still knowing prior facts (birth year, gender, situation).
+# Keyed by (user_id, conversation_id) with LRU cap, mirroring _agent_memories.
+_conv_summaries: "OrderedDict[Tuple[Optional[str], Optional[str]], str]" = OrderedDict()
+_conv_summarized_counts: "OrderedDict[Tuple[Optional[str], Optional[str]], int]" = OrderedDict()
+_CONV_SUMMARY_CAP = 32
+
+# Memory strategy constants (senior-grade hybrid: short-term raw + rolling
+# structured summary + long-term RAG recall via recall_user_memory_tool).
+_SHORT_TERM_RAW_TURNS = 2   # last N prior turns passed verbatim as chat_history
+_RESUMMARY_INTERVAL = 10    # full re-summarize from raw every N turns to fix drift
+_MSG_CHAR_CAP = 4000        # hard per-message char cap to bound token budget
+
+
+def _truncate_raw(text: str, limit: int = 600) -> str:
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _history_to_chat_messages(history: Optional[List[Dict]]) -> List[ChatMessage]:
+    """Convert DB history (list of {role, content} dicts) to ChatMessage list.
+
+    Skips system messages (the agent has its own system prompt). Hard-truncates
+    each message content to ``_MSG_CHAR_CAP`` to bound token budget.
+    """
+    if not history:
+        return []
+    msgs: List[ChatMessage] = []
+    for d in history:
+        if not isinstance(d, dict):
+            continue
+        role_str = str(d.get("role", "user")).lower()
+        if role_str == "system":
+            continue  # system msg is agent's own system prompt, not conversation history
+        if role_str == "assistant":
+            role = MessageRole.ASSISTANT
+        else:
+            role = MessageRole.USER
+        content = str(d.get("content", ""))
+        if len(content) > _MSG_CHAR_CAP:
+            content = content[:_MSG_CHAR_CAP] + "..."
+        msgs.append(ChatMessage(role=role, content=content))
+    return msgs
+
+
+def _summarize_chat_history(
+    history: Optional[List[Dict]],
+    user_id: Optional[str],
+    conversation_id: Optional[str],
+) -> Tuple[str, List[ChatMessage]]:
+    """Build grounding context from PRIOR conversation turns (hybrid memory).
+
+    Takes ``history`` = list of ``{role, content}`` dicts from the DB (source of
+    truth). The in-process ChatMemoryBuffer is NOT used for read — it was never
+    populated (generate_agent_answer passed history but the old code ignored it),
+    so relying on it made short-term/summary dead silent.
+
+    Returns ``(rolling_summary, short_term_raw)``:
+
+    - ``short_term_raw``: last ``_SHORT_TERM_RAW_TURNS`` prior turns verbatim.
+      Passed as ``chat_history`` so the agent keeps reference-resolution ability
+      ("việc đó", "như đã nói") for the immediately preceding turns.
+    - ``rolling_summary``: structured LLM summary (FACTS + TOPICS) of OLDER turns
+      beyond the raw window. Threshold-triggered (only when older turns exist),
+      incremental, with periodic full re-summary every ``_RESUMMARY_INTERVAL``
+      turns to fix accumulated drift. Injected into the system prompt as
+      grounding context only.
+
+    First turn (no prior history) -> ``("", [])`` (no LLM call).
+    """
+    key = (user_id, conversation_id)
+    # history is PRIOR turns only (current question is passed separately as
+    # user_msg and not yet in DB), so no trailing-drop needed.
+    prior_msgs = _history_to_chat_messages(history)
+    if not prior_msgs:
+        return "", []
+
+    short_term_raw = prior_msgs[-_SHORT_TERM_RAW_TURNS:]
+    old_turns = prior_msgs[:-_SHORT_TERM_RAW_TURNS]
+
+    # No older turns beyond the raw window -> nothing to summarize.
+    if not old_turns:
+        return "", short_term_raw
+
+    already = _conv_summarized_counts.get(key, 0)
+    # Periodic full re-summary from raw to correct incremental drift.
+    full_resummary = len(prior_msgs) % _RESUMMARY_INTERVAL == 0
+    needs_update = full_resummary or len(old_turns) > already
+
+    if not needs_update:
+        return _conv_summaries.get(key, ""), short_term_raw
+
+    prev_summary = _conv_summaries.get(key, "")
+    if full_resummary:
+        # Re-summarize ALL older turns from raw (drift correction).
+        new_turn_text = "\n".join(
+            f"{getattr(m.role, 'value', m.role)}: {m.content}" for m in old_turns
+        )
+        base_summary = "(chưa có)"
+        logger.info(f"[AGENT] Full re-summary from {len(old_turns)} old turns (drift fix)")
+    else:
+        new_msgs = old_turns[already:]
+        new_turn_text = "\n".join(
+            f"{getattr(m.role, 'value', m.role)}: {m.content}" for m in new_msgs
+        )
+        base_summary = prev_summary or "(chưa có)"
+
+    global _llm
+    if _llm is None:
+        _llm = _build_llm()
+    if _llm is None:
+        return prev_summary or _truncate_raw(new_turn_text), short_term_raw
+
+    prompt = (
+        "Bạn là bộ tóm tắt hội thoại pháp lý. Tóm tắt CẤU TRÚC, NGẮN (<200 từ) các lượt hội thoại.\n"
+        "Format BẮT BUỘC:\n"
+        "FACTS:\n"
+        "- <fact nền của user dạng key-value: năm sinh, giới tính, nghề, tình huống pháp lý — không lan man>\n"
+        "TOPICS:\n"
+        "- <chủ đề đã hỏi + kết luận ngắn 1 dòng>\n\n"
+        "Quy tắc:\n"
+        "- Dedup: không lặp fact đã có trong tóm tắt trước.\n"
+        "- Bỏ câu trả lời dài, chỉ giữ kết luận chính.\n"
+        "- Giữ nguyên giá trị sự thật (năm, số tiền, tên luật, số điều).\n\n"
+        f"Tóm tắt trước đó:\n{base_summary}\n\n"
+        f"Các lượt hội thoại cần tóm tắt:\n{new_turn_text}\n\n"
+        "Tóm tắt cập nhật (FACTS + TOPICS):"
+    )
+    try:
+        resp = _llm.complete(prompt)
+        summary = str(getattr(resp, "text", resp) or "").strip()
+        if summary:
+            _conv_summaries[key] = summary
+            _conv_summaries.move_to_end(key)
+            _conv_summarized_counts[key] = len(old_turns)
+            _conv_summarized_counts.move_to_end(key)
+            if len(_conv_summaries) > _CONV_SUMMARY_CAP:
+                ev_k, _ = _conv_summaries.popitem(last=False)
+                _conv_summarized_counts.pop(ev_k, None)
+        return summary or prev_summary, short_term_raw
+    except Exception as e:
+        logger.warning(f"[AGENT] History summary failed: {e}")
+        return prev_summary or _truncate_raw(new_turn_text), short_term_raw
+
+
+def filter_tools_for_query(query: str, history: Optional[List[Dict]] = None) -> list:
+    """Select a subset of tools relevant to the user's query to minimize prompt tokens."""
+    query_lower = query.lower()
+
+    # Accumulate query and last conversation turns to find relevant keywords
+    scan_text = query_lower
+    has_prior_history = False
+    if history:
+        try:
+            history_msgs = _history_to_chat_messages(history)
+            has_prior_history = len(history_msgs) > 1
+            if history_msgs:
+                # Scan last 2 messages for keyword context
+                for msg in history_msgs[-2:]:
+                    scan_text += " " + str(msg.content).lower()
+        except Exception as e:
+            logger.warning(f"Failed to load history for tool filtering: {e}")
+
+    selected = []
+    
+    # 1. Legal calculation tools
+    if any(kw in scan_text for kw in ["phạt", "chậm trễ", "vi phạm hợp đồng"]):
+        selected.append("contract_penalty_tool")
+    if any(kw in scan_text for kw in ["tuổi", "sinh năm", "năm sinh", "kết hôn", "lao động", "hình sự"]):
+        selected.append("legal_age_tool")
+    if any(kw in scan_text for kw in ["thừa kế", "di sản", "chia"]):
+        selected.append("inheritance_tool")
+    if any(kw in scan_text for kw in ["doanh nghiệp", "tên", "đặt tên"]):
+        selected.append("business_name_tool")
+    if any(kw in scan_text for kw in ["thời hiệu", "khởi kiện", "khiếu nại"]):
+        selected.append("statute_tool")
+        
+    # 2. Knowledge / data-driven legal tools
+    if any(kw in scan_text for kw in ["thôi việc", "sa thải", "trợ cấp"]):
+        selected.append("severance_pay_func_tool")
+    if any(kw in scan_text for kw in ["làm thêm", "tăng ca", "ot", "giờ"]):
+        selected.append("overtime_pay_func_tool")
+    if any(kw in scan_text for kw in ["thuế", "tncn", "thu nhập"]):
+        selected.append("pit_monthly_func_tool")
+    if any(kw in scan_text for kw in ["trước bạ", "đất đai", "nhà đất", "lệ phí"]):
+        selected.append("land_registration_fee_func_tool")
+        selected.append("vehicle_registration_fee_func_tool")
+    if any(kw in scan_text for kw in ["án phí", "tòa án", "lệ phí tòa"]):
+        selected.append("court_fee_func_tool")
+    if any(kw in scan_text for kw in ["phạt hành chính", "vi phạm", "giao thông"]):
+        selected.append("admin_fine_lookup_func_tool")
+    if any(kw in scan_text for kw in ["cấp dưỡng", "nuôi con", "ly hôn"]):
+        selected.append("child_support_func_tool")
+    if any(kw in scan_text for kw in ["thủ tục", "quy trình", "bước"]):
+        selected.append("procedure_wizard_func_tool")
+    if any(kw in scan_text for kw in ["thẩm quyền", "tòa án nào", "thụ lý"]):
+        selected.append("jurisdiction_resolver_func_tool")
+    if any(kw in scan_text for kw in ["mẫu đơn", "văn bản mẫu", "hợp đồng mẫu"]):
+        selected.append("generate_document_template_func_tool")
+    if any(kw in scan_text for kw in ["hiệu lực", "phiên bản", "sửa đổi", "bổ sung"]):
+        selected.append("law_version_func_tool")
+        
+    # 3. Retrieval-backed legal tools (always useful for general legal questions)
+    if any(kw in scan_text for kw in ["điều", "khoản", "luật", "án lệ", "trích dẫn"]):
+        selected.append("article_lookup_func_tool")
+        selected.append("precedent_lookup_func_tool")
+        selected.append("cross_reference_func_tool")
+        selected.append("verify_citation_func_tool")
+        
+    # Always include safety disclaimer (crucial for legal agent)
+    selected.append("legal_disclaimer_func_tool")
+
+    # 4. Search and Utility tools
+    selected.append("tavily_tool")
+    selected.append("current_time_tool")
+
+    # 5. Long-term memory recall — include when the query references prior
+    # context OR there is conversation history. Agent decides whether to call.
+    recall_keywords = ["việc đó", "như đã nói", "câu trước", "trước đó", "lúc nãy",
+                       "còn nhớ", "anh/chị còn nhớ", "vừa rồi", "nhắc lại", "lúc trước"]
+    if has_prior_history or any(kw in scan_text for kw in recall_keywords):
+        selected.append("recall_user_memory_func_tool")
+
+    # Import dynamically to avoid circular imports
+    import agent_tool_wrappers
+
+    tools_list = []
+    for name in selected:
+        tool_obj = getattr(agent_tool_wrappers, name, None)
+        if tool_obj:
+            tools_list.append(tool_obj)
+
+    # Fallback: if no specific tools matched, return a sensible default set
+    if not tools_list or len(tools_list) <= 3:
+        fallback = [
+            getattr(agent_tool_wrappers, "contract_penalty_tool"),
+            getattr(agent_tool_wrappers, "legal_age_tool"),
+            getattr(agent_tool_wrappers, "inheritance_tool"),
+            getattr(agent_tool_wrappers, "legal_disclaimer_func_tool"),
+            getattr(agent_tool_wrappers, "tavily_tool"),
+            getattr(agent_tool_wrappers, "current_time_tool"),
+        ]
+        if has_prior_history:
+            fallback.append(getattr(agent_tool_wrappers, "recall_user_memory_func_tool"))
+        return fallback
+
+    logger.info(f"[AGENT] Dynamically selected {len(tools_list)} tools for prompt reduction (out of 28)")
+    return tools_list
+
+
+def _build_react_agent(
+    llm,
+    memory: ChatMemoryBuffer,
+    tools: list,
+    history_summary: str = "",
+) -> ReActAgent | None:
     """Build ReAct agent with compatibility across llama-index versions."""
     if llm is None:
         return None
 
-    prompt = _get_agent_system_prompt()
+    prompt = _get_agent_system_prompt(history_summary=history_summary)
 
     # Older versions expose from_tools, newer workflow-based versions use constructor.
     if hasattr(ReActAgent, "from_tools"):
         return ReActAgent.from_tools(
-            all_tools,
+            tools,
             llm=llm,
             memory=memory,
             verbose=True,
@@ -170,50 +553,16 @@ def _build_react_agent(llm, memory: ChatMemoryBuffer) -> ReActAgent | None:
             context=prompt,
         )
 
+    # Newer workflow-based ReActAgent (llama_index >=0.12): __init__ does NOT
+    # accept `memory` or `max_iterations`. Memory/chat_history must be passed
+    # to run()/arun() at call time. Passing them here silently lands in
+    # **kwargs and the agent runs with no memory -> empty exception.
     return ReActAgent(
-        tools=all_tools,
+        tools=tools,
         llm=llm,
-        memory=memory,
-        verbose=True,
-        max_iterations=10,
         system_prompt=prompt,
+        verbose=True,
     )
-
-
-# Per-(user, conversation) agent cache so each conversation gets its own memory.
-# A single global agent would force a single shared memory again.
-_ai_agent_cache: "OrderedDict[Tuple[Optional[str], Optional[str]], ReActAgent]" = OrderedDict()
-_AI_AGENT_CACHE_CAP = 32
-
-
-def _get_ai_agent(user_id: Optional[str] = None, conversation_id: Optional[str] = None):
-    """Lazily build and cache a per-(user, conversation) ReAct agent.
-
-    Building is deferred until the first ``ai_agent_handle`` call so that
-    importing this module (e.g. for ``agent_tool_calls`` in eval) does not
-    require LLM env vars or network access. Defaults ``(None, None)`` keep
-    legacy callers working (a shared default-memory agent).
-    """
-    global _llm
-    key = (user_id, conversation_id)
-    cached = _ai_agent_cache.get(key)
-    if cached is not None:
-        _ai_agent_cache.move_to_end(key)
-        return cached
-
-    if _llm is None:
-        _llm = _build_llm()
-    memory = get_agent_memory(user_id, conversation_id)
-    agent = _build_react_agent(_llm, memory)
-    if agent is None:
-        return None
-    _ai_agent_cache[key] = agent
-    _ai_agent_cache.move_to_end(key)
-    if len(_ai_agent_cache) > _AI_AGENT_CACHE_CAP:
-        evicted_key, _ = _ai_agent_cache.popitem(last=False)
-        logger.info(f"[AGENT] Evicted oldest agent for key={evicted_key}")
-    logger.info(f"Agent initialized with {len(all_tools)} tools for key={key}")
-    return agent
 
 
 @shared_task()
@@ -221,6 +570,7 @@ def ai_agent_handle(
     question: str,
     user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
+    history: Optional[List[Dict]] = None,
 ) -> Tuple[str, List[Dict]]:
     """
     Handle user question using ReAct agent with tools.
@@ -229,6 +579,9 @@ def ai_agent_handle(
         question: User's question
         user_id: Optional user id for per-conversation memory isolation.
         conversation_id: Optional conversation id for per-conversation memory.
+        history: Prior conversation turns as list of ``{role, content}`` dicts
+            from the DB (source of truth). Used to build short-term raw context
+            + rolling summary. The current question is NOT in history.
 
     Returns:
         ``(response_text, tool_calls)`` where tool_calls is a list of
@@ -238,12 +591,43 @@ def ai_agent_handle(
     # Reset the tool-call accumulator for this run so @track_tool_call records
     # only this turn's calls. contextvars propagate into asyncio.run coroutines.
     token = agent_tool_calls.set([])
+    user_token = agent_user_id.set(user_id)
     try:
-        ai_agent = _get_ai_agent(user_id, conversation_id)
-        if ai_agent is None:
+        global _llm
+        if _llm is None:
+            _llm = _build_llm()
+        if _llm is None:
             return (
                 "Xin lỗi, hệ thống AI agent chưa sẵn sàng do thiếu cấu hình GROQ_API_KEY. "
                 "Vui lòng kiểm tra biến môi trường và thử lại.",
+                [],
+            )
+
+        # memory is kept only for the legacy from_tools branch of _build_react_agent.
+        # The workflow ReActAgent does not use it; history (DB-sourced) drives
+        # short-term raw + rolling summary instead.
+        memory = get_agent_memory(user_id, conversation_id)
+
+        # Hybrid memory: short-term raw (last turns verbatim) + rolling structured
+        # summary of older turns (grounding only). The current question is the
+        # main user_msg; short_term_raw keeps reference-resolution for the
+        # immediately preceding turns; older context is condensed in the summary.
+        history_summary, short_term_raw = _summarize_chat_history(history, user_id, conversation_id)
+        if history_summary:
+            logger.info(
+                f"[AGENT] Grounding summary injected ({len(history_summary)} chars); "
+                f"short-term raw turns={len(short_term_raw)}"
+            )
+        elif short_term_raw:
+            logger.info(f"[AGENT] Short-term raw turns={len(short_term_raw)} (no summary needed yet)")
+
+        # Select tools dynamically based on current query and conversation history
+        tools = filter_tools_for_query(question, history)
+
+        ai_agent = _build_react_agent(_llm, memory, tools, history_summary=history_summary)
+        if ai_agent is None:
+            return (
+                "Xin lỗi, lỗi khi khởi tạo hệ thống AI Agent.",
                 [],
             )
 
@@ -251,14 +635,27 @@ def ai_agent_handle(
 
         # Robust execution wrapper to handle different LlamaIndex versions and event loops
         async def _safe_execute_agent():
+            # chat_history = short_term_raw (last turns verbatim) for reference
+            # resolution. Older context is condensed in the system prompt summary.
+            # The current question is the main user_msg -> agent stays focused.
+            run_kwargs = {
+                "user_msg": question,
+                "chat_history": short_term_raw,
+                "max_iterations": 10,
+            }
+
             # Try async methods first (modern llama-index)
             # Newer ReActAgent (Workflow) uses run/arun which often returns a WorkflowHandler
             if hasattr(ai_agent, "arun"):
-                # Try with 'input' keyword (modern Workflow) or positional
+                # Workflow arun accepts user_msg + chat_history kwargs.
                 try:
-                    result = await ai_agent.arun(input=question)
+                    result = await ai_agent.arun(**run_kwargs)
                 except Exception:
-                    result = await ai_agent.arun(question)
+                    # Fallback: positional call (user_msg, chat_history)
+                    try:
+                        result = await ai_agent.arun(question, chat_history)
+                    except Exception:
+                        result = await ai_agent.arun(question)
 
                 # If result is a WorkflowHandler, we need to await it to get the actual response
                 if inspect.isawaitable(result) or hasattr(result, "__await__"):
@@ -270,7 +667,13 @@ def ai_agent_handle(
 
             # Sync fallbacks
             if hasattr(ai_agent, "run"):
-                result = ai_agent.run(question)
+                try:
+                    result = ai_agent.run(**run_kwargs)
+                except Exception:
+                    try:
+                        result = ai_agent.run(question, chat_history)
+                    except Exception:
+                        result = ai_agent.run(question)
                 if inspect.isawaitable(result) or hasattr(result, "__await__"):
                     result = await result
                 return result
@@ -324,10 +727,14 @@ def ai_agent_handle(
         logger.info(f"[AGENT] Captured {len(tool_calls)} tool calls")
         return res_text, tool_calls
     except Exception as e:
-        logger.error(f"[AGENT] Error: {e}")
-        return f"Xin lỗi, đã xảy ra lỗi khi xử lý câu hỏi: {str(e)}", []
+        logger.error(
+            f"[AGENT] Error: type={type(e).__name__} msg={e!r} "
+            f"traceback={traceback.format_exc()}"
+        )
+        return f"Xin lỗi, đã xảy ra lỗi khi xử lý câu hỏi ({type(e).__name__}).", []
     finally:
         agent_tool_calls.reset(token)
+        agent_user_id.reset(user_token)
 
 
 def get_agent_tools_summary() -> Dict:

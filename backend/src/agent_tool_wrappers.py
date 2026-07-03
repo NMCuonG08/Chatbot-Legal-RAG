@@ -607,6 +607,60 @@ quick_answer_tool_func = FunctionTool.from_defaults(fn=quick_answer_tool)
 # Utility tools
 current_time_tool = FunctionTool.from_defaults(fn=get_current_time)
 
+
+@track_tool_call
+def recall_user_memory_tool(query: str, limit: int = 3) -> str:
+    """Tra cứu lại các thông tin/fact pháp lý đã trao đổi với người dùng trong quá khứ
+    (lưu trong bộ nhớ dài hạn user_episodes). Dùng KHI câu hỏi hiện tại tham chiếu đến
+    ngữ cảnh cũ (ví dụ: "việc đó", "như đã nói", "câu trước", "anh/chị còn nhớ không")
+    hoặc khi cần факт nền đã cung cấp trước đây (năm sinh, giới tính, tình huống pháp lý).
+
+    Args:
+        query: Cụm từ/câu mô tả thông tin cần nhớ lại (tiếng Việt, tự nhiên).
+        limit: Số lượng fact tối đa trả về (mặc định 3).
+
+    Returns:
+        JSON chứa danh sách fact liên quan, hoặc thông báo chưa có/không tìm thấy.
+    """
+    from agent_tool_tracking import agent_user_id
+    user_id = agent_user_id.get()
+    if not user_id:
+        return json.dumps(
+            {"status": "no_user", "facts": [], "note": "Chưa định danh người dùng, không có bộ nhớ dài hạn."},
+            ensure_ascii=False,
+        )
+    try:
+        # Lazy import to avoid circular deps (tasks.py <-> agent.py <-> wrappers).
+        from vectorize import search_vector
+        from brain import get_embedding
+        query_vector = get_embedding(query)
+        episodes = search_vector(
+            collection_name="user_episodes",
+            vector=query_vector,
+            limit=limit,
+            filters={"user_id": user_id},
+            score_threshold=0.5,
+        )
+        if not episodes:
+            return json.dumps(
+                {"status": "no_match", "facts": [], "note": "Không tìm thấy fact cũ liên quan."},
+                ensure_ascii=False,
+            )
+        facts = []
+        for ep in episodes:
+            text = ep.get("content") or ep.get("summary") or ""
+            if text:
+                facts.append({"fact": text, "score": ep.get("score")})
+        return json.dumps(
+            {"status": "ok", "facts": facts, "note": "Fact cũ liên quan — dùng làm ngữ cảnh phụ, vẫn trả lời câu hỏi hiện tại."},
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        return json.dumps({"status": "error", "facts": [], "error": str(e)}, ensure_ascii=False)
+
+
+recall_user_memory_func_tool = FunctionTool.from_defaults(fn=recall_user_memory_tool)
+
 # All available tools for agent
 all_tools = [
     # Legal calc tools
@@ -640,4 +694,6 @@ all_tools = [
     quick_answer_tool_func,
     # Utility tools
     current_time_tool,
+    # Long-term memory recall
+    recall_user_memory_func_tool,
 ]

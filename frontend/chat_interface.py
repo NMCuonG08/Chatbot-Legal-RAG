@@ -11,16 +11,26 @@ st.set_page_config(page_title="Legal RAG & Agentic", page_icon="⚖️", layout=
 st.title("Legal RAG & Agentic Workflow")
 st.caption("MVP chat UI with async task polling")
 
+# Per-session identity = the name the user types in the sidebar. Each name
+# scopes its own conversation / memory / episodic store, so the agent only
+# ever sees that one session. The default is intentionally EMPTY (not a
+# shared sentinel like "demo-session") so two different users cannot
+# accidentally collapse into the same session and leak facts (e.g. names)
+# to each other. The backend rejects an empty id, forcing the user to pick
+# a unique name before chatting.
 if "session_id" not in st.session_state:
-    st.session_state.session_id = "demo-session"
+    st.session_state.session_id = ""
 
 # Sidebar settings & history
 st.sidebar.title("⚙️ Cấu hình & Lịch sử")
 
-# User ID input
+# User ID input — each name is its own isolated session. Empty by default
+# so no two users accidentally share a sentinel id.
 st.session_state.session_id = st.sidebar.text_input(
     "Tên người dùng / Session ID",
-    value=st.session_state.session_id
+    value=st.session_state.session_id,
+    placeholder="Nhập tên riêng (vd: snake) để bắt đầu",
+    help="Mỗi tên là một phiên riêng. Đừng dùng chung tên nếu không muốn lộ thông tin.",
 )
 
 # Clear History button
@@ -38,29 +48,32 @@ if st.sidebar.button("🗑️ Xóa lịch sử cuộc trò chuyện"):
 # Fetch and show history in sidebar
 st.sidebar.markdown("---")
 st.sidebar.subheader("📜 Nhật ký hội thoại")
-try:
-    hist_resp = requests.get(f"{BACKEND_URL}/history/{st.session_state.session_id}", timeout=5)
-    if hist_resp.status_code == 200:
-        history_data = hist_resp.json().get("history", [])
-        if not history_data:
-            st.sidebar.caption("Chưa có cuộc trò chuyện nào.")
+if not st.session_state.session_id:
+    st.sidebar.caption("Nhập tên ở trên để xem lịch sử.")
+else:
+    try:
+        hist_resp = requests.get(f"{BACKEND_URL}/history/{st.session_state.session_id}", timeout=5)
+        if hist_resp.status_code == 200:
+            history_data = hist_resp.json().get("history", [])
+            if not history_data:
+                st.sidebar.caption("Chưa có cuộc trò chuyện nào.")
+            else:
+                # We display messages in a readable way, latest first
+                for idx, msg in enumerate(history_data[:15]):  # limit to last 15 messages
+                    role = "👤 Bạn" if msg.get("is_request") else "⚖️ Trợ lý"
+                    text = msg.get("message", "")
+                    created_at = msg.get("created_at", "")
+                    # Format time representation
+                    time_str = ""
+                    if created_at and "T" in created_at:
+                        time_str = created_at.split("T")[1][:5]
+                    elif created_at and " " in created_at:
+                        time_str = created_at.split(" ")[1][:5]
+                    st.sidebar.markdown(f"**{role}** {f'({time_str})' if time_str else ''}: {text[:150]}...")
         else:
-            # We display messages in a readable way, latest first
-            for idx, msg in enumerate(history_data[:15]):  # limit to last 15 messages
-                role = "👤 Bạn" if msg.get("is_request") else "⚖️ Trợ lý"
-                text = msg.get("message", "")
-                created_at = msg.get("created_at", "")
-                # Format time representation
-                time_str = ""
-                if created_at and "T" in created_at:
-                    time_str = created_at.split("T")[1][:5]
-                elif created_at and " " in created_at:
-                    time_str = created_at.split(" ")[1][:5]
-                st.sidebar.markdown(f"**{role}** {f'({time_str})' if time_str else ''}: {text[:150]}...")
-    else:
-        st.sidebar.caption("Không thể tải lịch sử.")
-except Exception as e:
-    st.sidebar.caption(f"Không thể kết nối đến Backend: {e}")
+            st.sidebar.caption("Không thể tải lịch sử.")
+    except Exception as e:
+        st.sidebar.caption(f"Không thể kết nối đến Backend: {e}")
 
 def format_event(evt):
     node = evt.get("node", "?")
@@ -113,6 +126,9 @@ def format_event(evt):
 prompt = st.text_area("Nhap cau hoi", placeholder="Vi du: Hay tom tat quy dinh moi ve hop dong lao dong")
 
 if st.button("Gui") and prompt.strip():
+    if not st.session_state.session_id.strip():
+        st.error("Vui lòng nhập 'Tên người dùng / Session ID' ở thanh bên trước khi gửi.")
+        st.stop()
     try:
         submit_resp = requests.post(
             f"{BACKEND_URL}/chat/complete",

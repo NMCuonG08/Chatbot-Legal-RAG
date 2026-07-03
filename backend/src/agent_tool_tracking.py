@@ -24,6 +24,13 @@ agent_tool_calls: "contextvars.ContextVar[Optional[list]]" = contextvars.Context
     "agent_tool_calls", default=None
 )
 
+# Per-run user_id so tools (e.g. recall_user_memory) can scope retrieval to the
+# current user without the agent having to pass it as an explicit argument.
+# Set in ai_agent_handle alongside agent_tool_calls.
+agent_user_id: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "agent_user_id", default=None
+)
+
 
 def track_tool_call(func):
     """Decorator: record each call of a tool fn into ``agent_tool_calls``.

@@ -268,10 +268,11 @@ def clear_semantic_cache() -> int:
     unscoped points so the new scope-filtered reads start from a clean slate.
     """
     try:
+        from qdrant_client.models import Filter
         client = get_client()
         deleted = client.delete(
             collection_name=CACHE_COLLECTION_NAME,
-            points_selector={},  # empty filter = all points
+            points_selector=Filter(),  # empty Filter matches all points
         )
         logger.info("🧹 Cleared semantic cache collection.")
         # qdrant delete returns an UpdateResult; surface a best-effort count

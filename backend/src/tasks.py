@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
-from agent import ai_agent_handle
+from agent import ai_agent_handle, clear_user_runtime_caches
 from brain import (
     detect_route,
     detect_user_intent,
@@ -495,7 +495,7 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
 
 def generate_agent_answer(history, question, user_id=None, conversation_id=None):
     logger.info("Using ReAct agent with tools")
-    answer, tool_calls = ai_agent_handle(question, user_id, conversation_id)
+    answer, tool_calls = ai_agent_handle(question, user_id, conversation_id, history=history)
     return answer, tool_calls
 
 
@@ -1067,11 +1067,30 @@ QUAN TRỌNG:
 
         logger.info(f"Extracted episodic memories for user {user_id}:\n{summary_result}")
 
+        # Compute embedding once; reused for dedup check and Qdrant upsert.
+        vector = get_embedding(summary_result)
+
+        # Dedup: skip if a near-identical fact is already stored for this user
+        # (e.g. "sinh năm 2004" saved every turn). High threshold to only catch
+        # true duplicates, not related-but-distinct facts.
+        try:
+            existing = search_vector(
+                collection_name="user_episodes",
+                vector=vector,
+                limit=1,
+                filters={"user_id": user_id},
+                score_threshold=0.88,
+            )
+            if existing:
+                logger.info(f"Episodic dedup: similar fact already stored for user {user_id}, skipping save.")
+                return "skipped_duplicate"
+        except Exception as dedup_err:
+            logger.warning(f"Episodic dedup check failed (proceeding to save): {dedup_err}")
+
         # Save to MySQL
         save_user_episode(user_id, summary_result)
 
         # Save to Qdrant
-        vector = get_embedding(summary_result)
         point_id = str(uuid.uuid4())
 
         vectors_payload = {
@@ -1095,6 +1114,23 @@ QUAN TRỌNG:
     except Exception as e:
         logger.error(f"Failed in save_episodic_memory_task: {e}")
         return f"error: {str(e)}"
+
+
+@shared_task()
+def clear_user_runtime_caches_task(user_id: str, conversation_id: str | None = None) -> int:
+    """Worker-side purge of in-process memory caches for a user.
+
+    ``clear_user_runtime_caches`` only clears the caches in the process it
+    runs in. The agent runs in the Celery worker, so a delete issued from the
+    web process would not reach the worker's ``_conv_summaries`` /
+    ``_agent_memories``. This task runs IN the worker so a history delete
+    actually purges the rolling-summary + memory buffers the agent is using.
+    """
+    try:
+        return clear_user_runtime_caches(user_id, conversation_id)
+    except Exception as e:
+        logger.error(f"Failed in clear_user_runtime_caches_task: {e}")
+        return 0
 
 
 @shared_task(bind=True)

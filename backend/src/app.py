@@ -33,15 +33,17 @@ from security import (
     require_api_key,
     resolve_safe_data_path,
 )
-from tasks import index_document_v2, llm_handle_message
+from tasks import index_document_v2, llm_handle_message, clear_user_runtime_caches_task
+from agent import clear_user_runtime_caches
 from database import settings as db_settings
 from utils import setup_logging
-from vectorize import create_collection, list_collection_points, list_collections
+from vectorize import create_collection, list_collection_points, list_collections, delete_vectors_by_filter
 from semantic_cache import (
     clear_semantic_cache,
     get_cache_stats,
     init_semantic_cache,
     maybe_wipe_legacy_cache,
+    SCOPE_USER_PREFIX,
 )
 
 # Constants
@@ -195,23 +197,68 @@ async def get_user_history(user_id: str, limit: int = 100, offset: int = 0):
 
 @app.delete("/history/{user_id}")
 async def delete_history(user_id: str, bot_id: str = "botLawyer"):
-    """Clear all chat history for a user, including from cache"""
+    """Clear all chat history for a user, including from cache.
+
+    Purges, per user:
+      - Redis conversation-id mapping (clear_conversation_id)
+      - DB conversation rows (delete_user_conversations)
+      - Qdrant semantic-cache entries scoped to this user
+      - Qdrant user_episodes (long-term episodic facts)
+      - In-process rolling-summary + memory buffers (this process only)
+    Without the Qdrant + episodic clears the agent would keep recalling old
+    facts/answers even after the user wiped their history.
+    """
     logger.info(f"Deleting history for user {user_id} and bot {bot_id}")
-    
-    # Clear session from cache (Redis)
+
+    # Clear session from cache (Redis conversation-id mapping)
     cache_cleared = clear_conversation_id(bot_id, user_id)
-    
+
     # Clear records from database
     db_cleared = delete_user_conversations(user_id)
-    
+
+    # Clear per-user semantic cache (Qdrant). Best-effort: a Qdrant outage
+    # must not block the rest of the wipe.
+    semantic_cleared = False
+    try:
+        semantic_cleared = delete_vectors_by_filter(
+            "semantic_cache", {"scope": f"{SCOPE_USER_PREFIX}{user_id}"}
+        )
+    except Exception as e:
+        logger.warning(f"[DELETE] semantic_cache clear failed for user={user_id}: {e}")
+
+    # Clear long-term episodic facts (Qdrant user_episodes). These are the
+    # "agent remembers your name / situation" entries — the most common
+    # reason a deleted conversation still seems remembered.
+    episodic_cleared = False
+    try:
+        episodic_cleared = delete_vectors_by_filter("user_episodes", {"user_id": user_id})
+    except Exception as e:
+        logger.warning(f"[DELETE] user_episodes clear failed for user={user_id}: {e}")
+
+    # In-process rolling-summary + ChatMemoryBuffer. Clear locally (covers the
+    # sync path where the agent runs in this process) AND dispatch a Celery
+    # task so the worker's own copies are purged too.
+    runtime_cleared = 0
+    try:
+        runtime_cleared = clear_user_runtime_caches(user_id)
+    except Exception as e:
+        logger.warning(f"[DELETE] local runtime cache clear failed for user={user_id}: {e}")
+    try:
+        clear_user_runtime_caches_task.delay(user_id)
+    except Exception as e:
+        logger.warning(f"[DELETE] worker runtime cache clear dispatch failed for user={user_id}: {e}")
+
     if not db_cleared:
         raise HTTPException(status_code=500, detail="Failed to delete history from database")
-        
+
     return {
         "user_id": user_id,
         "status": "success",
         "cache_cleared": cache_cleared,
-        "db_cleared": db_cleared
+        "db_cleared": db_cleared,
+        "semantic_cache_cleared": semantic_cleared,
+        "episodic_cleared": episodic_cleared,
+        "runtime_caches_cleared": runtime_cleared,
     }
 
 
@@ -230,6 +277,9 @@ async def get_collection_points(
     )
 
 
+_SHARED_USER_SENTINELS = {"anonymous", "demo-session", ""}
+
+
 @app.post("/chat/complete")
 async def complete(data: CompleteRequest):
     bot_id = data.bot_id
@@ -240,6 +290,17 @@ async def complete(data: CompleteRequest):
     if not user_message or not user_id:
         raise HTTPException(
             status_code=400, detail="User id and user message are required"
+        )
+
+    # Sentinel guard: if the client sent a shared placeholder id, every such
+    # client collapses into ONE conversation_id / memory buffer / episodic
+    # store, leaking facts (e.g. names) across users. We do not reject (to
+    # keep the demo working) but log loudly so ops can see the leak risk.
+    if (user_id or "").strip() in _SHARED_USER_SENTINELS:
+        logger.warning(
+            f"[SESSION] Shared sentinel user_id={user_id!r} detected — "
+            "conversation/memory/episodic state is shared across all such "
+            "clients. Frontend must send a per-browser UUID."
         )
 
     # Fast-reject gate: deterministic Tier-1 keyword guardrails (pure string
