@@ -9,7 +9,9 @@
 [![LangGraph](https://img.shields.io/badge/Agent-LangGraph-brightgreen.svg)](https://github.com/langchain-ai/langgraph)
 [![Qdrant](https://img.shields.io/badge/VectorDB-Qdrant-red.svg)](https://qdrant.tech/)
 
-An intelligent virtual assistant for looking up Vietnamese legal documents, calculating legal costs/penalties, and verifying civil legal conditions. Built on an **Advanced RAG** architecture combined with an **Agentic Workflow** (LangGraph router → ReAct agent), protected by multi-layered safety guardrails and a hardened admin surface.
+An intelligent virtual assistant for looking up Vietnamese legal documents, calculating legal costs/penalties, and verifying civil legal conditions. Built on an **Advanced RAG** architecture combined with a **truly agentic workflow** (LangGraph router → ReAct agent), protected by multi-layered safety guardrails and a hardened admin surface.
+
+The agent is **truly agentic**, not just a routed RAG: it **self-verifies** its final answer for citation groundedness (PEV gate), **knows its own limits** via metacognitive escalation to a lawyer-referral prefix on high-stakes / low-confidence cases, **recalls structured legal knowledge** through a Neo4j statute→article graph for multi-hop reasoning, and **learns from feedback** via a 👍/👎 RLHF store that injects good prior answers as few-shot examples and up-weights their source chunks at rerank time.
 
 [🌟 Star](https://github.com/NMCuonG08/Chatbot-Legal-RAG/stargazers) • [🍴 Fork](https://github.com/NMCuonG08/Chatbot-Legal-RAG/fork) • [📚 Docs](docs/ARCHITECTURE.md) • [💬 Discord](https://discord.gg/legal-chatbot)
 
@@ -103,9 +105,25 @@ graph TD
     GenRag -->|Handoff: not found| Web
     Web -->|Handoff: tool| Agent
 
+    GenRag -->|verify groundedness| Verify{"`verify_answer
+    (PEV gate)`"}
+    Verify -->|supported| Meta
+    Verify -->|unsupported, retry < cap| Rew
+    Verify -->|cap reached / partial| Meta
+
+    Agent & Web & Gen -->|no sources, skip verify| Meta["`metacognitive
+    (stakes × confidence)`"]
+    Meta -->|high stakes OR low confidence| Esc["`⚠️ lawyer-referral
+    prefix`"]
+    Meta -->|low stakes & high confidence| Out
+    Esc --> Out
+
     GenRag & Agent & Web & Gen -->|Output guardrails| Out[Final response]
     Out -->|save + trace run_end| Broker
     Out -->|conversation history| SQL[("MySQL")]
+    Out -->|👍/👎 feedback| RLHF["`RLHF store
+    (Qdrant good pool + MySQL audit)`"]
+    RLHF -.->|few-shot + rerank boost| GenRag
 ```
 
 **Key Graph Properties:**
@@ -116,6 +134,10 @@ graph TD
 *   **SSE streaming:** `GET /chat/stream/{task_id}` subscribes to the pub/sub channel, filters by `run_id`, and closes on `run_end`. The Streamlit UI renders a live `Agent trace` expander.
 *   **ReAct tool-call surfacing:** the `agent_tool_calls` contextvar is reset per turn, populated by `@track_tool_call`, and lifted through the graph → Celery result → async poll as an optional `tool_calls` array.
 *   **Per-conversation memory:** ReAct agent memory is keyed by `(user_id, conversation_id)` in an LRU cache (cap 32) — fixing a prior global-memory cross-user leak.
+*   **PEV verify_answer gate (self-verify):** after `generate` (RAG route, where `sources` exist), the final answer is judged for citation groundedness via a Ragas-style `evaluate_faithfulness` claim decomposition. Verdict `supported` → metacognitive; `unsupported`/`partial` → loop back to `rewrite_query → retrieve` (capped at `VERIFY_MAX_RETRIES=2`) then degrade to metacognitive. Score thresholds: `VERIFY_ANSWER_THRESHOLD=0.7` (supported), `VERIFY_PARTIAL_THRESHOLD=0.35`. Non-RAG routes (empty `sources`) skip the gate. The graph result exposes `verify_score`, `verify_verdict`, `retry_verify` for eval wiring.
+*   **Metacognitive escalation (self-knowledge-of-limits):** a tiered stakes classifier (`high` criminal / `medium` civil disputes / `low` default) combined with the verify_answer confidence produces a graph-level gate — not a post-hoc disclaimer. High-stakes always escalate; medium-stakes escalate only when `verify_score < ESCALATION_CONFIDENCE_THRESHOLD=0.6`. Escalation prepends a "consult a practicing lawyer" prefix to the response (append-only, auditable in trace). The duplicate criminal-keyword list in `guardrails_manager` was consolidated into `metacognitive.HIGH_STAKES_KEYWORDS` (single source of truth).
+*   **Neo4j legal knowledge graph (structured memory):** `(:Statute {name, year})-[:HAS_ARTICLE]->(:Article {number, title})` nodes are written idempotently (MERGE) during ingestion, reusing the regex `extract_legal_metadata` extractor. The `recall_legal_graph_tool` FunctionTool traverses the graph for multi-hop queries (keyword-gated in `filter_tools_for_query` on terms like "dẫn chiếu", "án lệ", "còn hiệu lực", "điều nào"). Graph writes are best-effort additive — Neo4j down swallows + logs, never blocks vector ingest.
+*   **RLHF continual learning (learns-from-feedback):** 👍/👎 feedback → MySQL `agent_feedback` audit (always, both ratings) + Qdrant `rlhf_good_answers` pool (good-only). User-scoped via `_scope_for` + sentinel rejection (`anonymous`/`demo-session`/`""` → HTTP 400) — no cross-user leak. On later similar questions, the top good answer is injected as a system few-shot example in `generate_node` (score ≥ 0.85, same scope), and chunks whose `doc_id` backed a 👍 answer get an additive `RLHF_RERANK_BOOST=0.05` at rerank. Deterministic uuid5 point id makes re-submitting idempotent; dedup score ≥ 0.92 skips flooding.
 
 ---
 
@@ -131,15 +153,23 @@ Chatbot-Legal-RAG/
 │   │   ├── brain.py              # LLM routing (Groq/Ollama/OpenAI), intent detection, routing
 │   │   ├── custom_embedding.py   # Custom Vietnamese embedding model integrations
 │   │   ├── legal_tools.py        # Vietnamese civil/commercial law calculation logic
-│   │   ├── models.py             # Pydantic data models & GraphRun/AgentStep DB models
+│   │   ├── models.py             # Pydantic data models & GraphRun/AgentStep/AgentFeedback DB models
 │   │   ├── search.py             # Hybrid search index + BM25 retriever
-│   │   ├── semantic_cache.py     # Qdrant-based vector caching
-│   │   ├── config.py             # CRAG constants (REFLECTION_MAX, DOC_GRADE_THRESHOLD, ...)
+│   │   ├── semantic_cache.py     # Qdrant-based vector caching (user-scoped, sentinel-aware)
+│   │   ├── config.py             # CRAG + PEV + metacognitive + RLHF tuning constants
 │   │   ├── database.py           # Database connection & session orchestration
 │   │   ├── cache.py              # Redis cache integration
-│   │   ├── tasks.py              # Celery tasks + LangGraph StateGraph (CRAG loop, handoff, trace, checkpoint)
+│   │   ├── tasks.py              # Celery tasks + LangGraph StateGraph (CRAG loop, PEV verify, metacognitive, RLHF, handoff, trace, checkpoint)
 │   │   ├── trace.py              # Self-hosted trace: MySQL agent_steps/graph_runs + Redis pub/sub emit_*
-│   │   ├── import_data.py        # Legacy JSONL importer (incremental)
+│   │   ├── verify_answer.py      # Phase 1 — PEV gate: judge final answer groundedness (claim decomp + verdict)
+│   │   ├── metacognitive.py      # Phase 2 — tiered stakes classifier + lawyer-escalation decision
+│   │   ├── guardrails_manager.py # NeMo Guardrails wrapper (HIGH_STAKES_KEYWORDS consolidated from metacognitive)
+│   │   ├── graph_db.py           # Phase 3 — Neo4j driver singleton + set_graph_client test seam
+│   │   ├── legal_graph_ingest.py # Phase 3 — idempotent MERGE Statute→Article during ingest
+│   │   ├── legal_graph_tools.py  # Phase 3 — recall_legal_graph multi-hop FunctionTool
+│   │   ├── rlhf_store.py         # Phase 4 — 👍/👎 Qdrant good pool + MySQL audit, user-scoped
+│   │   ├── agent_tool_wrappers.py# FunctionTool registry (incl. recall_legal_graph_func_tool)
+│   │   ├── import_data.py        # Legacy JSONL importer (incremental) + graph-ingest hook
 │   │   └── pipeline/             # Multi-source Ingestion Pipeline
 │   │       ├── orchestrator.py   # one core loop, idempotent, per-doc isolation
 │   │       ├── run.py            # CLI entrypoint
@@ -201,7 +231,11 @@ Chatbot-Legal-RAG/
 │   ├── test_per_conversation_memory.py # Conversation memory leak tests
 │   ├── test_react_toolcalls.py   # ReAct tool-call surfacing tests
 │   ├── test_sse_stream.py        # SSE live-trace streaming tests
-│   └── test_trace_tables.py      # MySQL trace tables validation tests
+│   ├── test_trace_tables.py      # MySQL trace tables validation tests
+│   ├── test_verify_answer.py     # Phase 1 — PEV gate logic + verify recovery loop (10 tests)
+│   ├── test_metacognitive.py     # Phase 2 — stakes classifier + escalation E2E (13 tests)
+│   ├── test_graph_memory.py      # Phase 3 — Neo4j ingest/recall with fake driver (12 tests)
+│   └── test_rlhf_store.py        # Phase 4 — 👍/👎 store + few-shot + rerank boost (12 tests)
 │
 ├── 📝 docs/                       # Documentation
 │   ├── ARCHITECTURE.md           # System architecture guide
@@ -257,6 +291,33 @@ Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing t
 *   **Input Protection:** detects jailbreaks, prompt injections, and politically sensitive queries (NVIDIA NeMo Guardrails).
 *   **Output Groundedness:** verifies generated answers against source documents to prevent hallucinations and appends legal disclaimers.
 
+### 6b. Self-Verify — PEV verify_answer Gate
+*   **Final-answer groundedness:** after generation on the RAG route, `judge_answer` decomposes the answer into claims and scores each against source contexts via Ragas-style `evaluate_faithfulness`.
+*   **Verdict routing:** `supported` (≥0.7) → metacognitive; `partial` (≥0.35) / `unsupported` (<0.35) → recover via `rewrite_query → retrieve`, capped at `VERIFY_MAX_RETRIES=2` before degrading to metacognitive (never infinite-loops).
+*   **Non-RAG skip:** `agent_tools` / `web_search` / `general_chat` routes have empty `sources` and skip the citation check.
+*   **Eval surface:** the graph result exposes `verify_score`, `verify_verdict`, `retry_verify` for the eval harness.
+
+### 6c. Self-Knowledge-of-Limits — Metacognitive Escalation
+*   **Tiered stakes:** `classify_stakes` returns `high` (criminal / `ESCALATION_TOPICS`), `medium` (civil disputes: hợp đồng, ly hôn, bồi thường, thiệt hại, khởi kiện, tòa án…), or `low`.
+*   **Confidence signal:** reuses the PEV `verify_score` as the groundedness confidence.
+*   **Escalation rule:** high-stakes always escalate; medium-stakes escalate only when `verify_score < ESCALATION_CONFIDENCE_THRESHOLD=0.6`; low-stakes never auto-escalate.
+*   **Append-only prefix:** escalation prepends a "consult a practicing lawyer" warning to the response — auditable in the trace, never a silent mutation.
+*   **Dedup:** the prior duplicate criminal-keyword list in `guardrails_manager` now references `metacognitive.HIGH_STAKES_KEYWORDS` (single source of truth).
+
+### 6d. Structured Memory — Neo4j Legal Knowledge Graph
+*   **Schema:** `(:Statute {name, year})-[:HAS_ARTICLE]->(:Article {number, title, text})`, written idempotently via MERGE during ingestion.
+*   **Extraction:** reuses the regex `extract_legal_metadata` extractor (law_name + article_number) — no extra LLM call for the core path.
+*   **Multi-hop tool:** `recall_legal_graph_tool` parses law + article from the query and traverses the graph; gated by multi-hop keywords ("dẫn chiếu", "án lệ", "bác bỏ", "còn hiệu lực", "điều nào") in `filter_tools_for_query`.
+*   **Additive / non-blocking:** Neo4j down → swallow + log; vector ingest path is unaffected. Driver is a lazy singleton with a `set_graph_client` test seam (mirrors the Qdrant pattern).
+
+### 6e. Continual Learning — RLHF Feedback Store
+*   **👍/👎 capture:** `POST /feedback` persists every rating to MySQL `agent_feedback` (audit trail) and good answers only to a Qdrant `rlhf_good_answers` pool.
+*   **User-scoped privacy:** stored via `_scope_for` (`"user:{id}"`); sentinel/empty ids rejected with HTTP 400 — no cross-user leak of endorsed answers.
+*   **Idempotent + dedup:** deterministic uuid5 point id `f"{user_id}|good|{question}"`; near-identical good answers (score ≥ 0.92) are skipped to avoid flooding the few-shot pool.
+*   **Few-shot injection:** when the current question is semantically near a prior 👍 (score ≥ 0.85, same scope), the top good answer is appended as a system few-shot example in `generate_node` — style/grounding steer only, never copied verbatim.
+*   **Rerank up-weight:** chunks whose `doc_id` backed a 👍 answer get an additive `RLHF_RERANK_BOOST=0.05` and the ranked list is re-sorted — good-answer sources win ties without overriding clearly-relevant chunks.
+*   **Frontend:** 👍/👎 buttons under each assistant reply post to `/feedback` with `user_id = session_id`.
+
 ### 7. Hardened Admin Surface
 *   **API-key auth:** admin endpoints (`collection/create`, `document/create`, `data/import`, `pipeline/ingest`, `collections/.../clean`) require `X-API-Key` matching `ADMIN_API_KEY`. When unset, endpoints are **refused** unless `ALLOW_UNSAFE_ADMIN=1` (dev only).
 *   **Path-traversal guard:** ingestion paths are resolved safely under the data dir (`IMPORT_DATA_DIR`) — `../../etc/passwd`-style doc_ids/paths cannot escape.
@@ -279,7 +340,8 @@ A 4-pillar framework tracking operational metrics (token count, API cost, latenc
 *   **Backend API Framework:** FastAPI
 *   **Background Tasks & Queue:** Celery + Redis
 *   **Vector Database:** Qdrant DB
-*   **Relational Database:** PostgreSQL / MySQL (for logs, chat history, and status checks)
+*   **Graph Database:** Neo4j 5.20 (legal knowledge graph: Statute→Article multi-hop recall)
+*   **Relational Database:** PostgreSQL / MySQL (for logs, chat history, RLHF audit, and status checks)
 *   **AI Agent & Retrieval Orchestration:** LlamaIndex, LangGraph, NVIDIA NeMo Guardrails
 *   **Vietnamese Text Embedding:** BGE-M3 (locally hosted/served, or Cohere cloud backup)
 *   **LLM Providers:** Llama-3.1-8B-Instruct (via Groq/Ollama), OpenAI, self-hosted Legal LLM
@@ -312,7 +374,20 @@ COHERE_API_KEY=your_key_here
 ADMIN_API_KEY=your_admin_secret_key
 DATABASE_URL=postgresql://postgres:password@localhost:5432/legal_chatbot
 REDIS_URL=redis://localhost:6379/0
+
+# Phase 3 — Neo4j legal knowledge graph (optional; graph recall disabled if unset)
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=neo4j
 ```
+
+Start Neo4j alongside the stack:
+
+```bash
+docker compose up -d neo4j    # ports 7474 (browser) / 7687 (bolt)
+```
+
+Graph ingest + recall are best-effort — if Neo4j is down, the vector RAG path keeps working unchanged.
 
 ### 3. Run the Services
 
@@ -412,7 +487,16 @@ Run the test suite with `pytest` from the root directory:
 python -m pytest tests/ -v
 ```
 
-See [`docs/TESTING.md`](docs/TESTING.md) for full test suite coverage (including security layer, checkpointing, trace tables, CRAG flows, SSE streaming, and memory leakage tests).
+Agentic-feature units (no live Neo4j / Qdrant / MySQL required — all use fakes/mocks):
+
+```bash
+python -m pytest tests/test_verify_answer.py tests/test_metacognitive.py \
+                  tests/test_graph_memory.py tests/test_rlhf_store.py -v
+```
+
+Current suite: **273 passing** (incl. Phase 1 verify_answer 10, Phase 2 metacognitive 13, Phase 3 graph memory 12, Phase 4 RLHF 12).
+
+See [`docs/TESTING.md`](docs/TESTING.md) for full test suite coverage (including security layer, checkpointing, trace tables, CRAG flows, SSE streaming, memory leakage, PEV verify, metacognitive escalation, Neo4j graph memory, and RLHF feedback tests).
 
 ---
 
@@ -430,6 +514,7 @@ See [`docs/TESTING.md`](docs/TESTING.md) for full test suite coverage (including
 | POST | `/chat/complete` | – | Submit a chat query (async Celery task) |
 | GET | `/chat/complete/{task_id}` | – | Poll task result |
 | GET | `/chat/stream/{task_id}` | – | SSE live trace stream |
+| POST | `/feedback` | – | RLHF 👍/👎 feedback (user-scoped; sentinels rejected with 400) |
 | POST | `/collection/create` | API key | Create a Qdrant collection |
 | DELETE | `/collections/{name}/clean` | API key | Delete vectors in a collection |
 | POST | `/document/create` | API key | Create a document |

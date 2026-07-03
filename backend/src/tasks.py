@@ -30,6 +30,9 @@ except ImportError:  # pragma: no cover - optional dependency
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
 from agent import ai_agent_handle, clear_user_runtime_caches
+from verify_answer import judge_answer
+from metacognitive import build_escalation, ESCALATION_PREFIX
+from rlhf_store import find_similar_good
 from brain import (
     detect_route,
     detect_user_intent,
@@ -43,6 +46,8 @@ from config import (
     DOC_GRADE_THRESHOLD,
     REFLECTION_MAX,
     ALL_IRRELEVANT_THRESHOLD,
+    VERIFY_MAX_RETRIES,
+    RLHF_RERANK_BOOST,
 )
 from database import get_celery_app, SessionLocal, settings
 from models import (
@@ -70,6 +75,23 @@ logger = logging.getLogger(__name__)
 
 import redis
 redis_client = redis.from_url(settings.redis_url)
+
+# Shared placeholder user_ids: writing episodic facts or per-user cache under
+# one of these collapses every such client into a single bucket (cross-user
+# leak). Skip per-user persistence when a sentinel is in use.
+_SHARED_USER_SENTINELS = {"anonymous", "demo-session", ""}
+
+# Module-level trace-redis client (lazy) so we don't open+leak a new
+# connection pool on every message. The previous code did
+# `redis.from_url(settings.trace_redis_url)` per chat and never closed it.
+_trace_redis_client = None
+
+
+def _get_trace_redis():
+    global _trace_redis_client
+    if _trace_redis_client is None:
+        _trace_redis_client = redis.from_url(settings.trace_redis_url)
+    return _trace_redis_client
 
 # ---- Schema ensure guard: once per worker process ----
 # ensure_database_schema() reflects all tables and runs idempotent CREATE IF
@@ -217,6 +239,11 @@ class ChatGraphState(TypedDict, total=False):
     agent_to_rag_done: bool
     generate_to_web_done: bool
     web_to_agent_done: bool
+    # PEV verify_answer (final-answer groundedness gate) — Phase F.
+    verify_score: float               # 0.0–1.0 groundedness from judge_answer
+    verify_rationale: str
+    verify_verdict: str               # "supported" | "partial" | "unsupported"
+    retry_verify: int                 # verify -> rewrite_query recovery guard
 
 celery_app = get_celery_app(__name__)
 celery_app.autodiscover_tasks()
@@ -342,6 +369,42 @@ def _retrieve_episodic_context(user_id: str | None, question: str) -> str:
     except Exception as ep_err:
         logger.error(f"Failed to retrieve episodic memory for user {user_id}: {ep_err}")
         return ""
+
+
+def _apply_rlhf_rerank_boost(ranked_docs: List[Dict], user_id, question: str) -> List[Dict]:
+    """Phase 4 — up-weight chunks whose ``doc_id`` backed a 👍-marked answer.
+
+    Looks up this user's good answers semantically near ``question`` (same
+    scope, no cross-user leak). If a match exists, any ranked chunk whose
+    ``doc_id`` appears in that good answer's sources gets an additive
+    ``RLHF_RERANK_BOOST`` and the list is re-sorted. Non-mutating (returns a
+    new list); best-effort (any failure returns the input unchanged).
+    """
+    if not ranked_docs or not user_id or not question:
+        return ranked_docs
+    try:
+        good = find_similar_good(user_id, question)
+    except Exception as exc:
+        logger.warning(f"RLHF rerank boost lookup failed (non-blocking): {exc}")
+        return ranked_docs
+    if not good or not good.get("sources"):
+        return ranked_docs
+    boosted_ids = {
+        s.get("doc_id") for s in good["sources"] if s.get("doc_id") is not None
+    }
+    if not boosted_ids:
+        return ranked_docs
+    out = []
+    for d in ranked_docs:
+        if d.get("doc_id") in boosted_ids:
+            d2 = dict(d)
+            d2["relevance_score"] = float(d.get("relevance_score") or 0.0) + RLHF_RERANK_BOOST
+            out.append(d2)
+        else:
+            out.append(d)
+    out.sort(key=lambda x: x.get("relevance_score") or 0.0, reverse=True)
+    logger.info(f"RLHF rerank boost applied to {len(boosted_ids)} doc_ids for user {user_id}")
+    return out
 
 
 def _llm_judge_relevance(question: str, docs: List[Dict]) -> Dict[int, str]:
@@ -619,6 +682,7 @@ def _build_chat_graph():
             or state.get("standalone_question")
             or state.get("question", "")
         )
+        user_id = state.get("user_id")
         query_variations = rewrite_query_to_multi_queries(question, num_queries=3)
         try:
             retrieved = retrieve_with_hybrid_search(query_variations, top_k=4)
@@ -627,6 +691,8 @@ def _build_chat_graph():
             retrieved = retrieve_with_multi_query_fallback(query_variations, top_k=4)
         # Rerank here so docs carry relevance_score for the grade node.
         ranked = rerank_documents(retrieved, question, top_n=5)
+        # Phase 4 — RLHF rerank boost (user-scoped 👍-marked source up-weight).
+        ranked = _apply_rlhf_rerank_boost(ranked, user_id, question)
         logger.info(f"Retrieve node: {len(ranked)} reranked docs for query: {question[:80]}")
         _trace_node_end(state, "retrieve", {"query": question[:200], "doc_count": len(ranked)})
         return {"documents": ranked}
@@ -709,6 +775,23 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
             ]
         )
 
+        # Phase 4 — RLHF few-shot injection: if this user previously 👍-marked an
+        # answer to a semantically similar question (score >= 0.85, same scope),
+        # surface it as a system few-shot example to steer the LLM toward the
+        # style/grounding they endorsed. Never cross-user (scope-filtered).
+        try:
+            good = find_similar_good(user_id, question)
+            if good and good.get("response"):
+                few_shot = (
+                    f"\n\n[Ví dụ trả lời tốt cho câu tương tự đã được người dùng đánh giá cao — "
+                    f"chỉ tham khảo về phong cách/cách dẫn chứng, KHÔNG chép nguyên văn]:\n"
+                    f"Q: {good['question']}\nA: {good['response']}"
+                )
+                openai_messages[0]["content"] += few_shot
+                logger.info("RLHF few-shot example injected (score=%.3f).", good.get("score", 0.0))
+        except Exception as exc:
+            logger.warning("RLHF few-shot injection failed (non-blocking): %s", exc)
+
         assistant_answer = vietnamese_llm_chat_complete(openai_messages)
         logger.info("CRAG generate_node reply generated")
 
@@ -778,6 +861,52 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
         _trace_node_end(state, "general_chat", {})
         return {"response": generate_general_answer(history, question), "sources": []}
 
+    # ---- PEV verify_answer (Phase F) ----
+    # Judge the final answer for citation groundedness + hallucination.
+    # Only the RAG route carries real sources; agent/web/general return
+    # sources=[] and judge_answer short-circuits to "supported".
+    def verify_answer_node(state: ChatGraphState):
+        question = state.get("standalone_question") or state.get("question", "")
+        answer = state.get("response", "")
+        sources = state.get("sources", [])
+        verdict = judge_answer(question, answer, sources)
+        retry = state.get("retry_verify", 0)
+        _trace_node_end(state, "verify_answer", {
+            "score": verdict["score"],
+            "verdict": verdict["verdict"],
+            "retry_verify": retry + 1,
+        })
+        return {
+            "verify_score": verdict["score"],
+            "verify_rationale": verdict["rationale"],
+            "verify_verdict": verdict["verdict"],
+            "retry_verify": retry + 1,
+        }
+
+    def verify_router(state: ChatGraphState) -> str:
+        verdict = state.get("verify_verdict", "supported")
+        retry = state.get("retry_verify", 0)
+        if verdict == "supported":
+            return "metacognitive"
+        if retry >= VERIFY_MAX_RETRIES:
+            return "metacognitive"          # degrade — never infinite-loop
+        return "rewrite_query"              # recovery -> CRAG retrieve loop
+
+    # ---- Metacognitive escalation (Phase 2) ----
+    # Graph-level safety gate before END: combine verify_answer confidence
+    # with a tiered stakes classifier; prepend a lawyer-escalation prefix
+    # when the stakes are high, or medium with low confidence. The original
+    # answer is kept intact below the prefix (auditable in the trace).
+    def metacognitive_node(state: ChatGraphState):
+        question = state.get("standalone_question") or state.get("question", "")
+        confidence = state.get("verify_score", 1.0)
+        decision = build_escalation(question, confidence)
+        _trace_node_end(state, "metacognitive", decision)
+        if decision["escalate"]:
+            response = state.get("response", "")
+            return {"response": ESCALATION_PREFIX + response}
+        return {}
+
     def choose_route(state: ChatGraphState):
         return state.get("route", "general_chat")
 
@@ -789,6 +918,8 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
     graph.add_node("agent_tools", agent_tools_node)
     graph.add_node("web_search", web_search_node)
     graph.add_node("general_chat", general_chat_node)
+    graph.add_node("verify_answer", verify_answer_node)
+    graph.add_node("metacognitive", metacognitive_node)
 
     graph.add_edge(START, "route")
     graph.add_conditional_edges(
@@ -815,10 +946,22 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
     )
     graph.add_edge("rewrite_query", "retrieve")
 
-    graph.add_edge("generate", END)
-    graph.add_edge("agent_tools", END)
-    graph.add_edge("web_search", END)
-    graph.add_edge("general_chat", END)
+    # PEV verify_answer gate: generate -> verify -> {rewrite_query (recovery) | metacognitive}.
+    # agent_tools / web_search / general_chat carry no sources -> skip verify,
+    # go straight to metacognitive.
+    graph.add_edge("generate", "verify_answer")
+    graph.add_conditional_edges(
+        "verify_answer",
+        verify_router,
+        {
+            "rewrite_query": "rewrite_query",
+            "metacognitive": "metacognitive",
+        },
+    )
+    graph.add_edge("agent_tools", "metacognitive")
+    graph.add_edge("web_search", "metacognitive")
+    graph.add_edge("general_chat", "metacognitive")
+    graph.add_edge("metacognitive", END)
 
     return graph.compile(checkpointer=_get_checkpointer())
 
@@ -849,6 +992,9 @@ def run_chat_graph(history, question, user_id=None, conversation_id=None, run_id
         "reflection_count": result.get("reflection_count", 0),
         "run_id": run_id,
         "tool_calls": result.get("tool_calls", []),
+        "verify_score": result.get("verify_score", 0.0),
+        "verify_verdict": result.get("verify_verdict", ""),
+        "retry_verify": result.get("retry_verify", 0),
     }
 
 
@@ -1090,8 +1236,12 @@ QUAN TRỌNG:
         # Save to MySQL
         save_user_episode(user_id, summary_result)
 
-        # Save to Qdrant
-        point_id = str(uuid.uuid4())
+        # Save to Qdrant. Deterministic point id (uuid5 of user_id + summary)
+        # makes the upsert idempotent: if the dedup check was skipped (e.g. a
+        # transient Qdrant error) and the same fact is saved again, the
+        # second write overwrites the same point instead of creating a
+        # duplicate (uuid4 would create a new point every turn).
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{user_id}|{summary_result}"))
 
         vectors_payload = {
             point_id: {
@@ -1208,7 +1358,7 @@ def llm_handle_message(self, bot_id, user_id, question):
         # result is ready. Best-effort: never block the chat on Redis.
         if celery_task_id:
             try:
-                trace_redis = redis.from_url(settings.trace_redis_url)
+                trace_redis = _get_trace_redis()
                 trace_redis.setex(f"trace:run:{celery_task_id}", 600, run_id)
             except Exception as e:
                 logger.warning(f"trace:run key set failed: {e}")
@@ -1235,8 +1385,11 @@ def llm_handle_message(self, bot_id, user_id, question):
     # Save full response to history (to preserve all details like the specific age)
     update_chat_conversation(bot_id, user_id, response_text, False)
 
-    # 4. Save to Semantic Cache if not blocked
-    if not blocked_response:
+    # 4. Save to Semantic Cache if not blocked. Skip for shared sentinel
+    # user_ids: the answer may carry this client's private facts, and caching
+    # it under either user:<sentinel> or common would replay it to other
+    # clients. No cache is better than a leaking cache here.
+    if not blocked_response and (user_id or "").strip() not in _SHARED_USER_SENTINELS:
         try:
             import sys
             import os
@@ -1254,12 +1407,17 @@ def llm_handle_message(self, bot_id, user_id, question):
         except Exception as cache_err:
             logger.exception("Semantic Cache save failed")
 
-    # Trigger background episodic memory ingestion task asynchronously!
-    try:
-        save_episodic_memory_task.delay(user_id, conversation_id)
-        logger.info("Triggered save_episodic_memory_task asynchronously")
-    except Exception as t_err:
-        logger.error(f"Failed to trigger save_episodic_memory_task: {t_err}")
+    # Trigger background episodic memory ingestion task asynchronously.
+    # Skip when: (a) the input was blocked by guardrails — never persist a
+    # blocked/jailbreak message as a "user fact"; (b) user_id is a shared
+    # sentinel — writing would leak one client's private facts into the
+    # shared bucket every other sentinel client reads from.
+    if not blocked_response and (user_id or "").strip() not in _SHARED_USER_SENTINELS:
+        try:
+            save_episodic_memory_task.delay(user_id, conversation_id)
+            logger.info("Triggered save_episodic_memory_task asynchronously")
+        except Exception as t_err:
+            logger.error(f"Failed to trigger save_episodic_memory_task: {t_err}")
 
     # Return full response (tool_calls + run_id are additive optional keys;
     # sync /chat/complete callers ignore them, async poll passes them through).

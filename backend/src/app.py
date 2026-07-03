@@ -4,7 +4,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import redis.asyncio as aioredis
 from celery.result import AsyncResult
@@ -19,6 +19,7 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
 from models import (
     delete_user_conversations,
+    delete_user_episodes,
     ensure_database_schema,
     insert_document,
     list_documents,
@@ -45,6 +46,7 @@ from semantic_cache import (
     maybe_wipe_legacy_cache,
     SCOPE_USER_PREFIX,
 )
+from rlhf_store import init_rlhf_collection, save_feedback
 
 # Constants
 TASK_TIMEOUT = 60
@@ -76,6 +78,11 @@ async def lifespan(app: FastAPI):
             logger.info("Created Qdrant collection 'user_episodes' for Episodic Memory.")
     except Exception as e:
         logger.warning(f"Could not initialize user_episodes collection on startup: {e}")
+    # Phase 4 — RLHF good-answers collection (best-effort, non-blocking).
+    try:
+        init_rlhf_collection()
+    except Exception as e:
+        logger.warning(f"Could not initialize rlhf_good_answers collection on startup: {e}")
     yield
     # Shutdown: no explicit cleanup needed currently.
 
@@ -136,6 +143,24 @@ class PipelineIngestRequest(BaseModel):
     use_semantic: bool = True
 
 
+class FeedbackRequest(BaseModel):
+    """RLHF 👍/👎 on an assistant message (Phase 4).
+
+    ``user_id`` is required and must be a real per-user id — sentinel/empty
+    ids are rejected by ``rlhf_store.save_feedback`` (no cross-user feedback
+    leak). ``question``/``response``/``sources`` are echoed back by the client
+    from the message being rated so the store can reuse them as few-shot /
+    rerank signal without re-fetching.
+    """
+    user_id: str
+    conversation_id: Optional[str] = None
+    message_id: Optional[str] = None
+    rating: str = Field(..., pattern=r"^(good|bad)$")
+    question: str = Field(..., min_length=1)
+    response: str = Field(..., min_length=1)
+    sources: Optional[List[Dict[str, Any]]] = []
+
+
 @app.get("/")
 async def root():
     return {"message": "Hello World"}
@@ -144,6 +169,31 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy", "service": "Vietnamese Legal Chatbot Backend"}
+
+
+@app.post("/feedback")
+async def feedback(data: FeedbackRequest):
+    """RLHF 👍/👎 endpoint (Phase 4). Stores feedback user-scoped.
+
+    Sentinel/empty ``user_id`` is rejected (HTTP 400) — feedback requires a
+    real per-user scope so a user's 👍 never leaks into another user's
+    few-shot / rerank signal. Invalid rating is rejected by the pydantic
+    pattern. All downstream persistence failures are swallowed inside
+    ``save_feedback`` (returns 200 with a status string) so the frontend
+    click never errors the UX.
+    """
+    status = save_feedback(
+        user_id=data.user_id,
+        conversation_id=data.conversation_id or "",
+        message_id=data.message_id or "",
+        question=data.question,
+        response=data.response,
+        sources=data.sources or [],
+        rating=data.rating,
+    )
+    if status == "rejected_sentinel":
+        raise HTTPException(status_code=400, detail="login required to submit feedback")
+    return {"ok": True, "status": status}
 
 
 @app.get("/stats")
@@ -202,12 +252,23 @@ async def delete_history(user_id: str, bot_id: str = "botLawyer"):
     Purges, per user:
       - Redis conversation-id mapping (clear_conversation_id)
       - DB conversation rows (delete_user_conversations)
+      - DB episodic facts (delete_user_episodes)
       - Qdrant semantic-cache entries scoped to this user
       - Qdrant user_episodes (long-term episodic facts)
-      - In-process rolling-summary + memory buffers (this process only)
+      - In-process rolling-summary + memory buffers (this process + worker)
     Without the Qdrant + episodic clears the agent would keep recalling old
     facts/answers even after the user wiped their history.
     """
+    # Sentinel guard: a shared placeholder id maps EVERY such client to one
+    # bucket, so /history/anonymous would wipe OTHER anonymous users' facts.
+    # Reject so a wipe can only touch a real per-browser identity.
+    if (user_id or "").strip() in _SHARED_USER_SENTINELS:
+        raise HTTPException(
+            status_code=400,
+            detail="Không thể xóa lịch sử cho user_id dùng chung (anonymous/demo-session). "
+            "Vui lòng dùng tên người dùng riêng.",
+        )
+
     logger.info(f"Deleting history for user {user_id} and bot {bot_id}")
 
     # Clear session from cache (Redis conversation-id mapping)
@@ -215,6 +276,10 @@ async def delete_history(user_id: str, bot_id: str = "botLawyer"):
 
     # Clear records from database
     db_cleared = delete_user_conversations(user_id)
+
+    # Clear long-term episodic facts from MySQL (mirrors the Qdrant purge below
+    # — without this, facts survive in the DB and can resurface later).
+    db_episodes_cleared = delete_user_episodes(user_id)
 
     # Clear per-user semantic cache (Qdrant). Best-effort: a Qdrant outage
     # must not block the rest of the wipe.
@@ -256,6 +321,7 @@ async def delete_history(user_id: str, bot_id: str = "botLawyer"):
         "status": "success",
         "cache_cleared": cache_cleared,
         "db_cleared": db_cleared,
+        "db_episodes_cleared": db_episodes_cleared,
         "semantic_cache_cleared": semantic_cleared,
         "episodic_cleared": episodic_cleared,
         "runtime_caches_cleared": runtime_cleared,
@@ -321,8 +387,19 @@ async def complete(data: CompleteRequest):
             "sources": response.get("sources", [])
         }
     else:
-        task = llm_handle_message.delay(bot_id, user_id, user_message)
-        return {"task_id": task.id}
+        try:
+            task = llm_handle_message.delay(bot_id, user_id, user_message)
+            return {"task_id": task.id}
+        except Exception as broker_err:
+            # Broker/broker-down: fall back to the in-process sync path so a
+            # transient Redis/Celery outage does not hard-500 a chat that the
+            # sync handler could still serve.
+            logger.warning(f"[CHAT] broker dispatch failed, falling back to sync: {broker_err}")
+            response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message)
+            return {
+                "response": response.get("content", ""),
+                "sources": response.get("sources", []),
+            }
 
 
 @app.get("/chat/complete/{task_id}")

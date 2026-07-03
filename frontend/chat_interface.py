@@ -25,13 +25,18 @@ if "session_id" not in st.session_state:
 st.sidebar.title("⚙️ Cấu hình & Lịch sử")
 
 # User ID input — each name is its own isolated session. Empty by default
-# so no two users accidentally share a sentinel id.
-st.session_state.session_id = st.sidebar.text_input(
+# so no two users accidentally share a sentinel id. Only adopt the widget
+# value when non-empty, so clearing the field mid-task does NOT reset
+# session_id to "" and break the in-flight task poll (which still runs
+# against the prior valid id).
+_input_id = st.sidebar.text_input(
     "Tên người dùng / Session ID",
     value=st.session_state.session_id,
     placeholder="Nhập tên riêng (vd: snake) để bắt đầu",
     help="Mỗi tên là một phiên riêng. Đừng dùng chung tên nếu không muốn lộ thông tin.",
 )
+if _input_id.strip():
+    st.session_state.session_id = _input_id.strip()
 
 # Clear History button
 if st.sidebar.button("🗑️ Xóa lịch sử cuộc trò chuyện"):
@@ -243,6 +248,50 @@ if st.button("Gui") and prompt.strip():
                     for idx, src in enumerate(sources):
                         content_text = src.get('content') or src.get('text') or ''
                         st.markdown(f"**Tài liệu {idx+1}:** {content_text[:300]}...")
+
+            # Phase 4 — RLHF 👍/👎 feedback. Sent per-user (session_id) so the
+            # backend can store it user-scoped and reuse good answers as
+            # few-shot / rerank signal. Sentinel/empty ids are rejected server-side.
+            _resp_text = task_result.get("content", "")
+            fb_col1, fb_col2, _ = st.columns([1, 1, 6])
+            with fb_col1:
+                if st.button("👍", key=f"fb_good_{task_id}", help="Câu trả lời này tốt"):
+                    try:
+                        requests.post(
+                            f"{BACKEND_URL}/feedback",
+                            json={
+                                "user_id": st.session_state.session_id,
+                                "conversation_id": task_id,
+                                "message_id": task_id,
+                                "rating": "good",
+                                "question": prompt.strip(),
+                                "response": _resp_text,
+                                "sources": sources,
+                            },
+                            timeout=10,
+                        )
+                        st.toast("Cảm ơn bạn đã đánh giá! 👍")
+                    except requests.RequestException as fb_exc:
+                        st.toast(f"Lỗi gửi đánh giá: {fb_exc}")
+            with fb_col2:
+                if st.button("👎", key=f"fb_bad_{task_id}", help="Câu trả lời này chưa tốt"):
+                    try:
+                        requests.post(
+                            f"{BACKEND_URL}/feedback",
+                            json={
+                                "user_id": st.session_state.session_id,
+                                "conversation_id": task_id,
+                                "message_id": task_id,
+                                "rating": "bad",
+                                "question": prompt.strip(),
+                                "response": _resp_text,
+                                "sources": sources,
+                            },
+                            timeout=10,
+                        )
+                        st.toast("Cảm ơn phản hồi — chúng tôi sẽ cải thiện. 👎")
+                    except requests.RequestException as fb_exc:
+                        st.toast(f"Lỗi gửi đánh giá: {fb_exc}")
 
     except requests.RequestException as exc:
         st.error(f"Yêu cầu thất bại: {exc}")

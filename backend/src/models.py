@@ -162,6 +162,26 @@ def delete_user_conversations(user_id: str):
         db.close()
 
 
+def delete_user_episodes(user_id: str) -> bool:
+    """Delete all long-term episodic facts (MySQL UserEpisode rows) for a user.
+
+    Mirrors the Qdrant user_episodes purge so a history wipe also removes the
+    facts that resurface via get_user_episodes. Without this, deleted-conversation
+    facts survive in MySQL and can be re-embedded/surfaced later.
+    """
+    db = _new_db_session()
+    try:
+        db.execute(delete(UserEpisode).where(UserEpisode.user_id == user_id))
+        db.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Error deleting user episodes: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
 class Document(Base):
     __tablename__ = "document"
 
@@ -190,6 +210,26 @@ class UserEpisode(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(String(100), nullable=False, index=True)
     summary = Column(String)  # Summary of episodic interaction
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AgentFeedback(Base):
+    """RLHF user-feedback store (Phase 4). Mirror of 👍/👎 on an assistant
+    message. Auto-created by ``ensure_database_schema`` (create_all). The
+    Qdrant ``rlhf_good_answers`` collection (see ``rlhf_store``) holds the
+    good answers used for few-shot injection + rerank up-weighting; this
+    table is the durable MySQL audit trail for ALL feedback (good + bad).
+    """
+    __tablename__ = "agent_feedback"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(100), index=True)
+    conversation_id = Column(String(100), index=True)
+    message_id = Column(String(100))
+    question = Column(String)
+    response = Column(String)
+    sources_json = Column(JSON)
+    rating = Column(String(10))  # "good" | "bad"
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 

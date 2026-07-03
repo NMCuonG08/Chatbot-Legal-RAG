@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from brain import get_embedding
 from config import DEFAULT_COLLECTION_NAME
 from legal_metadata import extract_legal_metadata
+from legal_graph_ingest import add_to_graph
 from search import initialize_search_index
 from splitter import split_document
 from utils import setup_logging
@@ -241,6 +242,10 @@ def import_qa_data(
                             # Enrich with structured law_name/article_number for exact-field
                             # retrieval. Only recognized keys are added (no null pollution).
                             payload.update(extract_legal_metadata(f"{question} {text_val}"))
+                            # Phase 3 — write Statute->Article to Neo4j graph memory.
+                            # Best-effort + idempotent (MERGE): no-op when graph
+                            # is down/absent, never blocks vector ingest.
+                            add_to_graph(cid, text_val, payload)
                             vectors_payload[cid] = {
                                 "vector": vector,
                                 "payload": payload,
@@ -364,6 +369,10 @@ def import_qa_data(
                         # Enrich with structured law_name/article_number for exact-field
                         # retrieval. Only recognized keys are added (no null pollution).
                         payload.update(extract_legal_metadata(f"{question} {text_val}"))
+                        # Phase 3 — write Statute->Article to Neo4j graph memory.
+                        # Best-effort + idempotent (MERGE): no-op when graph is
+                        # down/absent, never blocks vector ingest.
+                        add_to_graph(cid, text_val, payload)
                         vectors_payload[cid] = {
                             "vector": vector,
                             "payload": payload,

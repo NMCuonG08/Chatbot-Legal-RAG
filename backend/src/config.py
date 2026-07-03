@@ -7,3 +7,23 @@ REFLECTION_MAX = 2
 DOC_GRADE_THRESHOLD = 0.35
 # If fewer than this many docs are relevant, consider retrieval "all irrelevant".
 ALL_IRRELEVANT_THRESHOLD = 1
+
+# ---- PEV verify_answer (final-answer groundedness gate) ----
+# Max verify->rewrite_query recovery loops before degrading to metacognitive.
+VERIFY_MAX_RETRIES = 2
+# evaluate_faithfulness score >= this -> verdict "supported" (pass the gate).
+VERIFY_ANSWER_THRESHOLD = 0.7
+# score >= this (but < supported) -> verdict "partial"; below -> "unsupported".
+VERIFY_PARTIAL_THRESHOLD = 0.35
+
+# ---- Metacognitive escalation (Phase 2) ----
+# On a MEDIUM-stakes question, escalate to "consult a lawyer" only when the
+# verify_answer confidence (groundedness score) drops below this threshold.
+# HIGH-stakes questions always escalate regardless of confidence.
+ESCALATION_CONFIDENCE_THRESHOLD = 0.6
+
+# ---- RLHF rerank up-weight (Phase 4) ----
+# Additive boost applied to a chunk's relevance_score when its doc_id backs a
+# 👍-marked answer for the current user. Small so a good-answer source wins
+# ties without overriding a clearly-more-relevant chunk.
+RLHF_RERANK_BOOST = 0.05

@@ -22,6 +22,21 @@ services:
       - "6333:6333"
       - "6334:6334"
 
+  # Phase 3 — Neo4j legal knowledge graph. Optional: only needed when
+  # NEO4J_URI is set in backend/.env. Best-effort: backend runs without it.
+  neo4j:
+    image: neo4j:5.20
+    environment:
+      NEO4J_AUTH: neo4j/neo4j
+    ports:
+      - "7474:7474"   # browser UI
+      - "7687:7687"   # bolt
+    volumes:
+      - neo4j_data:/data
+
+volumes:
+  neo4j_data:
+
   backend:
     build:
       context: ./backend

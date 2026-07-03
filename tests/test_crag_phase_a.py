@@ -95,6 +95,10 @@ def _patch_heavy(monkeypatch, *, relevant):
     monkeypatch.setattr(tasks, "gen_doc_prompt", lambda docs: "CTX")
     monkeypatch.setattr(tasks, "vietnamese_llm_chat_complete", lambda msgs: "RAG_ANSWER")
     monkeypatch.setattr(tasks, "rewrite_query_with_context", lambda q, history: q + "_rewritten")
+    # PEV verify_answer gate: pin to "supported" so the happy path does not
+    # trigger a recovery loop or make a real judge LLM call. Verify is tested
+    # separately in test_verify_answer.py.
+    monkeypatch.setattr(tasks, "judge_answer", lambda q, a, s: {"score": 1.0, "rationale": "mock", "verdict": "supported"})
     # Neutralize guardrails to avoid async/NeMo in unit tests.
     tasks.guardrails_manager.initialized = False
 

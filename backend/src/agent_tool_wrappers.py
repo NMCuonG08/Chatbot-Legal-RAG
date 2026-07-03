@@ -14,6 +14,7 @@ import logging
 from llama_index.core.tools import FunctionTool
 
 from agent_tool_tracking import track_tool_call
+from legal_graph_tools import recall_legal_graph_tool
 from legal_tools import (
     calculate_contract_penalty,
     calculate_inheritance_share,
@@ -661,6 +662,9 @@ def recall_user_memory_tool(query: str, limit: int = 3) -> str:
 
 recall_user_memory_func_tool = FunctionTool.from_defaults(fn=recall_user_memory_tool)
 
+# Phase 3 — Neo4j legal knowledge-graph recall (multi-hop citation traversal).
+recall_legal_graph_func_tool = FunctionTool.from_defaults(fn=recall_legal_graph_tool)
+
 # All available tools for agent
 all_tools = [
     # Legal calc tools
@@ -696,4 +700,6 @@ all_tools = [
     current_time_tool,
     # Long-term memory recall
     recall_user_memory_func_tool,
+    # Phase 3 — Neo4j graph recall (multi-hop citation traversal)
+    recall_legal_graph_func_tool,
 ]

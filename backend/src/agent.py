@@ -8,6 +8,7 @@ per-run tool-call tracker (``agent_tool_calls``, ``track_tool_call``) lives in
 """
 
 import asyncio
+import threading
 import inspect
 import logging
 import os
@@ -239,17 +240,23 @@ _AGENT_MEMORY_CAP = 32
 def get_agent_memory(user_id: Optional[str], conversation_id: Optional[str]) -> ChatMemoryBuffer:
     """Return (creating if needed) the ChatMemoryBuffer for a (user, conversation).
 
-    LRU-evicts the oldest entry once the cap is exceeded.
+    LRU-evicts the oldest entry once the cap is exceeded. Thread-safe via
+    ``_memory_lock`` so concurrent runs cannot corrupt the LRU order.
     """
     key = (user_id, conversation_id)
-    mem = _agent_memories.get(key)
-    if mem is None:
-        mem = ChatMemoryBuffer.from_defaults(token_limit=8192)
-        _agent_memories[key] = mem
-        _agent_memories.move_to_end(key)
-        if len(_agent_memories) > _AGENT_MEMORY_CAP:
-            evicted_key, _ = _agent_memories.popitem(last=False)
-            logger.info(f"[AGENT] Evicted oldest agent memory for key={evicted_key}")
+    with _memory_lock:
+        mem = _agent_memories.get(key)
+        if mem is None:
+            mem = ChatMemoryBuffer.from_defaults(token_limit=8192)
+            _agent_memories[key] = mem
+            _agent_memories.move_to_end(key)
+            if len(_agent_memories) > _AGENT_MEMORY_CAP:
+                evicted_key, _ = _agent_memories.popitem(last=False)
+                logger.info(f"[AGENT] Evicted oldest agent memory for key={evicted_key}")
+        else:
+            # LRU: touch on read so a long-lived, frequently-read conversation
+            # is not evicted while cold conversations occupy the tail.
+            _agent_memories.move_to_end(key)
     return mem
 
 
@@ -265,14 +272,15 @@ def clear_user_runtime_caches(user_id: Optional[str], conversation_id: Optional[
     call this from the worker too (or restart it) for a full purge.
     """
     removed = 0
-    for store in (_agent_memories, _conv_summaries, _conv_summarized_counts):
-        keys_to_drop = [
-            (u, c) for (u, c) in list(store.keys())
-            if u == user_id and (conversation_id is None or c == conversation_id)
-        ]
-        for k in keys_to_drop:
-            store.pop(k, None)
-            removed += 1
+    with _memory_lock:
+        for store in (_agent_memories, _conv_summaries, _conv_summarized_counts):
+            keys_to_drop = [
+                (u, c) for (u, c) in list(store.keys())
+                if u == user_id and (conversation_id is None or c == conversation_id)
+            ]
+            for k in keys_to_drop:
+                store.pop(k, None)
+                removed += 1
     logger.info(
         f"[AGENT] Cleared runtime caches for user={user_id} "
         f"conv={conversation_id} entries_removed={removed}"
@@ -287,6 +295,12 @@ def clear_user_runtime_caches(user_id: Optional[str], conversation_id: Optional[
 _conv_summaries: "OrderedDict[Tuple[Optional[str], Optional[str]], str]" = OrderedDict()
 _conv_summarized_counts: "OrderedDict[Tuple[Optional[str], Optional[str]], int]" = OrderedDict()
 _CONV_SUMMARY_CAP = 32
+
+# Guards the three module-level OrderedDicts below: ai_agent_handle runs in a
+# thread (asyncio.to_thread in the web process, or a Celery thread/gevent
+# pool) and CPython OrderedDict mutations (move_to_end/popitem/pop/__setitem__)
+# are not atomic, so concurrent runs could corrupt LRU order or lose entries.
+_memory_lock = threading.Lock()
 
 # Memory strategy constants (senior-grade hybrid: short-term raw + rolling
 # structured summary + long-term RAG recall via recall_user_memory_tool).
@@ -364,15 +378,20 @@ def _summarize_chat_history(
     if not old_turns:
         return "", short_term_raw
 
-    already = _conv_summarized_counts.get(key, 0)
+    with _memory_lock:
+        already = _conv_summarized_counts.get(key, 0)
+        prev_summary = _conv_summaries.get(key, "")
     # Periodic full re-summary from raw to correct incremental drift.
     full_resummary = len(prior_msgs) % _RESUMMARY_INTERVAL == 0
     needs_update = full_resummary or len(old_turns) > already
 
     if not needs_update:
-        return _conv_summaries.get(key, ""), short_term_raw
-
-    prev_summary = _conv_summaries.get(key, "")
+        # LRU touch on read so the active conversation is not evicted while
+        # cold ones occupy the tail; keeps the two stores' ordering in sync.
+        with _memory_lock:
+            _conv_summaries.move_to_end(key)
+            _conv_summarized_counts.move_to_end(key)
+        return prev_summary, short_term_raw
     if full_resummary:
         # Re-summarize ALL older turns from raw (drift correction).
         new_turn_text = "\n".join(
@@ -412,13 +431,18 @@ def _summarize_chat_history(
         resp = _llm.complete(prompt)
         summary = str(getattr(resp, "text", resp) or "").strip()
         if summary:
-            _conv_summaries[key] = summary
-            _conv_summaries.move_to_end(key)
-            _conv_summarized_counts[key] = len(old_turns)
-            _conv_summarized_counts.move_to_end(key)
-            if len(_conv_summaries) > _CONV_SUMMARY_CAP:
-                ev_k, _ = _conv_summaries.popitem(last=False)
-                _conv_summarized_counts.pop(ev_k, None)
+            with _memory_lock:
+                _conv_summaries[key] = summary
+                _conv_summaries.move_to_end(key)
+                _conv_summarized_counts[key] = len(old_turns)
+                _conv_summarized_counts.move_to_end(key)
+                if len(_conv_summaries) > _CONV_SUMMARY_CAP:
+                    ev_k, _ = _conv_summaries.popitem(last=False)
+                    _conv_summarized_counts.pop(ev_k, None)
+                # Cap the counts store symmetrically so it cannot drift past
+                # _CONV_SUMMARY_CAP (it has no independent cap otherwise).
+                if len(_conv_summarized_counts) > _CONV_SUMMARY_CAP:
+                    _conv_summarized_counts.popitem(last=False)
         return summary or prev_summary, short_term_raw
     except Exception as e:
         logger.warning(f"[AGENT] History summary failed: {e}")
@@ -488,6 +512,14 @@ def filter_tools_for_query(query: str, history: Optional[List[Dict]] = None) -> 
         selected.append("precedent_lookup_func_tool")
         selected.append("cross_reference_func_tool")
         selected.append("verify_citation_func_tool")
+
+    # 3b. Neo4j graph recall — multi-hop citation traversal (Phase 3). Better
+    # fit than vector search for "điều nào dẫn chiếu", "còn hiệu lực không",
+    # "bác bỏ bởi luật nào", or enumerating a statute's articles.
+    if any(kw in scan_text for kw in ["dẫn chiếu", "dẫn chứng", "bác bỏ",
+                                     "còn hiệu lực", "điều nào", "tham chiếu",
+                                     "chuỗi dẫn chiếu"]):
+        selected.append("recall_legal_graph_func_tool")
         
     # Always include safety disclaimer (crucial for legal agent)
     selected.append("legal_disclaimer_func_tool")
@@ -604,9 +636,11 @@ def ai_agent_handle(
             )
 
         # memory is kept only for the legacy from_tools branch of _build_react_agent.
-        # The workflow ReActAgent does not use it; history (DB-sourced) drives
-        # short-term raw + rolling summary instead.
-        memory = get_agent_memory(user_id, conversation_id)
+        # The workflow ReActAgent (llama_index >=0.12) ignores it; history
+        # (DB-sourced) drives short-term raw + rolling summary instead. Only
+        # populate the buffer when the legacy branch will actually read it, so
+        # we don't mutate/evict _agent_memories for a buffer that is never used.
+        memory = get_agent_memory(user_id, conversation_id) if hasattr(ReActAgent, "from_tools") else None
 
         # Hybrid memory: short-term raw (last turns verbatim) + rolling structured
         # summary of older turns (grounding only). The current question is the

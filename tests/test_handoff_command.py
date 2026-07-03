@@ -39,6 +39,9 @@ def _patch_retrieve(monkeypatch):
     monkeypatch.setattr(tasks, "_retrieve_episodic_context", lambda user_id, q: "")
     monkeypatch.setattr(tasks, "gen_doc_prompt", lambda docs: "CTX")
     monkeypatch.setattr(tasks, "rewrite_query_with_context", lambda q, history: q + "_rw")
+    # PEV verify_answer gate: pin to "supported" so it never triggers a recovery
+    # loop here — these tests assert handoff behavior, not verify behavior.
+    monkeypatch.setattr(tasks, "judge_answer", lambda q, a, s: {"score": 1.0, "rationale": "mock", "verdict": "supported"})
     tasks.guardrails_manager.initialized = False
 
 

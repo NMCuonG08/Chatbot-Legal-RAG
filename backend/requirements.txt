@@ -20,4 +20,5 @@ qdrant-client==1.11.1
 llama-index-llms-groq
 sentence-transformers
 prometheus-fastapi-instrumentator>=6.0.0
+neo4j>=5.20
 

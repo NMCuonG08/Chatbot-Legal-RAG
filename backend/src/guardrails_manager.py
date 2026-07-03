@@ -3,6 +3,8 @@ from pathlib import Path
 import asyncio
 from typing import Dict, List, Any, Optional
 
+from metacognitive import HIGH_STAKES_KEYWORDS
+
 logger = logging.getLogger(__name__)
 
 class LegalGuardrailsManager:
@@ -200,15 +202,10 @@ class LegalGuardrailsManager:
             return response_text
 
     # Topics that require a licensed lawyer — the chatbot must escalate,
-    # not advise. Kept here (not imported from legal_knowledge_tools) to
-    # avoid a circular import: guardrails_manager is imported by tasks.py
-    # which also imports the agent which imports legal_knowledge_tools.
-    _ESCALATION_TOPICS = [
-        "bào chữa", "khởi tố hình sự", "truy tố", "tội danh",
-        "trộm cắp", "giết người", "cố ý gây thương tích",
-        "mua bán ma túy", "chống người thi hành công vụ",
-        "phúc thẩm hình sự", "thi hành án hình sự", "tử hình",
-    ]
+    # not advise. Canonical list now lives in metacognitive.HIGH_STAKES_KEYWORDS
+    # (single source of truth, shared with the metacognitive graph node);
+    # re-aliased here so existing self._ESCALATION_TOPICS references keep working.
+    _ESCALATION_TOPICS = HIGH_STAKES_KEYWORDS
 
     def add_legal_disclaimer(self, text: str, question: Optional[str] = None) -> str:
         """Append a legal disclaimer; escalate to a lawyer referral when the
