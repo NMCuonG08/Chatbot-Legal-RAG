@@ -409,6 +409,20 @@ def import_qa_data(
         logger.warning("⚠️ No documents collected for search index!")
 
     logger.info("🏁 IMPORT FUNCTION COMPLETED!")
+
+    # On a full reset/reindex, cached answers were grounded in the OLD corpus
+    # and are now stale. Wipe the semantic cache so subsequent queries recompute
+    # against the freshly indexed documents. Best-effort, never blocks the
+    # successful import. Covers BOTH the CLI (main) and the API endpoint path
+    # (which calls import_qa_data directly and bypasses main).
+    if reset:
+        try:
+            from semantic_cache import clear_semantic_cache
+            wiped = clear_semantic_cache()
+            logger.info(f"🧹 Semantic cache wiped after reset reindex: {wiped} stale entries removed.")
+        except Exception as cache_err:
+            logger.warning(f"⚠️ Could not wipe semantic cache after reset: {cache_err}")
+
     return True
 
 
@@ -469,6 +483,16 @@ def main():
 
     if success:
         logger.info("Import completed successfully!")
+        # Wipe the semantic cache after a successful reindex: cached answers
+        # were grounded in the OLD document set and may now be stale/wrong
+        # against the freshly indexed corpus. Best-effort — never block import
+        # on cache cleanup.
+        try:
+            from semantic_cache import clear_semantic_cache
+            wiped = clear_semantic_cache()
+            logger.info(f"Semantic cache wiped after reindex: {wiped} stale entries removed.")
+        except Exception as cache_err:
+            logger.warning(f"Could not wipe semantic cache after reindex: {cache_err}")
         sys.exit(0)
     else:
         logger.error("Import failed!")

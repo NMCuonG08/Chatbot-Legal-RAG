@@ -37,7 +37,12 @@ from tasks import index_document_v2, llm_handle_message
 from database import settings as db_settings
 from utils import setup_logging
 from vectorize import create_collection, list_collection_points, list_collections
-from semantic_cache import clear_semantic_cache, init_semantic_cache
+from semantic_cache import (
+    clear_semantic_cache,
+    get_cache_stats,
+    init_semantic_cache,
+    maybe_wipe_legacy_cache,
+)
 
 # Constants
 TASK_TIMEOUT = 60
@@ -52,6 +57,15 @@ async def lifespan(app: FastAPI):
     # Startup
     ensure_database_schema()
     init_semantic_cache()
+    # One-time deploy migration: wipe legacy unscoped cache points so the new
+    # per-user scope filter starts from a clean slate. No-op unless
+    # SEMANTIC_CACHE_WIPE_LEGACY=1 is set in the environment.
+    try:
+        wiped = maybe_wipe_legacy_cache()
+        if wiped:
+            logger.info(f"Legacy cache wipe deleted {wiped} points.")
+    except Exception as e:
+        logger.warning(f"Legacy cache wipe failed (non-fatal): {e}")
     try:
         from vectorize import create_collection, list_collections
         existing = [c["name"] for c in list_collections()]
@@ -128,6 +142,31 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy", "service": "Vietnamese Legal Chatbot Backend"}
+
+
+@app.get("/stats")
+async def stats():
+    """Lightweight observability snapshot for ops / alerter scrape.
+
+    Exposes in-process counters: semantic-cache hit/miss/error rates +
+    error-skip (poisoning-prevention) counts, and router route distribution.
+    Counters reset on process restart. Intended for an external alerter to
+    detect cache-down (error spike) or hit-rate collapse, not a full metrics
+    backend (Prometheus /metrics already covers HTTP-level signals).
+    """
+    try:
+        cache = get_cache_stats()
+    except Exception as e:
+        logger.warning(f"/stats cache stats failed: {e}")
+        cache = {"error": str(e)}
+    try:
+        from brain import get_route_stats
+
+        routes = get_route_stats()
+    except Exception as e:
+        logger.warning(f"/stats route stats failed: {e}")
+        routes = {"error": str(e)}
+    return {"cache": cache, "routes": routes}
 
 
 @app.get("/collections")

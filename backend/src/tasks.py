@@ -449,7 +449,7 @@ def generate_rag_answer(history, question, user_id=None):
 5. Luôn đưa ra câu trả lời có căn cứ pháp lý
 
 QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung cấp bên dưới.
-LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG bao giờ tóm tắt, nhắc lại hay mô tả lại thông tin lịch sử của người dùng; ngữ cảnh lịch sử (nếu có) chỉ là gợi ý phụ để cá nhân hóa, tuyệt đối không dùng làm nội dung chính của câu trả lời."""
+LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG bao giờ tóm tắt, nhắc lại hay mô tả lại thông tin lịch sử của người dùng; ngữ cảnh lịch sử (nếu có) chỉ là gợi ý phụ để cá nhân hóa, tuyệt đối không dùng làm nội dung chính của câu trả lời.""" + _date_context_block()
 
     doc_context = gen_doc_prompt(ranked_docs)
 
@@ -499,12 +499,26 @@ def generate_agent_answer(history, question, user_id=None, conversation_id=None)
     return answer, tool_calls
 
 
+def _date_context_block() -> str:
+    """Grounding block: injects current date so the LLM never hallucinates
+    a stale year (e.g. answering 'năm nay' with a training-cutoff year).
+    Used by every generation node that may answer time-dependent questions."""
+    from datetime import datetime
+    today = datetime.now()
+    return (
+        f"\n\nTHÔNG TIN THỜI GIAN: Hôm nay là {today.strftime('%d/%m/%Y')} "
+        f"(năm {today.year}). Khi câu hỏi phụ thuộc thời gian — tính tuổi, "
+        f"thời hiệu khởi kiện, hiệu lực văn bản, lương tối thiểu vùng, văn bản "
+        f"mới ban hành — PHẢI dùng mốc này, tuyệt đối KHÔNG dùng năm khác."
+    )
+
+
 def generate_web_search_answer(history, question):
     logger.info("Using Tavily web search for query")
     search_results = tavily_search_legal(question, max_results=5)
 
     system_prompt = """Bạn là trợ lý AI giúp tìm kiếm thông tin pháp luật trên internet.
-    Hãy tổng hợp và trả lời câu hỏi dựa trên kết quả tìm kiếm được cung cấp."""
+    Hãy tổng hợp và trả lời câu hỏi dựa trên kết quả tìm kiếm được cung cấp.""" + _date_context_block()
 
     openai_messages = (
         [{"role": "system", "content": system_prompt}]
@@ -530,7 +544,7 @@ Bạn có thể:
 - Trả lời câu hỏi về luật pháp Việt Nam
 - Tính toán phí phạt, chia thừa kế, kiểm tra tuổi pháp lý
 - Tìm kiếm thông tin pháp luật mới trên internet
-- Hướng dẫn thủ tục pháp lý"""
+- Hướng dẫn thủ tục pháp lý""" + _date_context_block()
 
     openai_messages = (
         [{"role": "system", "content": system_prompt}]
@@ -669,7 +683,7 @@ def _build_chat_graph():
 5. Luôn đưa ra câu trả lời có căn cứ pháp lý
 
 QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung cấp bên dưới.
-LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG bao giờ tóm tắt, nhắc lại hay mô tả lại thông tin lịch sử của người dùng; ngữ cảnh lịch sử (nếu có) chỉ là gợi ý phụ để cá nhân hóa, tuyệt đối không dùng làm nội dung chính của câu trả lời."""
+LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG bao giờ tóm tắt, nhắc lại hay mô tả lại thông tin lịch sử của người dùng; ngữ cảnh lịch sử (nếu có) chỉ là gợi ý phụ để cá nhân hóa, tuyệt đối không dùng làm nội dung chính của câu trả lời.""" + _date_context_block()
 
         doc_context = gen_doc_prompt(ranked_docs)
 
@@ -1121,7 +1135,7 @@ def llm_handle_message(self, bot_id, user_id, question):
         if _dir not in sys.path:
             sys.path.insert(0, _dir)
         from semantic_cache import get_cached_response, set_cached_response
-        cached = get_cached_response(question)
+        cached = get_cached_response(question, user_id)
         if cached:
             logger.info("Semantic Cache HIT - returning cached response directly")
             update_chat_conversation(bot_id, user_id, cached["response"], False)
@@ -1193,8 +1207,14 @@ def llm_handle_message(self, bot_id, user_id, question):
             _dir = os.path.dirname(os.path.abspath(__file__))
             if _dir not in sys.path:
                 sys.path.insert(0, _dir)
-            from semantic_cache import set_cached_response
-            set_cached_response(question, response_text, sources)
+            from semantic_cache import set_cached_response, SCOPE_COMMON
+            # Scope the cache per-user for privacy: legal_rag/agent_tools/web_search
+            # answers may carry the user's private facts, so they must never leak to
+            # another user. Only general_chat greetings opt into the shared
+            # "common" scope to keep hit rate for non-private small talk.
+            route = graph_result.get("route") if not blocked_response else None
+            cache_scope = SCOPE_COMMON if route == "general_chat" else None
+            set_cached_response(question, response_text, sources, user_id, scope=cache_scope)
         except Exception as cache_err:
             logger.exception("Semantic Cache save failed")
 

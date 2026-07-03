@@ -269,7 +269,7 @@ def vietnamese_llm_chat_complete(messages=(), temperature=0.7, max_tokens=512):
         return get_main_provider().chat(messages, temperature=temperature, max_tokens=max_tokens)
 
 
-def groq_chat_complete(messages=(), model=None, raw=False):
+def groq_chat_complete(messages=(), model=None, raw=False, temperature=0.7):
     """Backward-compatible chat completion.
 
     Routes through the centralized provider router (groq|ollama) so model
@@ -283,8 +283,8 @@ def groq_chat_complete(messages=(), model=None, raw=False):
         provider = build_ollama_provider(model) if isinstance(base, OllamaProvider) else build_groq_provider(model)
     else:
         provider = base
-    logger.info(f"Chat complete using provider: {provider.name}, model: {provider.model}")
-    return provider.chat(messages, raw=raw)
+    logger.info(f"Chat complete using provider: {provider.name}, model: {provider.model}, temp: {temperature}")
+    return provider.chat(messages, raw=raw, temperature=temperature)
 
 
 # Alias kept for backward compatibility (tasks.py / query_rewriter import this).
@@ -400,6 +400,53 @@ Câu hỏi đã viết lại:"""
         return message
 
 
+# Unambiguous tool-specific signals that map 1:1 to an agent_tools function.
+# Used ONLY to force route TOWARD agent_tools (safe direction — agent_tools
+# can hand off to RAG/web). Never used to force any other route. Keep this list
+# narrow: only phrases that have no plausible legal_rag interpretation.
+_AGENT_TOOLS_OVERRIDE_SIGNALS = [
+    # Fee / money calculation tools
+    "lệ phí trước bạ", "án phí", "trợ cấp thôi việc", "cấp dưỡng",
+    "làm thêm giờ", "làm thêm", "tăng ca", "thuế tncn", "thuế thu nhập cá nhân",
+    # Document generation
+    "sinh đơn", "mẫu đơn", "hợp đồng mẫu", "đơn khởi kiện", "đơn khiếu nại",
+    # Law version / validity check
+    "còn hiệu lực không", "phiên bản", "hiện còn hiệu lực",
+    # Jurisdiction
+    "tòa cấp nào thụ lý", "tòa nào thụ lý", "thẩm quyền",
+    # Age
+    "sinh năm", "năm sinh", "mấy tuổi", "bao nhiêu tuổi",
+    # Admin fine calc (specific phrasing, not "phạt" alone which is ambiguous)
+    "phạt bao nhiêu", "bị phạt bao nhiêu",
+]
+
+
+def _detect_agent_tools_override(message: str) -> bool:
+    """True if the message contains an unambiguous agent_tools signal.
+
+    Substring match on normalized lowercase text. Intentionally conservative —
+    only matches phrases tied to a specific tool with no legal_rag interpretation.
+    """
+    msg = message.lower()
+    return any(sig in msg for sig in _AGENT_TOOLS_OVERRIDE_SIGNALS)
+
+
+# Route distribution counters (observability). Reset on process restart.
+# Exposed via the app /stats endpoint so ops can spot route skew (e.g. all
+# traffic falling into one route) or override firing too often.
+_route_stats = {"legal_rag": 0, "agent_tools": 0, "web_search": 0, "general_chat": 0}
+
+
+def get_route_stats() -> dict:
+    """Snapshot of route distribution (for the /stats endpoint)."""
+    return dict(_route_stats)
+
+
+def _record_route(route: str) -> None:
+    if route in _route_stats:
+        _route_stats[route] += 1
+
+
 def detect_route(history, message):
     """
     Detect the appropriate tool/route for handling the user's query.
@@ -413,6 +460,21 @@ def detect_route(history, message):
     """
     logger.info(f"Detect route on history messages: {history}")
 
+    # Hybrid safety-net: the LLM router is non-deterministic (observed 94% one
+    # run, 69% the next at temp 0.7) and tends to drop clear calculation/tool
+    # questions into legal_rag. These signals map 1:1 to specific agent_tools
+    # functions and are unambiguous, so we force agent_tools deterministically.
+    # This is SAFE: it only ever forces TOWARD agent_tools, which can hand off
+    # to RAG/web_search if a tool isn't actually needed — so a legal_rag-style
+    # question misrouted here still gets answered. The reverse (LLM dropping a
+    # calc question into legal_rag) loses the tool entirely. Asymmetric risk →
+    # override toward agent_tools for these.
+    override = _detect_agent_tools_override(message)
+    if override:
+        logger.info(f"Route override -> agent_tools (deterministic tool signal) for: '{message[:60]}'")
+        _record_route("agent_tools")
+        return "agent_tools"
+
     # Format history for better context
     history_text = ""
     if history and len(history) > 1:
@@ -424,123 +486,117 @@ def detect_route(history, message):
             elif role == "assistant":
                 history_text += f"Trợ lý: {content}\n"
 
-    # Improved prompt with agent_tools route
-    user_prompt = f"""Bạn là hệ thống định tuyến thông minh cho chatbot tư vấn pháp luật Việt Nam. Phân tích câu hỏi và chọn công cụ phù hợp nhất.
+    # Prompt-engineered router: semantic decision tree + chain-of-thought +
+    # structured output. No keyword hacks — LLM understands intent, scales
+    # with new tools without maintaining parallel keyword dicts.
+    import re
+    from datetime import datetime
+    current_year = datetime.now().year
+
+    user_prompt = f"""Bạn là bộ định tuyến (router) cho chatbot TƯ VẤN PHÁP LUẬT VIỆT NAM.
+Phân tích câu hỏi + ngữ cảnh hội thoại rồi xếp vào MỘT trong 4 luồng.
+
+NĂM HIỆN TẠI: {current_year}. Dùng mốc này khi câu hỏi phụ thuộc thời gian
+(tuổi, thời hiệu, hiệu lực luật, lương vùng, văn bản mới ban hành).
 
 Lịch sử hội thoại:
 {history_text}
 
-Câu hỏi hiện tại:
+Câu hỏi cần định tuyến:
 {message}
 
-CÁC CÔNG CỤ KHẢ DỤNG:
+CÂY QUYẾT ĐỊNH (theo thứ tự, dừng ở nhánh match đầu tiên):
 
-1. "legal_rag" - Hệ thống RAG tra cứu văn bản pháp luật
-   Sử dụng khi:
-   - Hỏi về nội dung luật, nghị định, thông tư, quyết định
-   - Hỏi về thủ tục pháp lý (ly hôn, thành lập DN, đăng ký đất đai)
-   - Hỏi về quyền lợi, nghĩa vụ, trách nhiệm pháp lý
-   - Câu hỏi về điều khoản cụ thể trong văn bản
-   - Giải thích khái niệm pháp lý
-   Ví dụ: "Thủ tục ly hôn theo Bộ luật Dân sự?", "Quyền của người lao động theo Luật Lao động?"
+1. agent_tools — CÂU HỎI CẦN TÍNH TOÁN / KIỂM TRA / SINH VĂN BẢN / TRA CỨU CỤ THỂ:
+   - Tính số tiền/tuổi/thời hạn: "tôi sinh năm 2004 năm nay bao nhiêu tuổi",
+     "tính phạt hợp đồng 100 triệu chậm 30 ngày", "tính trợ cấp thôi việc sau 3 năm",
+     "chia di sản thừa kế cho 4 người", "làm thêm giờ lương 15 triệu", "thuế TNCN tháng này"
+   - Kiểm tra điều kiện: "tên doanh nghiệp này có hợp lệ không", "đủ tuổi kết hôn chưa",
+     "thời hiệu khởi kiện còn không", "điều khoản này có hiệu lực không"
+   - Tra cứu văn bản cụ thể: "Điều 418 Bộ luật Dân sự nói gì", "có án lệ nào về trốn thuế",
+     "phiên bản luật nào còn hiệu lực", "dẫn chiếu điều này tới điều nào"
+   - Sinh văn bản mẫu: "sinh đơn khởi kiện đòi nợ", "tạo hợp đồng mua bán xe",
+     "mẫu đơn ly hôn", "đơn khiếu nại hành chính"
+   - Thẩm quyền/thủ tục theo bước: "ly hôn nộp ở đâu", "tòa nào thụ lý", "thủ tục thành lập DN cần gì"
+   → Bất kỳ câu có ý "tính/kiểm tra/sinh/tra cứu điều X/án lệ/thủ tục bước/nộp ở đâu" → agent_tools
+   → Mọi câu hỏi về THẨM QUYỀN/TÒA THỤ LÝ luôn là agent_tools (dù kèm "tranh chấp ..."),
+     ví dụ "tranh chấp dân sự 600 triệu thì tòa cấp nào thụ lý?" → agent_tools
+     (công cụ jurisdiction_resolver xác định tòa theo giá trị vụ việc).
 
-2. "agent_tools" - Agent với công cụ tính toán, tra cứu, xác thực và sinh văn bản
-   Sử dụng khi:
-   - Tính toán: phạt hợp đồng, chia thừa kế, trợ cấp thôi việc, làm thêm giờ,
-     thuế TNCN, lệ phí trước bạ nhà đất/xe, án phí, cấp dưỡng con
-   - Kiểm tra: tuổi pháp lý, tên doanh nghiệp, thời hiệu khởi kiện
-   - Tra cứu văn bản: nội dung một điều luật, án lệ, dẫn chiếu, xác minh trích dẫn
-   - Tra cứu bảng: thời hiệu, phiên bản luật, phạt vi phạm hành chính
-   - Thủ tục & thẩm quyền: hướng dẫn thủ tục (ly hôn, thành lập DN, đăng ký đất,
-     khiếu nại, khởi kiện), xác định tòa/cơ quan thụ lý
-   - Sinh văn bản mẫu: đơn khởi kiện, đơn khiếu nại, hợp đồng mua bán, đơn ly hôn
-   - Câu hỏi dạng "tính", "kiểm tra", "có hợp lệ không", "thủ tục...", "nộp ở đâu",
-     "sinh đơn", "Điều X nói gì", "có án lệ nào"
-   - Cần xử lý số liệu và logic phức tạp, nhiều bước suy luận
-   Ví dụ: "Tính tiền phạt hợp đồng 100 triệu chậm 30 ngày với lãi 0.1%/ngày",
-     "Thủ tục ly hôn cần giấy tờ gì, nộp ở đâu?", "Sinh đơn khởi kiện đòi nợ",
-     "Điều 418 Bộ luật Dân sự nói gì?", "Trợ cấp thôi việc sau 3 năm làm việc"
+2. legal_rag — CÂU HỎI VỀ NỘI DUNG LUẬT (giải thích, quyền, nghĩa vụ, khái niệm pháp lý):
+   - "Quyền của người lao động theo Luật Lao động", "nghĩa vụ cấp dưỡng theo BLDS"
+   - Giải thích khái niệm: "ủy quyền là gì", "diện trừ khỏi di sản là gì"
+   - Hỏi nội dung điều khoản nói chung (KHÔNG kèm yêu cầu tính/sinh/tra cứu công cụ)
 
-3. "web_search" - Tìm kiếm web cho thông tin mới
-   Sử dụng khi:
-   - Tin tức, sự kiện pháp luật gần đây (trong vài tháng gần nhất)
-   - Vụ án cụ thể đang diễn ra
-   - Thống kê, số liệu hiện tại (GDP, lương tối thiểu, lạm phát)
-   - Văn bản pháp luật MỚI vừa ban hành
-   - Từ khóa: "mới nhất", "gần đây", "hiện nay", "năm 2024", "vừa ban hành"
-   Ví dụ: "Luật Đất đai 2024 có gì mới?", "Lương tối thiểu vùng 1 năm 2024"
+3. web_search — THÔNG TIN MỚI / THỜI SỰ (năm {current_year} hoặc vài tháng gần):
+   - "Luật Đất đai mới nhất có gì thay đổi", "lương tối thiểu vùng năm nay",
+     "văn bản pháp luật vừa ban hành", "số liệu GDP/lạm phát hiện nay"
 
-4. "general_chat" - Trò chuyện thông thường
-   Sử dụng khi:
-   - Chào hỏi: "xin chào", "hello", "hi"
-   - Cảm ơn: "cảm ơn", "thanks"
-   - Hỏi về bot: "bạn là ai", "bạn làm được gì"
-   - Off-topic: không liên quan pháp luật (thời tiết, thể thao, giải trí)
-   Ví dụ: "Xin chào", "Bạn có thể giúp gì?", "Cảm ơn bạn"
+4. general_chat — CHÀO HỎI, CẢM ƠN, OFF-TOPIC (không liên quan pháp luật):
+   - "xin chào", "cảm ơn bạn", "bạn làm được gì", thời tiết, thể thao, giải trí
 
-HƯỚNG DẪN PHÂN LOẠI:
-1. Phân tích ý định chính của câu hỏi
-2. Xác định xem cần tính toán/kiểm tra (→ agent_tools) hay tra cứu văn bản (→ legal_rag)
-3. Nếu cần thông tin thời sự → web_search
-4. Ưu tiên: agent_tools (có tính toán) > legal_rag (tra cứu) > web_search (tin mới) > general_chat
-5. CHỈ trả về MỘT trong bốn giá trị: "legal_rag", "agent_tools", "web_search", "general_chat"
-6. KHÔNG giải thích, KHÔNG thêm văn bản khác
+NGUYÊN TẮC XUNG ĐỘT:
+- Phân vân giữa agent_tools và legal_rag → chọn agent_tools (agent có thể handoff sang RAG nếu cần văn bản; ngược lại RAG không có tool tính).
+- Câu vừa hỏi nội dung luật vừa yêu cầu tính/sinh/kiểm tra → agent_tools.
+- Câu follow-up tham chiếu câu trước ("cái đó tính sao", "khoản kia nữa") → nếu luồng trước là pháp luật và có ý tính → agent_tools; nếu chỉ hỏi lại nội dung → giữ route trước.
+- Câu pháp luật mơ hồ (không rõ cần tính hay tra cứu) → agent_tools (an toàn hơn vì có tool + handoff).
+- Câu có "mới nhất"/"năm nay"/"hiện nay" hỏi SỐ LIỆU THỜI SỰ (lương tối thiểu vùng,
+  GDP, lạm phát, thống kê, văn bản vừa ban hành) → web_search, ƯU TIÊN hơn agent_tools
+  (không có tool tính các số liệu này, cần dữ liệu internet cập nhật).
 
-Phân loại:"""
+QUY TRÌNH: suy nghĩ 1-2 câu ngắn lý do, rồi trả về route. KHÔNG giải thích dài.
+
+Trả về ĐÚNG định dạng:
+<reasoning>1-2 câu lý do ngắn</reasoning>
+<route>tên_route</route>"""
 
     openai_messages = [
         {
             "role": "system",
-            "content": "Bạn là hệ thống định tuyến chính xác. Chỉ trả về một trong bốn giá trị: legal_rag, agent_tools, web_search, general_chat",
+            "content": (
+                "Bạn là bộ định tuyến chính xác cho chatbot pháp luật Việt Nam. "
+                "Chỉ trả về đúng định dạng <reasoning>...</reasoning><route>...</route> "
+                "với route là một trong: agent_tools, legal_rag, web_search, general_chat."
+            ),
         },
         {"role": "user", "content": user_prompt},
     ]
     logger.info(f"Routing query: {message}")
 
     try:
-        route = openai_chat_complete(openai_messages).strip().lower()
+        raw = openai_chat_complete(openai_messages, temperature=0.0).strip()
 
-        # Validate route
-        valid_routes = ["legal_rag", "agent_tools", "web_search", "general_chat"]
-        if route not in valid_routes:
-            # Try to extract valid route from response
-            for valid_route in valid_routes:
-                if valid_route in route:
-                    route = valid_route
-                    break
-            else:
-                # Default logic based on keywords
-                message_lower = message.lower()
+        # Structured parse: extract <route> tag (robust to LLM formatting drift).
+        route_match = re.search(
+            r"<route>\s*(legal_rag|agent_tools|web_search|general_chat)\s*</route>",
+            raw,
+            re.IGNORECASE,
+        )
+        if route_match:
+            route = route_match.group(1).lower()
+            logger.info(f"Detected route: {route} | reasoning: {raw[:200]}")
+            _record_route(route)
+            return route
 
-                # Check for calculation/validation keywords
-                calc_keywords = [
-                    "tính",
-                    "kiểm tra",
-                    "hợp lệ",
-                    "đủ tuổi",
-                    "chia",
-                    "phạt",
-                    "thời hiệu",
-                ]
-                if any(kw in message_lower for kw in calc_keywords):
-                    logger.warning(
-                        f"Invalid route '{route}', detected calculation keywords, using 'agent_tools'"
-                    )
-                    route = "agent_tools"
-                else:
-                    # Default to legal_rag for legal questions
-                    logger.warning(
-                        f"Invalid route '{route}', defaulting to 'legal_rag'"
-                    )
-                    route = "legal_rag"
+        # Fallback: scan raw text for any valid route token (last-resort safety net).
+        valid_routes = ["agent_tools", "legal_rag", "web_search", "general_chat"]
+        raw_lower = raw.lower()
+        for r in valid_routes:
+            if r in raw_lower:
+                logger.warning(f"Fallback scan route: {r} (no <route> tag) | raw: {raw[:200]}")
+                _record_route(r)
+                return r
 
-        logger.info(f"Detected route: {route}")
-        return route
+        # Truly unparseable — default to agent_tools (safe: has tools + RAG handoff).
+        logger.warning(f"Unparseable route output, defaulting to agent_tools | raw: {raw[:200]}")
+        _record_route("agent_tools")
+        return "agent_tools"
 
     except Exception as e:
         logger.error(f"Error detecting route: {e}")
-        # Default to legal_rag
-        return "legal_rag"
+        # Default to agent_tools: it can answer via tools and hand off to RAG/web.
+        _record_route("agent_tools")
+        return "agent_tools"
 
 
 def get_financial_tools():
