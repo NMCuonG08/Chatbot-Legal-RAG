@@ -20,8 +20,8 @@ if (Test-Path ".venv") {
 
 switch ($Action) {
     "up" {
-        Write-Host "[1/1] Starting infra services (Redis, MariaDB, Qdrant, Prometheus, Grafana)..." -ForegroundColor Green
-        docker compose up -d redis mariadb qdrant prometheus grafana
+        Write-Host "[1/1] Starting infra services (Redis, MariaDB, Qdrant, Prometheus, Grafana, Neo4j)..." -ForegroundColor Green
+        docker compose up -d redis mariadb qdrant prometheus grafana neo4j
         docker compose ps
         Write-Host "`nNext: .\scripts\dev.ps1 setup (first time) then .\scripts\dev.ps1 app"
         Write-Host "To stop infra: docker compose down"

@@ -31,7 +31,7 @@ _MERGE_CYPHER = """
 MERGE (st:Statute {name: $law})
   ON CREATE SET st.created_at = timestamp()
   SET st.year = $year
-MERGE (a:Article {number: $art})
+MERGE (a:Article {number: $art, statute: $law})
   ON CREATE SET a.created_at = timestamp()
   SET a.text = $text
 MERGE (st)-[:HAS_ARTICLE]->(a)

@@ -27,15 +27,12 @@ services:
   neo4j:
     image: neo4j:5.20
     environment:
-      NEO4J_AUTH: neo4j/neo4j
+      NEO4J_AUTH: none
     ports:
       - "7474:7474"   # browser UI
       - "7687:7687"   # bolt
     volumes:
       - neo4j_data:/data
-
-volumes:
-  neo4j_data:
 
   backend:
     build:
@@ -93,4 +90,7 @@ volumes:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     depends_on:
       - prometheus
+
+volumes:
+  neo4j_data:
 
