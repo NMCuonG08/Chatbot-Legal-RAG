@@ -38,10 +38,10 @@ class CustomEmbeddingService:
         self.embedding_endpoint = f"{self.api_url}/embed"
         self.health_endpoint = f"{self.api_url}/health"
         self.timeout = 30  # seconds
-        self.service_available = True
-
-        # Check service health on init
-        self.service_available = self._check_health()
+        self.service_available = CUSTOM_EMBEDDING_ENABLED
+        if self.service_available:
+            # Check service health on init
+            self.service_available = self._check_health()
 
     def _bag_of_words_embedding(self, text: str) -> List[float]:
         """Generate a deterministic local fallback embedding (bag-of-words)."""

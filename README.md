@@ -283,6 +283,11 @@ Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing t
 *   **Statute of Limitations Lookup:** time limits for civil, labor, administrative, and criminal cases.
 *   **Web tools:** Google-style search, Tavily AI search, Tavily Q&A quick-answer.
 
+### 4b. Multi-Agent Planner & Supervisor Handoff
+*   **Planner (`planner.py`):** before a specialist runs, an LLM emits an ordered `<plan>` of steps, each assigning a specialist (`rag` | `tool` | `web` | `chat`) + a Vietnamese goal. Simple queries → 1 step; multi-step queries (e.g. *"tính trợ cấp thôi việc rồi dẫn điều luật áp dụng"*) → 2+. `parse_plan` tolerates missing wrappers / aliases / single+double quotes; `validate_plan` caps at `MAX_PLAN_STEPS=5` and dedupes consecutive identical steps. Falls back to a router-derived 1-step plan on any LLM failure.
+*   **Supervisor (`supervisor.py`):** after each specialist answers, an LLM emits a `<handoff next="...|END" rationale="..."/>` decision. Prefers the LLM; on failure/unparseable output falls back to `heuristic_handoff` (the same Vietnamese keyword markers used before — `không tìm thấy` → web, `cần tra cứu` → rag/tool). `MAX_HANDOFF_STEPS=5` loop guard forces END so a handoff chain cannot loop forever.
+*   **Non-invasive:** wraps the existing CRAG RAG loop (`route → planner → specialist → supervisor → {next | metacognitive → END}`) without removing any prior node/edge.
+
 ### 5. Episodic Memory
 *   **Long-Term Memory:** extracts key facts from sessions and stores them as vectors in Qdrant.
 *   **Contextual Retrieval:** dual-retrieval (laws + conversation context history) for personalized answers.
@@ -324,11 +329,37 @@ Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing t
 *   **No data leakage:** the Vietnamese LLM endpoint has no hardcoded public IP default — it must be configured explicitly; internal errors return a generic user-facing message (details logged server-side only).
 *   **Collection name validation:** FastAPI field patterns constrain collection/source identifiers.
 
+### 7a. Authentication & RBAC (`auth.py`, `rbac.py`)
+*   **JWT + bcrypt:** passwords hashed with passlib bcrypt; `python-jose` HS256 JWTs (`JWT_SECRET`, `JWT_ALG`, `JWT_EXP_MIN=60`). Endpoints `POST /auth/register` (rejects admin/lawyer self-registration), `POST /auth/login` (same message on both branches to avoid user enumeration), `GET /auth/me`. Startup `seed_admin()` creates a default admin from `SEED_ADMIN_*` env.
+*   **Roles:** `admin` | `lawyer` | `user` | `guest`, each mapping to an allowed tool-name set (`ROLE_PERMISSIONS`); `admin` = all tools. `Principal` is a frozen dataclass (`is_admin`, `is_approval_exempt`).
+*   **Tool policy:** `filter_tools_by_policy` drops tools the caller's role may not call **before** the ReAct agent sees them. FastAPI deps `get_current_user` (strict, 401), `get_current_user_optional` (anonymous), `require_role` / `require_admin` (403).
+*   **Anonymous demo fallback:** `ALLOW_ANONYMOUS=1` keeps the old client-supplied `user_id` path working for the Streamlit demo; production should set `JWT_SECRET` and require auth.
+
+### 7b. Approval Workflow (`approval.py`)
+*   **Sensitive tools** (`generate_document_template_tool`, `web_search_tool`, `tavily_search_tool`) require human approval for non-exempt roles (`user`, `guest`); `admin` / `lawyer` are exempt.
+*   **Gate:** before the ReAct loop, `evaluate_tool_gate` intersects the query's anticipated tools with the sensitive set. If blocked, a `ToolApproval(pending)` row is created and the run returns a Vietnamese *"chờ phê duyệt"* message + `approval_id` instead of executing.
+*   **Decide:** `POST /approvals/{id}/decide` (admin, idempotent) → `approved` | `rejected`, audit-logged. On approval, `approval:allowed:{run_id}` (Redis + in-process fallback) lets a retry skip the gate.
+*   **Scope:** the graph is re-invoked on approval rather than fully suspended (keeps the change non-invasive); still enforces human-in-the-loop on sensitive tool use.
+
+### 7c. Subprocess Sandbox (`sandbox.py`)
+*   **Defense-in-depth:** deterministic pure-compute calc tools run in a throwaway child process — scrubbed env (secret vars stripped, UTF-8 stdio) + hard timeout — so a runaway calc tool cannot wedge the agent/worker. `SAFE_TO_SANDBOX` is an explicit allowlist; network / retrieval / graph / memory / sensitive tools are **not** sandboxed.
+*   **Limitation:** Windows has no seccomp — isolation is process-level + timeout + env scrub, not a syscall filter. Demo-grade, not production hardening.
+
+### 7d. Audit Logging (`audit.py`)
+*   `log_audit(user_id, action, resource, ip, payload)` is best-effort: any DB failure is caught + logged server-side so an audit-store outage never breaks a request. `GET /audit` (admin) lists entries with optional user/action filters. Login/register/chat/admin-decision events are recorded.
+
 ### 8. Multi-Provider LLM Routing
 Generation routes by `LLM_PROVIDER` (`groq` | `ollama` | `openai`) with graceful fallback (Vietnamese LLM API → Groq; Ollama main → Groq). Token usage is accumulated in-process via a `usage_accumulator` contextvar for cost metrics — no external tracing service required.
 
 ### 9. Comprehensive RAG Evaluation Suite
 A 4-pillar framework tracking operational metrics (token count, API cost, latency TTFT/TTLT), quality metrics (LLM-as-judge faithfulness/relevance), agentic metrics (tool-call success via the `agent_tool_calls` contextvar, router accuracy), and failure-mode analysis (Retrieval / Routing / Hallucination / Execution).
+
+### 10. MCP Server (`backend/src/mcp_server/`)
+The legal tools are also exposed as an **MCP** (Model Context Protocol) server, so any MCP-compatible client (Claude Desktop, Claude Code, the MCP inspector) can call them directly without the HTTP chat API.
+*   **Tools (~18):** `contract_penalty_calculator`, `legal_age_checker`, `inheritance_calculator`, `business_name_validator`, `statute_lookup`, `severance_pay`, `overtime_pay`, `pit_monthly`, `court_fee`, `child_support`, `law_version`, `article_lookup`, `precedent_lookup`, `cross_reference`, `verify_citation`, `procedure_wizard`, `jurisdiction_resolver`, `recall_legal_graph`. Each `@mcp.tool()` is a thin wrapper over the **raw Dict-returning implementation** (not the LlamaIndex `FunctionTool` — avoids double-encoding); the Vietnamese docstring becomes the MCP description.
+*   **Transports:** `stdio` (local — Claude Desktop / Claude Code) and `streamable-http` (remote/production).
+*   **Run:** `python -m src.mcp_server --transport stdio|http [--host 0.0.0.0] [--port 8100]` (or `MCP_TRANSPORT` / `MCP_HOST` / `MCP_HTTP_PORT` env).
+*   **Inspect:** `mcp dev src.mcp_server.server:mcp` opens the MCP inspector with the full tool list. See `backend/src/mcp_server/README.md` for the Claude Desktop config snippet.
 
 > **Observability note (tracing):** Tracing is **self-hosted** by design: every graph run is persisted as a `GraphRun` + `AgentStep` rows in MySQL and published to a Redis pub/sub channel (`graph_trace_events`) for live SSE streaming. Tool-call tracking and token-usage accumulation are in-process contextvars feeding the eval suite. **No LangSmith / Langfuse / OpenTelemetry, no cloud egress** — Vietnamese legal data stays local. If external tracing is ever desired, add a LangSmith/Langfuse callback; it is off by default and the self-hosted trace keeps working independently.
 

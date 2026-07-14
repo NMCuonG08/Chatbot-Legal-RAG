@@ -189,7 +189,10 @@ class OllamaProvider(LLMProvider):
 # --------------------------------------------------------------------------- #
 
 def build_groq_provider(model: str | None = None) -> GroqProvider:
-    return GroqProvider(model or os.environ.get("LLM_MODEL", "llama-3.1-8b-instant"))
+    m = model or os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+    if m and "cloud" in m.lower():
+        m = "llama-3.3-70b-versatile"
+    return GroqProvider(m)
 
 
 def build_ollama_provider(model: str | None = None) -> OllamaProvider:

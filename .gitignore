@@ -70,4 +70,11 @@ llm_finetuning_serving/checkpoints/
 # Downloaded embedding / serving model artifacts (HF cache, multi-GB)
 embed_serving/models/
 
+# Native Qdrant database and binaries
+storage/
+qdrant-win/
+qdrant.zip
+.qdrant-initialized
+
+
 

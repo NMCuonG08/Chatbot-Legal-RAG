@@ -11,6 +11,8 @@ from qdrant_client.models import (
     PointStruct,
     Range,
     VectorParams,
+    HnswConfigDiff,
+    OptimizersConfigDiff,
 )
 
 from pathlib import Path
@@ -50,7 +52,9 @@ def create_collection(name, vector_size=1024):
     """
     return client.create_collection(
         collection_name=name,
-        vectors_config=VectorParams(size=vector_size, distance=Distance.DOT),
+        vectors_config=VectorParams(size=vector_size, distance=Distance.DOT, on_disk=True),
+        hnsw_config=HnswConfigDiff(m=0, on_disk=True),
+        optimizers_config=OptimizersConfigDiff(indexing_threshold=999999),
     )
 
 
@@ -62,7 +66,9 @@ def wipe_collection(name, vector_size=1024):
         client.delete_collection(collection_name=name)
         client.create_collection(
             collection_name=name,
-            vectors_config=VectorParams(size=vector_size, distance=Distance.DOT),
+            vectors_config=VectorParams(size=vector_size, distance=Distance.DOT, on_disk=True),
+            hnsw_config=HnswConfigDiff(m=0, on_disk=True),
+            optimizers_config=OptimizersConfigDiff(indexing_threshold=999999),
         )
         logger.info(f"Wiped collection: {name}")
         return True

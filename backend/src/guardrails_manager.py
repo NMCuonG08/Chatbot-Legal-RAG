@@ -33,6 +33,8 @@ class LegalGuardrailsManager:
             # --- Dynamic LLM Configuration via Environment Variables ---
             llm_provider = os.environ.get("LLM_PROVIDER", "groq").lower()
             llm_model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
+            if llm_provider == "groq" and "cloud" in llm_model.lower():
+                llm_model = "llama-3.3-70b-versatile"
             
             logger.info(f"[GUARDRAILS] Configuring NeMo LLM engine - Provider: {llm_provider}, Model: {llm_model}")
             

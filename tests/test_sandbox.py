@@ -4,7 +4,10 @@ Exercises ``sandbox.run_in_sandbox`` against the real pure-compute tool impls
 (no network / DB / Qdrant). The worker runs in a child process with a scrubbed
 environment + UTF-8 stdio so Vietnamese output survives.
 """
+import io
+import json
 import subprocess
+import sys
 
 from sandbox import SAFE_TO_SANDBOX, _scrub_env, is_sandboxable, run_in_sandbox
 
@@ -93,3 +96,140 @@ def test_all_safe_to_sandbox_names_are_known_calc_tools():
     for tool_name, (module_name, fn_name) in SAFE_TO_SANDBOX.items():
         mod = importlib.import_module(module_name)
         assert hasattr(mod, fn_name), f"{tool_name} -> {module_name}.{fn_name} missing"
+
+
+# ---- _worker_main (direct, in-process) ----
+# The worker normally runs in a child process (not coverage-measured), so drive
+# it directly here to cover its branches.
+
+
+def test_worker_main_dispatches_calc(capsys):
+    import io
+    import json
+
+    import sandbox
+
+    payload = json.dumps({"tool": "contract_penalty_calculator", "args": {"contract_value": 1e9, "penalty_rate": 0.08, "days_late": 30}})
+    sandbox.sys.stdin = io.StringIO(payload)
+    try:
+        sandbox._worker_main()
+    finally:
+        sandbox.sys.stdin = sys.__stdin__
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert "error" not in data
+
+
+def test_worker_main_unknown_tool(capsys):
+    import io
+    import json
+
+    import sandbox
+
+    sandbox.sys.stdin = io.StringIO(json.dumps({"tool": "nope", "args": {}}))
+    try:
+        sandbox._worker_main()
+    finally:
+        sandbox.sys.stdin = sys.__stdin__
+    out = capsys.readouterr().out
+    assert "not sandboxable" in json.loads(out)["error"]
+
+
+def test_worker_main_tool_error(capsys):
+    import io
+    import json
+
+    import sandbox
+
+    # Missing required args -> impl raises -> worker emits tool_error.
+    sandbox.sys.stdin = io.StringIO(json.dumps({"tool": "contract_penalty_calculator", "args": {"penalty_rate": 0.08}}))
+    try:
+        sandbox._worker_main()
+    finally:
+        sandbox.sys.stdin = sys.__stdin__
+    out = capsys.readouterr().out
+    assert "tool_error" in json.loads(out)["error"]
+
+
+def test_worker_main_bad_input(capsys):
+    import io
+    import json
+
+    import sandbox
+
+    sandbox.sys.stdin = io.StringIO("not-json{")
+    try:
+        sandbox._worker_main()
+    finally:
+        sandbox.sys.stdin = sys.__stdin__
+    out = capsys.readouterr().out
+    assert "bad_input" in json.loads(out)["error"]
+
+
+def test_worker_main_empty_input(capsys):
+    import io
+    import json
+
+    import sandbox
+
+    sandbox.sys.stdin = io.StringIO("")
+    try:
+        sandbox._worker_main()
+    finally:
+        sandbox.sys.stdin = sys.__stdin__
+    out = capsys.readouterr().out
+    # Empty input -> req={} -> tool None -> not sandboxable.
+    assert "not sandboxable" in json.loads(out)["error"]
+
+
+# ---- run_in_sandbox error branches (returncode / empty / bad_json) ----
+
+
+def test_run_in_sandbox_worker_nonzero_exit(monkeypatch):
+    import sandbox
+
+    class _Proc:
+        returncode = 2
+        stdout = ""
+        stderr = "boom"
+
+    monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **kw: _Proc())
+    r = sandbox.run_in_sandbox("contract_penalty_calculator", {"contract_value": 1e9, "penalty_rate": 0.08, "days_late": 30})
+    assert "worker_exit_2" in r["error"]
+
+
+def test_run_in_sandbox_empty_output(monkeypatch):
+    import sandbox
+
+    class _Proc:
+        returncode = 0
+        stdout = "   "
+        stderr = ""
+
+    monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **kw: _Proc())
+    r = sandbox.run_in_sandbox("contract_penalty_calculator", {"contract_value": 1e9, "penalty_rate": 0.08, "days_late": 30})
+    assert r["error"] == "empty_output"
+
+
+def test_run_in_sandbox_bad_json(monkeypatch):
+    import sandbox
+
+    class _Proc:
+        returncode = 0
+        stdout = "not json at all"
+        stderr = ""
+
+    monkeypatch.setattr(sandbox.subprocess, "run", lambda *a, **kw: _Proc())
+    r = sandbox.run_in_sandbox("contract_penalty_calculator", {"contract_value": 1e9, "penalty_rate": 0.08, "days_late": 30})
+    assert "bad_json" in r["error"]
+
+
+def test_run_in_sandbox_spawn_failed(monkeypatch):
+    import sandbox
+
+    def _boom(*a, **kw):
+        raise OSError("no such interpreter")
+
+    monkeypatch.setattr(sandbox.subprocess, "run", _boom)
+    r = sandbox.run_in_sandbox("contract_penalty_calculator", {"contract_value": 1e9, "penalty_rate": 0.08, "days_late": 30})
+    assert "spawn_failed" in r["error"]

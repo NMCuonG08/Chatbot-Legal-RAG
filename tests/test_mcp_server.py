@@ -191,3 +191,58 @@ class TestRetrievalBestEffort:
         assert isinstance(out, str)
         data = json.loads(out)
         assert isinstance(data, dict)
+
+    def test_precedent_lookup_no_crash(self):
+        out = _call_tool("precedent_lookup", fact_pattern="tranh chấp hợp đồng", limit=3)
+        data = json.loads(out)
+        assert isinstance(data, dict)
+
+    def test_cross_reference_no_crash(self):
+        out = _call_tool("cross_reference", law_name="Bộ luật Dân sự", article_number=35, limit=3)
+        data = json.loads(out)
+        assert isinstance(data, dict)
+
+    def test_verify_citation_no_crash(self):
+        out = _call_tool("verify_citation", law_name="Bộ luật Dân sự", article_number=35, claimed_text="đoạn trích dẫn")
+        data = json.loads(out)
+        assert isinstance(data, dict)
+
+
+# ---- CLI entrypoint (mcp_server.__main__) ----
+class TestCli:
+    def test_parse_args_defaults_stdio(self, monkeypatch):
+        from mcp_server import __main__ as cli
+
+        monkeypatch.setattr(cli, "mcp", _FakeMcp())
+        monkeypatch.setattr("sys.argv", ["mcp_server"])
+        ns = cli._parse_args()
+        assert ns.transport == "stdio"
+        assert ns.port == 8100
+
+    def test_main_stdio_calls_run(self, monkeypatch):
+        from mcp_server import __main__ as cli
+
+        fake = _FakeMcp()
+        monkeypatch.setattr(cli, "mcp", fake)
+        monkeypatch.setattr("sys.argv", ["mcp_server", "--transport", "stdio"])
+        cli.main()
+        assert fake.calls and fake.calls[0]["transport"] is None
+
+    def test_main_http_calls_run_with_host_port(self, monkeypatch):
+        from mcp_server import __main__ as cli
+
+        fake = _FakeMcp()
+        monkeypatch.setattr(cli, "mcp", fake)
+        monkeypatch.setattr("sys.argv", ["mcp_server", "--transport", "http", "--host", "127.0.0.1", "--port", "9999"])
+        cli.main()
+        assert fake.calls[0]["transport"] == "streamable-http"
+        assert fake.calls[0]["host"] == "127.0.0.1"
+        assert fake.calls[0]["port"] == 9999
+
+
+class _FakeMcp:
+    def __init__(self):
+        self.calls = []
+
+    def run(self, *args, **kwargs):
+        self.calls.append({"args": args, "kwargs": kwargs, "transport": kwargs.get("transport"), "host": kwargs.get("host"), "port": kwargs.get("port")})

@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     celery_broker_url: str | None = None
     celery_result_backend: str | None = None
     redis_url: str = "redis://localhost:6379/0"
+    celery_task_always_eager: bool = False
 
     # LangGraph checkpointing (Phase B). default_ttl is in MINUTES for RedisSaver.
     langgraph_checkpoint_ttl_seconds: int = 86400  # 24h
@@ -96,6 +97,7 @@ def get_celery_app(name):
         enable_utc=True,
         result_backend_transport_options={"redis_client_args": {"protocol": 2}},
         broker_transport_options={"redis_client_args": {"protocol": 2}},
+        task_always_eager=settings.celery_task_always_eager,
     )
 
     # Configure Celery logging

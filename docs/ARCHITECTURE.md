@@ -131,7 +131,16 @@ Embeds each chunk and upserts into the **shared** Qdrant collection + `document_
 ## 3. Agentic & RAG engine
 
 ### 3.1 LangGraph workflow (`tasks.py`)
-Celery task orchestrates: input guardrails → intent router → selected engine → output guardrails → history → response.
+Celery task orchestrates: input guardrails → intent router → **planner** → selected specialist → **supervisor handoff** → output guardrails → history → response.
+
+The graph wraps the existing CRAG RAG loop without removing it:
+
+```
+route → planner → {rag | tool | web | chat} → supervisor → {next specialist | metacognitive → END}
+```
+
+*   **Planner node** (`planner.py`): an LLM emits an ordered `<plan>` of steps, each assigning a specialist (`rag` | `tool` | `web` | `chat`) + a Vietnamese goal. Simple queries yield a 1-step plan; multi-step queries (e.g. "tính trợ cấp thôi việc rồi dẫn điều luật áp dụng") yield 2+. `parse_plan` tolerates missing wrappers, alias names, single/double quotes; `validate_plan` caps at `MAX_PLAN_STEPS=5` and dedupes consecutive identical steps. On any LLM failure, `fallback_plan(route)` derives a 1-step plan from the router classification so behavior never regresses.
+*   **Supervisor node** (`supervisor.py`): after each specialist produces an answer, an LLM emits a `<handoff next="...|END" rationale="..."/>` decision. `supervisor_decide` prefers the LLM; on any failure/unparseable output it falls back to `heuristic_handoff` (the same Vietnamese keyword markers the graph used before — `không tìm thấy` → web, `cần tra cứu` → rag/tool). A `MAX_HANDOFF_STEPS=5` loop guard forces END so a runaway handoff chain cannot loop forever.
 
 ### 3.2 Intent router (`brain.detect_route`)
 LLM classifies into one of `legal_rag`, `agent_tools`, `web_search`, `general_chat`. Robust fallback: if the returned route is invalid, extract a valid substring; otherwise apply a keyword heuristic (calc/validation keywords → `agent_tools`, else default `legal_rag`). Priority when ambiguous: `agent_tools` (calc) > `legal_rag` (lookup) > `web_search` (recent) > `general_chat`.
@@ -159,13 +168,50 @@ Web tools: `web_search_tool`, `tavily_search_tool`, `quick_answer_tool`.
 
 ---
 
-## 4. Security model (`security.py`)
+## 4. Security model
 
+The platform layers four controls on top of the legacy admin API-key guard.
+
+### 4.1 Legacy admin surface (`security.py`)
 *   **Admin API-key dependency (`require_api_key`):** admin/ingestion endpoints require `X-API-Key` matching `ADMIN_API_KEY`. When `ADMIN_API_KEY` is unset, requests are **refused** unless `ALLOW_UNSAFE_ADMIN=1` (dev convenience). This prevents an accidentally-deployed open admin surface.
 *   **Path-traversal guard (`resolve_safe_data_path`):** ingestion paths are resolved under `IMPORT_DATA_DIR`; traversal segments cannot escape.
 *   **Collection-name validation:** FastAPI field patterns (`^[a-z0-9_-]{1,64}$`) constrain identifiers; `get_legal_collection_name` normalizes.
 *   **CORS (`get_cors_origins`):** configurable allow-list.
 *   **No secret leakage:** no hardcoded API keys/IPs; env-var driven; generic error messages to users.
+
+### 4.2 Authentication (`auth.py`, `models.User`)
+*   **Password hashing:** passlib bcrypt (`hash_password` / `verify_password`).
+*   **JWT:** `python-jose` HS256; `create_access_token(subject, claims)` / `decode_token`. Secret from `JWT_SECRET` (validated at startup), `JWT_ALG`, `JWT_EXP_MIN` (default 60). `extract_bearer` requires the `Bearer ` scheme.
+*   **Unsafe fallback:** when `JWT_SECRET` is unset and `ALLOW_UNSAFE_AUTH=1`, a single dev secret is cached at module load so encode/decode stay consistent. Without either, auth-dependent endpoints refuse.
+*   **Endpoints:** `POST /auth/register` (rejects admin/lawyer self-registration), `POST /auth/login` (same message on both branches to avoid user enumeration), `GET /auth/me`. Startup `seed_admin()` creates a default admin from `SEED_ADMIN_USERNAME` / `SEED_ADMIN_PASSWORD` (best-effort).
+
+### 4.3 RBAC + tool policy (`rbac.py`)
+*   **Roles:** `admin` | `lawyer` | `user` | `guest` (`Role`), each mapping to an allowed tool-name set (`ROLE_PERMISSIONS`); `admin` = `{"*"}`. `Principal` is a frozen dataclass (`is_admin`, `is_approval_exempt`).
+*   **Tool filtering:** `filter_tools_by_policy(tools, principal)` drops tools the role may not call before the ReAct agent ever sees them. `is_tool_allowed(name, role)` / `needs_approval(name, principal)` answer per-tool queries.
+*   **Sensitive tools** (require approval): `generate_document_template_tool`, `web_search_tool`, `tavily_search_tool`. Approval-exempt roles: `admin`, `lawyer`.
+*   **FastAPI deps:** `get_current_user` (strict, 401 on missing/bad token), `get_current_user_optional` (anonymous allowed), `require_role(*roles)` / `require_admin` (403 on wrong role).
+
+### 4.4 Approval workflow (`approval.py`, `models.ToolApproval`)
+*   **Gate:** before the ReAct agent loop, `evaluate_tool_gate(principal, anticipated_tool_names, run_id)` intersects the query's anticipated tools with `SENSITIVE_TOOLS`. If a sensitive tool is anticipated and the principal is not exempt, a `ToolApproval(status=pending)` row is created and the run returns a Vietnamese "chờ phê duyệt" message + `approval_id` instead of executing.
+*   **Decide:** `POST /approvals/{id}/decide` (admin only, idempotent) sets `approved` | `rejected`, writes an audit entry, and on approval records `approval:allowed:{run_id}` (Redis, with in-process fallback) so a retry of the same run skips the gate.
+*   **Scope/limitation:** the graph is **not** fully suspended LangGraph-checkpoint-style; the client re-invokes on approval. This keeps the change non-invasive while still enforcing human-in-the-loop on sensitive tool use.
+
+### 4.5 Sandbox (`sandbox.py`)
+*   **Defense-in-depth:** deterministic pure-compute calc tools run in a throwaway child process with a scrubbed environment (env allowlist; `GROQ_API_KEY` etc. stripped) + UTF-8 stdio + hard timeout, so a runaway calc tool cannot wedge the agent/worker. `SAFE_TO_SANDBOX` is an explicit allowlist; network / retrieval / graph / memory / sensitive tools are **not** sandboxed (they need external resources or are gated by approval).
+*   **Limitation:** Windows has no seccomp — isolation is process-level + timeout + env scrub, not a syscall filter. Adequate for demo; not production hardening.
+
+### 4.6 Audit (`audit.py`, `models.AuditLog`)
+*   `log_audit(user_id, action, resource, ip, payload)` is best-effort: any DB failure is caught + logged server-side so an audit-store outage never breaks a request. `GET /audit` (admin) lists entries with optional user/action filters.
+
+---
+
+## 4b. MCP server (`backend/src/mcp_server/`)
+
+The legal tools are also exposed as an **MCP** (Model Context Protocol) server, so any MCP-compatible client (Claude Desktop, Claude Code, the MCP inspector) can call them directly without going through the HTTP chat API.
+
+*   **Server (`server.py`):** FastMCP (`mcp` SDK) registers ~18 `@mcp.tool()` thin wrappers that call the **raw Dict-returning implementations** in `legal_tools.py` / `legal_knowledge_tools.py` / `legal_retrieval_tools.py` / `legal_procedure_tools.py` / `legal_graph_tools.py` and `json.dumps` the result. They intentionally do **not** wrap the LlamaIndex `FunctionTool` wrappers (avoids double-encoding). Each tool's Vietnamese docstring becomes its MCP description.
+*   **Transports:** `stdio` (local, for Claude Desktop / Claude Code) and `streamable-http` (remote/production). CLI: `python -m src.mcp_server --transport stdio|http [--host 0.0.0.0] [--port 8100]` (`__main__.py`), also drivable via `MCP_TRANSPORT` / `MCP_HOST` / `MCP_HTTP_PORT` env.
+*   **Inspect:** `mcp dev src.mcp_server.server:mcp` opens the MCP inspector with the full tool list. See `backend/src/mcp_server/README.md` for Claude Desktop config snippet.
 
 ---
 
@@ -221,7 +267,16 @@ Four pillars:
 | LLM routing + intent/router | `backend/src/brain.py` |
 | ReAct agent + tools | `backend/src/agent.py` |
 | Legal calculation logic | `backend/src/legal_tools.py` |
-| Security (auth, path guard, CORS) | `backend/src/security.py` |
+| Security (admin API-key, path guard, CORS) | `backend/src/security.py` |
+| Authentication (JWT, bcrypt) | `backend/src/auth.py` |
+| RBAC + tool policy | `backend/src/rbac.py` |
+| Approval workflow | `backend/src/approval.py` |
+| Sandbox (subprocess isolation) | `backend/src/sandbox.py` |
+| Audit logging | `backend/src/audit.py` |
+| Seed admin | `backend/src/seed_admin.py` |
+| Planner node | `backend/src/planner.py` |
+| Supervisor node | `backend/src/supervisor.py` |
+| MCP server | `backend/src/mcp_server/` (`server.py`, `__main__.py`) |
 | Guardrails | `backend/src/guardrails_manager.py` |
 | Hybrid search + BM25 | `backend/src/search.py` |
 | Semantic cache | `backend/src/semantic_cache.py` |
@@ -229,4 +284,4 @@ Four pillars:
 | Legacy importer | `backend/src/import_data.py` |
 | Pipeline | `backend/src/pipeline/` (orchestrator, run, schema, state, storage, parsers, chunker, embedder, connectors/) |
 | Evaluation | `backend/src/evaluation/` |
-| Tests | `tests/` (conftest auto-adds `backend/src` to `sys.path`) |
+| Tests | `tests/` (conftest auto-adds `backend/src` to `sys.path`; sqlite in-memory + JWT fixtures for Phase 2) |
