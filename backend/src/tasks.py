@@ -169,6 +169,27 @@ def _should_handoff_to_agent(answer: str) -> bool:
     return any(m in low for m in _HANDOFF_NEEDS_LOOKUP_MARKERS)
 
 
+def _planner_llm_call(prompt: str):
+    """Best-effort LLM call for the planner. Returns response text or None.
+
+    Lazily borrows the agent's Groq LLM; any failure -> None so the planner
+    falls back to a route-derived 1-step plan. Kept defensive so a missing /
+    misconfigured LLM never breaks routing.
+    """
+    try:
+        from agent import _build_llm  # local import avoids heavy module load at import time
+
+        llm = _build_llm()
+        if llm is None:
+            return None
+        # llama-index LLM .complete returns a CompletionResponse with .text
+        resp = llm.complete(prompt)
+        return getattr(resp, "text", None) or str(resp)
+    except Exception as exc:
+        logger.warning(f"[PLANNER] LLM unavailable: {exc}")
+        return None
+
+
 # ---- Persistent event loop for async guardrails calls inside sync Celery tasks ----
 # Previously every guardrails call did `asyncio.run(...)`, which creates and tears
 # down a fresh event loop each time — wasteful and fragile under concurrency. Here
@@ -228,6 +249,12 @@ class ChatGraphState(TypedDict, total=False):
     # (approval.evaluate_tool_gate) for sensitive tools by non-exempt roles.
     role: str
     approved_tool: str
+    # Phase 3 — planner + supervisor. plan = ordered specialist steps;
+    # plan_step_idx = current step; supervisor_steps = handoffs executed
+    # (capped at MAX_HANDOFF_STEPS to prevent infinite loops).
+    plan: List[Dict]
+    plan_step_idx: int
+    supervisor_steps: int
     # CRAG (self-corrective RAG)
     documents: List[Dict]            # retrieved + reranked docs
     graded_docs: List[Dict]          # docs tagged with relevance: "relevant"|"irrelevant"
@@ -720,6 +747,73 @@ def _build_chat_graph():
             "standalone_question": standalone_question,
         }
 
+    # ---- Phase 3: planner ----
+    # Produces an ordered plan (list of {specialist, goal}) and records it in
+    # state + trace. Falls back to a 1-step plan derived from the route when
+    # the LLM is unavailable or returns an unparseable response. The plan is
+    # observational + drives supervisor handoff; the existing route->specialist
+    # edges still execute the first step.
+    def planner_node(state: ChatGraphState):
+        question = state.get("standalone_question") or state.get("question", "")
+        route = state.get("route", "general_chat")
+        try:
+            from planner import build_plan_prompt, parse_plan, validate_plan, fallback_plan
+
+            plan = fallback_plan(route)
+            try:
+                prompt = build_plan_prompt(question, history_summary="")
+                raw = _planner_llm_call(prompt)
+                if raw:
+                    parsed = validate_plan(parse_plan(raw))
+                    if parsed:
+                        plan = parsed
+            except Exception as exc:
+                logger.warning(f"[PLANNER] LLM plan failed, using route fallback: {exc}")
+            _trace_node_end(state, "planner", {"plan_steps": len(plan), "plan": plan})
+            return {"plan": plan, "plan_step_idx": 0, "supervisor_steps": 0}
+        except Exception as exc:
+            logger.warning(f"[PLANNER] node failed (non-fatal): {exc}")
+            _trace_node_end(state, "planner", {"plan_steps": 1, "fallback": True})
+            return {"plan": [{"specialist": "chat", "goal": "fallback"}], "plan_step_idx": 0}
+
+    # ---- Phase 3: supervisor handoff helper ----
+    # specialist name -> graph node name
+    _SPEC_TO_NODE = {
+        "rag": "retrieve",
+        "tool": "agent_tools",
+        "web": "web_search",
+        "chat": "general_chat",
+    }
+
+    def _supervisor_next(state, current_specialist, answer, already_done_flag):
+        """Ask the supervisor for the next step. Returns a Command(goto=...)
+        when a handoff is decided (and the per-edge guard not already fired),
+        else None (caller falls through to its default -> metacognitive edge).
+
+        Replaces the bare _should_handoff_to_* heuristics: supervisor_decide
+        tries the LLM first, then falls back to those same heuristics, and
+        enforces the MAX_HANDOFF_STEPS loop guard.
+        """
+        from supervisor import supervisor_decide, END as SUP_END
+
+        steps = state.get("supervisor_steps", 0)
+        plan = state.get("plan", [])
+        question = state.get("standalone_question") or state.get("question", "")
+        decision = supervisor_decide(
+            question, current_specialist, answer, plan, steps_taken=steps,
+            llm_call=_planner_llm_call,
+        )
+        nxt = decision.get("next", SUP_END)
+        if nxt == SUP_END or nxt not in _SPEC_TO_NODE:
+            return None
+        if state.get(already_done_flag):
+            return None  # per-edge guard: this handoff already fired this run
+        _trace_handoff(state, current_specialist, _SPEC_TO_NODE[nxt], decision.get("rationale", ""))
+        return Command(
+            goto=_SPEC_TO_NODE[nxt],
+            update={"supervisor_steps": steps + 1, already_done_flag: True},
+        )
+
     # ---- CRAG (self-corrective RAG) nodes ----
     def retrieve_node(state: ChatGraphState):
         # On a reflection loop, prefer the rewritten query; otherwise the standalone question.
@@ -887,17 +981,15 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
             resp = guardrails_manager.add_legal_disclaimer(resp, question)
         _trace_node_end(state, "agent_tools", {"answer_len": len(resp), "tool_calls": len(tool_calls)})
 
-        # Phase D handoff: agent says it needs legal-doc lookup -> hand off to RAG retrieve.
-        if _should_handoff_to_rag(resp) and not state.get("agent_to_rag_done"):
-            _trace_handoff(state, "agent_tools", "retrieve", "needs_legal_lookup")
-            return Command(
-                goto="retrieve",
-                update={
-                    "agent_to_rag_done": True,
-                    "standalone_question": question,
-                    "tool_calls": tool_calls,
-                },
-            )
+        # Phase 3: supervisor-driven handoff (LLM decision with heuristic
+        # fallback). Replaces the bare _should_handoff_to_rag heuristic.
+        cmd = _supervisor_next(state, "tool", resp, "agent_to_rag_done")
+        if cmd is not None:
+            # Preserve tool_calls + standalone_question for the retrieve node.
+            update = dict(cmd.update)
+            update["standalone_question"] = question
+            update["tool_calls"] = tool_calls
+            return Command(goto=cmd.goto, update=update)
 
         return {"response": resp, "sources": [], "tool_calls": tool_calls}
 
@@ -909,10 +1001,11 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
             resp = guardrails_manager.add_legal_disclaimer(resp, question)
         _trace_node_end(state, "web_search", {"answer_len": len(resp)})
 
-        # Phase D handoff: web result looks like it needs tool use -> hand off to agent_tools.
-        if _should_handoff_to_agent(resp) and not state.get("web_to_agent_done"):
-            _trace_handoff(state, "web_search", "agent_tools", "needs_tool_use")
-            return Command(goto="agent_tools", update={"web_to_agent_done": True})
+        # Phase 3: supervisor-driven handoff (LLM + heuristic fallback),
+        # replacing the bare _should_handoff_to_agent heuristic.
+        cmd = _supervisor_next(state, "web", resp, "web_to_agent_done")
+        if cmd is not None:
+            return cmd
 
         return {"response": resp, "sources": [], "web_search_fallback_used": True}
 
@@ -972,6 +1065,7 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
         return state.get("route", "general_chat")
 
     graph.add_node("route", route_node)
+    graph.add_node("planner", planner_node)
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("grade_documents", grade_documents_node)
     graph.add_node("generate", generate_node)
@@ -983,8 +1077,10 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
     graph.add_node("metacognitive", metacognitive_node)
 
     graph.add_edge(START, "route")
+    # Phase 3: route -> planner (records plan + trace) -> specialist via choose_route.
+    graph.add_edge("route", "planner")
     graph.add_conditional_edges(
-        "route",
+        "planner",
         choose_route,
         {
             "legal_rag": "retrieve",
