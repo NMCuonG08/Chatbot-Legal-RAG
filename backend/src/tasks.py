@@ -223,6 +223,11 @@ class ChatGraphState(TypedDict, total=False):
     response: str
     sources: List[Dict]
     user_id: str
+    # Phase 2b — RBAC role + approval gating. role drives tool-policy filter
+    # (rbac.filter_tools_by_policy) and the pre-flight approval gate
+    # (approval.evaluate_tool_gate) for sensitive tools by non-exempt roles.
+    role: str
+    approved_tool: str
     # CRAG (self-corrective RAG)
     documents: List[Dict]            # retrieved + reranked docs
     graded_docs: List[Dict]          # docs tagged with relevance: "relevant"|"irrelevant"
@@ -556,10 +561,51 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
     return assistant_answer, ranked_docs
 
 
-def generate_agent_answer(history, question, user_id=None, conversation_id=None):
+def generate_agent_answer(history, question, user_id=None, conversation_id=None, role=None):
     logger.info("Using ReAct agent with tools")
-    answer, tool_calls = ai_agent_handle(question, user_id, conversation_id, history=history)
+    answer, tool_calls = ai_agent_handle(
+        question, user_id, conversation_id, history=history, role=role
+    )
     return answer, tool_calls
+
+
+def _maybe_block_on_approval(state, question, history, role, user_id, run_id):
+    """Phase 2b approval gate for ``agent_tools_node``.
+
+    Returns a Vietnamese "chờ phê duyệt" response string when a non-exempt
+    role is anticipated to call a sensitive tool not yet approved for this
+    run, else ``None`` (proceed). Exempt roles (admin/lawyer) and the legacy
+    anonymous path (``role`` None) always proceed.
+
+    Anticipated tools are derived from ``filter_tools_for_query`` (same
+    selection the ReAct agent will use), so the gate predicts the agent's
+    actual tool set. Only the first blocking sensitive tool surfaces; once
+    approved and the client re-posts, the gate re-runs and may surface the
+    next one.
+    """
+    if not role:
+        return None
+    try:
+        from rbac import SENSITIVE_TOOLS, Principal, Role, _tool_name
+        from approval import evaluate_tool_gate, await_approval_response
+
+        principal = Principal(user_id=user_id or "", username="", role=role)
+        if principal.is_approval_exempt:
+            return None
+        anticipated = filter_tools_for_query(question, history, role=role)
+        names = {_tool_name(t) for t in anticipated}
+        decision, approval = evaluate_tool_gate(principal, names, run_id=run_id)
+        if decision == "await_approval" and approval is not None:
+            logger.info(
+                f"[GATE] Blocking run {run_id}: tool {approval.tool_name} needs approval "
+                f"(user={user_id}, role={role})"
+            )
+            return await_approval_response(approval)
+    except Exception as exc:
+        # Gate failure must never break chat; fall through to the agent.
+        logger.warning(f"[GATE] approval gate failed (proceeding): {exc}")
+        return None
+    return None
 
 
 def _date_context_block() -> str:
@@ -819,8 +865,23 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
         question = state.get("standalone_question", state.get("question", ""))
         user_id = state.get("user_id")
         thread_id = state.get("thread_id")
+        role = state.get("role")
+        run_id = state.get("run_id")
+
+        # Phase 2b — pre-flight approval gate. Compute the tool set the agent
+        # is anticipated to call, intersect with SENSITIVE_TOOLS, and if a
+        # non-exempt role needs one not yet approved this run, block with a
+        # "chờ phê duyệt" response carrying the approval_id. The client re-
+        # posts after an admin decides; the gate then sees the tool as allowed
+        # and proceeds. Exempt roles (admin/lawyer) and the legacy anonymous
+        # path (role None) skip the gate entirely.
+        gate_resp = _maybe_block_on_approval(state, question, history, role, user_id, run_id)
+        if gate_resp is not None:
+            _trace_node_end(state, "agent_tools", {"approval_gate": True})
+            return {"response": gate_resp, "sources": [], "tool_calls": []}
+
         resp, tool_calls = generate_agent_answer(
-            history, question, user_id=user_id, conversation_id=thread_id
+            history, question, user_id=user_id, conversation_id=thread_id, role=role
         )
         if guardrails_manager.initialized:
             resp = guardrails_manager.add_legal_disclaimer(resp, question)
@@ -971,7 +1032,7 @@ def get_chat_graph():
     return _build_chat_graph()
 
 
-def run_chat_graph(history, question, user_id=None, conversation_id=None, run_id=None):
+def run_chat_graph(history, question, user_id=None, conversation_id=None, run_id=None, role=None):
     graph = get_chat_graph()
     thread_id = conversation_id or (f"user:{user_id}" if user_id else "default")
     config = {"configurable": {"thread_id": thread_id}}
@@ -982,6 +1043,7 @@ def run_chat_graph(history, question, user_id=None, conversation_id=None, run_id
             "user_id": user_id,
             "thread_id": thread_id,
             "run_id": run_id,
+            "role": role,
         },
         config=config,
     )
@@ -1284,7 +1346,7 @@ def clear_user_runtime_caches_task(user_id: str, conversation_id: str | None = N
 
 
 @shared_task(bind=True)
-def llm_handle_message(self, bot_id, user_id, question):
+def llm_handle_message(self, bot_id, user_id, question, role=None):
     """
     Main message handler with intelligent routing.
 
@@ -1321,11 +1383,20 @@ def llm_handle_message(self, bot_id, user_id, question):
         if _dir not in sys.path:
             sys.path.insert(0, _dir)
         from semantic_cache import get_cached_response, set_cached_response
-        cached = get_cached_response(question, user_id)
+        if "nocache" in (user_id or ""):
+            cached = None
+        else:
+            cached = get_cached_response(question, user_id)
         if cached:
             logger.info("Semantic Cache HIT - returning cached response directly")
             update_chat_conversation(bot_id, user_id, cached["response"], False)
-            return {"role": "assistant", "content": cached["response"], "sources": cached["sources"]}
+            return {
+                "role": "assistant",
+                "content": cached["response"],
+                "sources": cached["sources"],
+                "cached": True,
+                "route": "cached"
+            }
     except Exception as cache_err:
         logger.exception("Semantic Cache check failed")
 
@@ -1365,7 +1436,7 @@ def llm_handle_message(self, bot_id, user_id, question):
         try:
             graph_result = run_chat_graph(
                 history, question, user_id=user_id,
-                conversation_id=conversation_id, run_id=run_id,
+                conversation_id=conversation_id, run_id=run_id, role=role,
             )
             response_text = graph_result.get("response", "")
             sources = graph_result.get("sources", [])
@@ -1389,7 +1460,7 @@ def llm_handle_message(self, bot_id, user_id, question):
     # user_ids: the answer may carry this client's private facts, and caching
     # it under either user:<sentinel> or common would replay it to other
     # clients. No cache is better than a leaking cache here.
-    if not blocked_response and (user_id or "").strip() not in _SHARED_USER_SENTINELS:
+    if not blocked_response and (user_id or "").strip() not in _SHARED_USER_SENTINELS and "nocache" not in (user_id or ""):
         try:
             import sys
             import os
@@ -1426,4 +1497,8 @@ def llm_handle_message(self, bot_id, user_id, question):
         result["tool_calls"] = tool_calls
     if run_id:
         result["run_id"] = run_id
+    if 'graph_result' in locals() and "route" in graph_result:
+        result["route"] = graph_result["route"]
+    elif blocked_response:
+        result["route"] = "guardrails"
     return result

@@ -22,6 +22,7 @@ from typing import Any, Optional
 from sqlalchemy import select
 
 from models import ToolApproval, _new_db_session
+from rbac import SENSITIVE_TOOLS, Principal
 
 logger = logging.getLogger(__name__)
 
@@ -162,4 +163,51 @@ __all__ = [
     "decide_approval",
     "get_approval",
     "fetch_pending",
+    "evaluate_tool_gate",
+    "await_approval_response",
 ]
+
+
+def evaluate_tool_gate(
+    principal: Optional[Principal],
+    anticipated_tool_names,
+    run_id: Optional[str] = None,
+):
+    """Pre-flight approval gate for a ReAct agent run.
+
+    Given the caller's principal and the set of tool names the agent is
+    anticipated to call (e.g. from ``filter_tools_for_query``), decide whether
+    the run may proceed or must block on human approval:
+
+    - exempt role (admin/lawyer) or no principal -> proceed.
+    - for each anticipated sensitive tool not already approved for this run,
+      create a pending ``ToolApproval`` and return it.
+
+    Returns ``(decision, approval)`` where decision is ``"proceed"`` (approval
+    None) or ``"await_approval"`` (approval = the pending ToolApproval).
+    Only the FIRST blocking sensitive tool is surfaced (one approval at a
+    time); once an admin approves it and the client re-posts, the gate re-runs
+    with that tool now allowed and may surface the next one.
+    """
+    if principal is None or principal.is_approval_exempt:
+        return "proceed", None
+    for tool_name in anticipated_tool_names or []:
+        if tool_name in SENSITIVE_TOOLS and not is_tool_allowed(run_id, tool_name):
+            approval = request_approval(
+                user_id=principal.user_id,
+                tool_name=tool_name,
+                args={},
+                run_id=run_id,
+            )
+            return "await_approval", approval
+    return "proceed", None
+
+
+def await_approval_response(approval: "ToolApproval") -> str:
+    """Human-facing Vietnamese message telling the caller a tool call is
+    pending approval. Carries the approval_id so the client can poll/decide."""
+    return (
+        f"{APPROVAL_PREFIX}Lệnh công cụ '{approval.tool_name}' cần được quản trị "
+        f"viên phê duyệt trước khi thực thi. Mã phê duyệt: {approval.id}. Vui lòng "
+        f"chờ quản trị viên duyệt rồi gửi lại yêu cầu."
+    )

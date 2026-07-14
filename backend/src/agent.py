@@ -121,7 +121,9 @@ def _build_llm():
     # 1. Build Groq (as fallback or primary)
     from llama_index.llms.groq import Groq
     groq_api_key = os.environ.get("GROQ_API_KEY")
-    groq_model = os.environ.get("LLM_MODEL", "llama-3.1-8b-instant")
+    groq_model = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+    if groq_model and "cloud" in groq_model.lower():
+        groq_model = "llama-3.3-70b-versatile"
     groq_llm = None
     if groq_api_key:
         groq_llm = Groq(model=groq_model, api_key=groq_api_key, temperature=0.1)
@@ -449,8 +451,19 @@ def _summarize_chat_history(
         return prev_summary or _truncate_raw(new_turn_text), short_term_raw
 
 
-def filter_tools_for_query(query: str, history: Optional[List[Dict]] = None) -> list:
-    """Select a subset of tools relevant to the user's query to minimize prompt tokens."""
+def filter_tools_for_query(
+    query: str,
+    history: Optional[List[Dict]] = None,
+    role: Optional[str] = None,
+) -> list:
+    """Select a subset of tools relevant to the user's query to minimize prompt tokens.
+
+    Phase 2b — when ``role`` is supplied, the result is further narrowed by
+    RBAC tool policy (``rbac.filter_tools_by_policy``) so a guest never sees
+    web/search/sensitive tools in the agent's prompt, and a user never sees
+    admin-only escalation paths. ``role=None`` keeps legacy behavior (no
+    policy filter) for the anonymous demo path.
+    """
     query_lower = query.lower()
 
     # Accumulate query and last conversation turns to find relevant keywords
@@ -556,10 +569,34 @@ def filter_tools_for_query(query: str, history: Optional[List[Dict]] = None) -> 
         ]
         if has_prior_history:
             fallback.append(getattr(agent_tool_wrappers, "recall_user_memory_func_tool"))
-        return fallback
+        return _apply_role_policy(fallback, role)
 
     logger.info(f"[AGENT] Dynamically selected {len(tools_list)} tools for prompt reduction (out of 28)")
-    return tools_list
+    return _apply_role_policy(tools_list, role)
+
+
+def _apply_role_policy(tools: list, role: Optional[str]) -> list:
+    """Narrow ``tools`` by RBAC policy when a role is supplied (Phase 2b).
+
+    No-op for ``role=None`` (legacy anonymous path). A principal with no
+    matching tools after filtering returns an empty list; callers should fall
+    back to a non-tool generation path rather than run a toolless ReAct agent.
+    """
+    if not role:
+        return tools
+    try:
+        from rbac import Principal, Role, filter_tools_by_policy
+
+        principal = Principal(user_id="", username="", role=role)
+        kept = filter_tools_by_policy(tools, principal)
+        if len(kept) < len(tools):
+            logger.info(
+                f"[AGENT] RBAC policy (role={role}) kept {len(kept)}/{len(tools)} tools"
+            )
+        return kept
+    except Exception as exc:
+        logger.warning(f"[AGENT] RBAC policy filter failed (proceeding unfiltered): {exc}")
+        return tools
 
 
 def _build_react_agent(
@@ -603,6 +640,7 @@ def ai_agent_handle(
     user_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     history: Optional[List[Dict]] = None,
+    role: Optional[str] = None,
 ) -> Tuple[str, List[Dict]]:
     """
     Handle user question using ReAct agent with tools.
@@ -656,7 +694,7 @@ def ai_agent_handle(
             logger.info(f"[AGENT] Short-term raw turns={len(short_term_raw)} (no summary needed yet)")
 
         # Select tools dynamically based on current query and conversation history
-        tools = filter_tools_for_query(question, history)
+        tools = filter_tools_for_query(question, history, role=role)
 
         ai_agent = _build_react_agent(_llm, memory, tools, history_summary=history_summary)
         if ai_agent is None:

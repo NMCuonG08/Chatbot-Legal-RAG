@@ -580,11 +580,15 @@ async def complete(
         payload={"bot_id": bot_id, "role": principal.role if principal else "anonymous"},
     )
 
+    # Phase 2b — thread the caller's RBAC role into the graph so tool-policy
+    # filtering + the approval gate apply. Anonymous (no JWT) -> None = legacy.
+    role = principal.role if principal else None
+
     if data.sync_request:
         # llm_handle_message is sync (Celery task called directly). Run in a
         # worker thread so the uvicorn event loop is NOT blocked for the whole
         # generation latency.
-        response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message)
+        response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message, role)
         return {
             "response": response.get("content", ""),
             "sources": response.get("sources", []),
@@ -593,14 +597,14 @@ async def complete(
         }
     else:
         try:
-            task = llm_handle_message.delay(bot_id, user_id, user_message)
+            task = llm_handle_message.delay(bot_id, user_id, user_message, role)
             return {"task_id": task.id}
         except Exception as broker_err:
             # Broker/broker-down: fall back to the in-process sync path so a
             # transient Redis/Celery outage does not hard-500 a chat that the
             # sync handler could still serve.
             logger.warning(f"[CHAT] broker dispatch failed, falling back to sync: {broker_err}")
-            response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message)
+            response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message, role)
             return {
                 "response": response.get("content", ""),
                 "sources": response.get("sources", []),
