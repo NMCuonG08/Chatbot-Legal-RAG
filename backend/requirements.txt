@@ -22,3 +22,10 @@ sentence-transformers
 prometheus-fastapi-instrumentator>=6.0.0
 neo4j>=5.20
 
+# ---- MCP server (Phase 1) ----
+mcp>=1.2.0
+
+# ---- Security: JWT auth + RBAC (Phase 2) ----
+passlib[bcrypt]>=1.7.4
+python-jose[cryptography]>=3.3.0
+

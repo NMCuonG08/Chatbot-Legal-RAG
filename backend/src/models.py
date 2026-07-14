@@ -263,6 +263,63 @@ class AgentStep(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+# ---- Phase 2 — Security: users, audit log, tool approvals ----
+
+class User(Base):
+    """Application user with a role (admin|lawyer|user|guest).
+
+    Auth is JWT (see auth.py); password_hash is bcrypt via passlib. ``user_id``
+    columns on other tables still store the self-asserted client id for
+    backward compatibility, but when JWT auth is enforced the caller's User.id
+    (string uuid) is used instead.
+    """
+    __tablename__ = "users"
+
+    id = Column(String(64), primary_key=True)  # uuid4 hex
+    username = Column(String(100), nullable=False, unique=True, index=True)
+    email = Column(String(255), nullable=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(32), nullable=False, default="user")  # admin|lawyer|user|guest
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class AuditLog(Base):
+    """Durable who-did-what trail. Written by audit.log_audit for auth, chat,
+    tool, and admin events. Not a replacement for stdout logs — this is the
+    queryable, tamper-evident store."""
+    __tablename__ = "audit_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(100), index=True)
+    action = Column(String(64), nullable=False, index=True)  # login|register|chat|tool_call|admin|...
+    resource = Column(String(255), nullable=True)
+    ip = Column(String(64), nullable=True)
+    payload = Column(JSON)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class ToolApproval(Base):
+    """Human-in-the-loop approval request for a sensitive tool call.
+
+    Lifecycle: pending -> approved|rejected. Created by approval.request_approval
+    when a non-exempt role triggers a SENSITIVE_TOOLS entry. Resolved by an admin
+    via POST /approvals/{id}/decide. On approve, the agent is re-invoked with the
+    tool explicitly allowed (see agent_tools_node gate in tasks.py).
+    """
+    __tablename__ = "tool_approvals"
+
+    id = Column(String(64), primary_key=True)  # uuid4 hex
+    user_id = Column(String(100), nullable=False, index=True)
+    tool_name = Column(String(128), nullable=False)
+    args_json = Column(JSON)
+    status = Column(String(16), nullable=False, default="pending", index=True)  # pending|approved|rejected
+    run_id = Column(String(64), nullable=True, index=True)
+    decided_by = Column(String(100), nullable=True)
+    decision_note = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    decided_at = Column(DateTime(timezone=True), nullable=True)
+
+
 def save_graph_run(run_id: str, thread_id: str, user_id: str | None, question: str,
                    status: str = "running", db: Session = None) -> GraphRun:
     session_created = False
@@ -483,6 +540,75 @@ def ensure_database_schema():
         Base.metadata.create_all(bind=engine)
     except Exception as e:
         logger.warning("Database not ready during schema initialization: %s", e)
+
+
+# ---- Phase 2 — User repository ----
+import uuid as _uuid
+
+
+def create_user(username: str, password_hash: str, role: str = "user",
+                email: str | None = None, db: Session = None) -> User:
+    """Insert a new user. Raises on duplicate username (caller handles)."""
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        user = User(
+            id=_uuid.uuid4().hex,
+            username=username,
+            email=email,
+            password_hash=password_hash,
+            role=role,
+        )
+        db.add(user)
+        if session_created:
+            db.commit()
+            db.refresh(user)
+        return user
+    finally:
+        if session_created:
+            db.close()
+
+
+def get_user_by_username(username: str, db: Session = None) -> User | None:
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        return db.execute(
+            select(User).where(User.username == username)
+        ).scalars().first()
+    finally:
+        if session_created:
+            db.close()
+
+
+def get_user_by_id(user_id: str, db: Session = None) -> User | None:
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        return db.get(User, user_id)
+    finally:
+        if session_created:
+            db.close()
+
+
+def list_users(limit: int = 100, offset: int = 0, db: Session = None) -> list[User]:
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        return db.execute(
+            select(User).order_by(User.created_at.desc()).offset(offset).limit(limit)
+        ).scalars().all()
+    finally:
+        if session_created:
+            db.close()
 
 
 # insert document into database

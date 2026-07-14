@@ -14,3 +14,49 @@ if str(_BACKEND_SRC) not in sys.path:
 @pytest.fixture
 def sample_query() -> str:
     return "sample legal question"
+
+
+# ---- Phase 2: sqlite in-memory DB fixture ----
+# Swaps database.engine + SessionLocal to an in-memory sqlite engine and
+# creates all tables on models.Base. Lets audit/approval/user tests run
+# without a live MySQL. Scoped per-test (autouse=False): opt in via the
+# `sqlite_db` fixture.
+@pytest.fixture
+def sqlite_db(monkeypatch):
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import database
+    import models
+
+    engine = create_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+    )
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", SessionLocal)
+
+    def _get_db():
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    monkeypatch.setattr(database, "get_db", _get_db)
+
+    models.Base.metadata.create_all(bind=engine)
+    yield engine
+    models.Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture
+def jwt_secret(monkeypatch):
+    """Ensure JWT_SECRET is set for auth tests."""
+    monkeypatch.setenv("JWT_SECRET", "test-secret-not-for-prod")
+    monkeypatch.setenv("JWT_ALG", "HS256")
+    monkeypatch.setenv("JWT_EXP_MIN", "60")
+    monkeypatch.delenv("ALLOW_UNSAFE_AUTH", raising=False)
+    yield "test-secret-not-for-prod"

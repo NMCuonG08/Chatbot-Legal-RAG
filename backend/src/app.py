@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,7 +10,7 @@ from typing import Any, Dict, List, Optional
 import redis.asyncio as aioredis
 from celery.result import AsyncResult
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import delete
@@ -18,9 +19,12 @@ from sse_starlette.sse import EventSourceResponse
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
 from models import (
+    create_user,
     delete_user_conversations,
     delete_user_episodes,
     ensure_database_schema,
+    get_user_by_id,
+    get_user_by_username,
     insert_document,
     list_documents,
     list_user_conversations,
@@ -34,6 +38,23 @@ from security import (
     require_api_key,
     resolve_safe_data_path,
 )
+# Phase 2 — auth / RBAC / audit / approval / seed
+from auth import (
+    auth_configured,
+    create_access_token,
+    hash_password,
+    verify_password,
+)
+from audit import list_audit_entries, log_audit
+from approval import decide_approval, fetch_pending, get_approval
+from rbac import (
+    Principal,
+    Role,
+    get_current_user,
+    get_current_user_optional,
+    require_admin,
+)
+from seed_admin import seed_admin
 from tasks import index_document_v2, llm_handle_message, clear_user_runtime_caches_task
 from agent import clear_user_runtime_caches
 from database import settings as db_settings
@@ -60,6 +81,11 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     # Startup
     ensure_database_schema()
+    # Phase 2 — seed default admin from env (best-effort, idempotent).
+    try:
+        seed_admin()
+    except Exception as e:
+        logger.warning(f"Seed admin failed (non-fatal): {e}")
     init_semantic_cache()
     # One-time deploy migration: wipe legacy unscoped cache points so the new
     # per-user scope filter starts from a clean slate. No-op unless
@@ -110,6 +136,24 @@ class CompleteRequest(BaseModel):
     user_id: Optional[str] = "anonymous"
     user_message: str
     sync_request: Optional[bool] = False
+
+
+# Phase 2 — auth / approval request schemas
+class RegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    password: str = Field(..., min_length=6, max_length=128)
+    email: Optional[str] = None
+    role: Optional[str] = Field(default=Role.USER, pattern=r"^(admin|lawyer|user|guest)$")
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class ApprovalDecideRequest(BaseModel):
+    decision: str = Field(..., pattern=r"^(approved|rejected)$")
+    note: Optional[str] = None
 
 
 class ImportRequest(BaseModel):
@@ -169,6 +213,118 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "healthy", "service": "Vietnamese Legal Chatbot Backend"}
+
+
+# ---- Phase 2: auth / RBAC / approval / audit endpoints ----
+def _client_ip(request: "Request") -> Optional[str]:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+@app.post("/auth/register")
+async def register(req: RegisterRequest, request: "Request"):
+    """Register a new user. Self-registration is restricted to non-escalating
+    roles: a caller may NOT self-assign admin/lawyer via this public endpoint
+    — only user/guest. Existing-role seeding is done via ``seed_admin`` at
+    startup or by an admin out-of-band."""
+    if req.role in (Role.ADMIN, Role.LAWYER):
+        raise HTTPException(
+            status_code=403,
+            detail="Không thể tự đăng ký vai trò admin/lawyer. Liên hệ quản trị viên.",
+        )
+    if not auth_configured():
+        raise HTTPException(
+            status_code=500,
+            detail="JWT chưa được cấu hình (JWT_SECRET). Thiết lập trước khi dùng auth.",
+        )
+    if get_user_by_username(req.username) is not None:
+        raise HTTPException(status_code=409, detail="Tên đăng nhập đã tồn tại.")
+    try:
+        user = create_user(req.username, hash_password(req.password), role=req.role)
+    except Exception as exc:  # IntegrityError on concurrent duplicate insert
+        logger.warning(f"register duplicate/race: {exc}")
+        raise HTTPException(status_code=409, detail="Tên đăng nhập đã tồn tại.")
+    log_audit(
+        user_id=user.id,
+        action="register",
+        resource="user",
+        ip=_client_ip(request),
+        payload={"username": req.username, "role": req.role},
+    )
+    token = create_access_token(
+        subject=user.id, claims={"username": user.username, "role": user.role}
+    )
+    return {"access_token": token, "token_type": "bearer", "user": {"id": user.id, "username": user.username, "role": user.role}}
+
+
+@app.post("/auth/login")
+async def login(req: LoginRequest, request: "Request"):
+    """Exchange username/password for a JWT."""
+    if not auth_configured():
+        raise HTTPException(status_code=500, detail="JWT chưa được cấu hình (JWT_SECRET).")
+    user = get_user_by_username(req.username)
+    if user is None or not verify_password(req.password, user.password_hash):
+        # Same message for both branches to avoid username enumeration.
+        log_audit(
+            user_id=None,
+            action="login_failed",
+            resource="user",
+            ip=_client_ip(request),
+            payload={"username": req.username},
+        )
+        raise HTTPException(status_code=401, detail="Tên đăng nhập hoặc mật khẩu không đúng.")
+    token = create_access_token(
+        subject=user.id, claims={"username": user.username, "role": user.role}
+    )
+    log_audit(
+        user_id=user.id,
+        action="login",
+        resource="user",
+        ip=_client_ip(request),
+        payload={"username": user.username},
+    )
+    return {"access_token": token, "token_type": "bearer", "user": {"id": user.id, "username": user.username, "role": user.role}}
+
+
+@app.get("/auth/me")
+async def me(principal: Principal = Depends(get_current_user)):
+    return {"id": principal.user_id, "username": principal.username, "role": principal.role}
+
+
+@app.get("/approvals", dependencies=[Depends(require_admin)])
+async def list_approvals(limit: int = 100):
+    """List pending tool-approval requests (admin only)."""
+    return {"pending": fetch_pending(limit=limit)}
+
+
+@app.post("/approvals/{approval_id}/decide", dependencies=[Depends(require_admin)])
+async def approval_decide(
+    approval_id: str,
+    req: ApprovalDecideRequest,
+    principal: Principal = Depends(get_current_user),
+    request: Request = None,
+):
+    """Approve or reject a pending tool-approval request (admin only)."""
+    existing = get_approval(approval_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Không tìm thấy yêu cầu phê duyệt.")
+    updated = decide_approval(approval_id, req.decision, decided_by=principal.user_id, note=req.note)
+    log_audit(
+        user_id=principal.user_id,
+        action=f"approval_{req.decision}",
+        resource="tool_approval",
+        ip=_client_ip(request) if request else None,
+        payload={"approval_id": approval_id, "tool_name": existing.tool_name},
+    )
+    return {"id": updated.id, "status": updated.status, "decided_by": updated.decided_by}
+
+
+@app.get("/audit", dependencies=[Depends(require_admin)])
+async def audit_entries(limit: int = 200, offset: int = 0, user_id: Optional[str] = None, action: Optional[str] = None):
+    """Read the audit trail (admin only)."""
+    return {"entries": list_audit_entries(limit=limit, offset=offset, user_id=user_id, action=action)}
 
 
 @app.post("/feedback")
@@ -236,7 +392,19 @@ async def get_documents(limit: int = 100, offset: int = 0):
 
 
 @app.get("/history/{user_id}")
-async def get_user_history(user_id: str, limit: int = 100, offset: int = 0):
+async def get_user_history(
+    user_id: str,
+    limit: int = 100,
+    offset: int = 0,
+    principal: Optional[Principal] = Depends(get_current_user_optional),
+):
+    # Phase 2 — a caller may only read their own history; admin may read any.
+    if principal is None:
+        allow_anon = os.getenv("ALLOW_ANONYMOUS", "1") == "1"
+        if not allow_anon:
+            raise HTTPException(status_code=401, detail="Đăng nhập (JWT) là bắt buộc.")
+    elif principal.user_id != user_id and not principal.is_admin:
+        raise HTTPException(status_code=403, detail="Không có quyền xem lịch sử của user khác.")
     return {
         "user_id": user_id,
         "history": list_user_conversations(user_id, limit=limit, offset=offset),
@@ -246,7 +414,11 @@ async def get_user_history(user_id: str, limit: int = 100, offset: int = 0):
 
 
 @app.delete("/history/{user_id}")
-async def delete_history(user_id: str, bot_id: str = "botLawyer"):
+async def delete_history(
+    user_id: str,
+    bot_id: str = "botLawyer",
+    principal: Optional[Principal] = Depends(get_current_user_optional),
+):
     """Clear all chat history for a user, including from cache.
 
     Purges, per user:
@@ -268,6 +440,13 @@ async def delete_history(user_id: str, bot_id: str = "botLawyer"):
             detail="Không thể xóa lịch sử cho user_id dùng chung (anonymous/demo-session). "
             "Vui lòng dùng tên người dùng riêng.",
         )
+
+    # Phase 2 — a caller may only wipe their own history; admin may wipe any.
+    if principal is None:
+        if os.getenv("ALLOW_ANONYMOUS", "1") != "1":
+            raise HTTPException(status_code=401, detail="Đăng nhập (JWT) là bắt buộc.")
+    elif principal.user_id != user_id and not principal.is_admin:
+        raise HTTPException(status_code=403, detail="Không có quyền xóa lịch sử của user khác.")
 
     logger.info(f"Deleting history for user {user_id} and bot {bot_id}")
 
@@ -347,9 +526,25 @@ _SHARED_USER_SENTINELS = {"anonymous", "demo-session", ""}
 
 
 @app.post("/chat/complete")
-async def complete(data: CompleteRequest):
+async def complete(
+    data: CompleteRequest,
+    principal: Optional[Principal] = Depends(get_current_user_optional),
+    request: Request = None,
+):
     bot_id = data.bot_id
-    user_id = data.user_id
+    # Phase 2 — trust the JWT subject over the client-supplied user_id so a
+    # user cannot impersonate another by editing the payload. Fall back to the
+    # payload id only for the legacy anonymous demo path (ALLOW_ANONYMOUS=1).
+    if principal is not None:
+        user_id = principal.user_id
+    else:
+        allow_anon = os.getenv("ALLOW_ANONYMOUS", "1") == "1"
+        user_id = data.user_id
+        if not allow_anon:
+            raise HTTPException(
+                status_code=401,
+                detail="Đăng nhập (JWT) là bắt buộc. ALLOW_ANONYMOUS=0 đang bật.",
+            )
     user_message = data.user_message
     logger.info(f"Complete chat from user {user_id} to {bot_id}: {user_message}")
 
@@ -377,6 +572,14 @@ async def complete(data: CompleteRequest):
     if blocked:
         return {"response": blocked, "sources": []}
 
+    log_audit(
+        user_id=user_id,
+        action="chat",
+        resource="message",
+        ip=_client_ip(request) if request else None,
+        payload={"bot_id": bot_id, "role": principal.role if principal else "anonymous"},
+    )
+
     if data.sync_request:
         # llm_handle_message is sync (Celery task called directly). Run in a
         # worker thread so the uvicorn event loop is NOT blocked for the whole
@@ -384,7 +587,9 @@ async def complete(data: CompleteRequest):
         response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message)
         return {
             "response": response.get("content", ""),
-            "sources": response.get("sources", [])
+            "sources": response.get("sources", []),
+            "route": response.get("route", ""),
+            "tool_calls": response.get("tool_calls", [])
         }
     else:
         try:
@@ -399,6 +604,8 @@ async def complete(data: CompleteRequest):
             return {
                 "response": response.get("content", ""),
                 "sources": response.get("sources", []),
+                "route": response.get("route", ""),
+                "tool_calls": response.get("tool_calls", [])
             }
 
 
