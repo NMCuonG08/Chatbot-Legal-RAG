@@ -228,21 +228,117 @@ class TestCli:
         cli.main()
         assert fake.calls and fake.calls[0]["transport"] is None
 
-    def test_main_http_calls_run_with_host_port(self, monkeypatch):
+    def test_main_http_builds_app_and_runs_uvicorn(self, monkeypatch):
         from mcp_server import __main__ as cli
 
         fake = _FakeMcp()
         monkeypatch.setattr(cli, "mcp", fake)
-        monkeypatch.setattr("sys.argv", ["mcp_server", "--transport", "http", "--host", "127.0.0.1", "--port", "9999"])
+        monkeypatch.setenv("MCP_API_KEY", "test-key-abc")
+        captured = {}
+        monkeypatch.setattr(
+            "uvicorn.run",
+            lambda app, **kw: captured.update({"app": app, "kw": kw}),
+        )
+        monkeypatch.setattr(
+            "sys.argv", ["mcp_server", "--transport", "http", "--host", "127.0.0.1", "--port", "9999"]
+        )
         cli.main()
-        assert fake.calls[0]["transport"] == "streamable-http"
-        assert fake.calls[0]["host"] == "127.0.0.1"
-        assert fake.calls[0]["port"] == 9999
+        # uvicorn.run was invoked with the wrapped (auth) app + host/port.
+        assert captured["kw"]["host"] == "127.0.0.1"
+        assert captured["kw"]["port"] == 9999
+        assert fake.streamable_calls == 1
+        assert captured["app"] is not None
+
+    def test_main_http_refuses_without_key(self, monkeypatch):
+        from mcp_server import __main__ as cli
+
+        monkeypatch.setattr(cli, "mcp", _FakeMcp())
+        monkeypatch.delenv("MCP_API_KEY", raising=False)
+        monkeypatch.delenv("MCP_ALLOW_NO_AUTH", raising=False)
+        monkeypatch.setattr("sys.argv", ["mcp_server", "--transport", "http"])
+        with pytest.raises(RuntimeError, match="MCP_API_KEY"):
+            cli.main()
+
+    def test_main_http_allow_no_auth_dev_bypass(self, monkeypatch):
+        from mcp_server import __main__ as cli
+
+        fake = _FakeMcp()
+        monkeypatch.setattr(cli, "mcp", fake)
+        monkeypatch.delenv("MCP_API_KEY", raising=False)
+        monkeypatch.setenv("MCP_ALLOW_NO_AUTH", "1")
+        captured = {}
+        monkeypatch.setattr("uvicorn.run", lambda app, **kw: captured.update({"kw": kw}))
+        monkeypatch.setattr("sys.argv", ["mcp_server", "--transport", "http"])
+        cli.main()
+        assert captured["kw"]["port"] == 8100  # default
 
 
 class _FakeMcp:
     def __init__(self):
         self.calls = []
+        self.streamable_calls = 0
 
     def run(self, *args, **kwargs):
         self.calls.append({"args": args, "kwargs": kwargs, "transport": kwargs.get("transport"), "host": kwargs.get("host"), "port": kwargs.get("port")})
+
+    def streamable_http_app(self):
+        self.streamable_calls += 1
+
+        async def _app(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        return _app
+
+
+# ---- Bearer auth middleware (mcp_server.auth) ----
+class TestBearerAuth:
+    def _build(self):
+        from starlette.applications import Starlette
+        from starlette.middleware import Middleware
+        from starlette.routing import Mount
+        from mcp_server.auth import BearerAuthMiddleware
+
+        async def _inner(scope, receive, send):
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        return Starlette(
+            routes=[Mount("/", app=_inner)],
+            middleware=[Middleware(BearerAuthMiddleware)],
+        )
+
+    def _get(self, app, headers=None):
+        from starlette.testclient import TestClient
+
+        with TestClient(app) as client:
+            return client.get("/", headers=headers or {})
+
+    def test_valid_key_passes(self, monkeypatch):
+        monkeypatch.setenv("MCP_API_KEY", "secret-key")
+        resp = self._get(self._build(), {"Authorization": "Bearer secret-key"})
+        assert resp.status_code == 200
+
+    def test_missing_header_rejected(self, monkeypatch):
+        monkeypatch.setenv("MCP_API_KEY", "secret-key")
+        resp = self._get(self._build())
+        assert resp.status_code == 401
+        assert resp.json()["error"] == "unauthorized"
+
+    def test_wrong_key_rejected(self, monkeypatch):
+        monkeypatch.setenv("MCP_API_KEY", "secret-key")
+        resp = self._get(self._build(), {"Authorization": "Bearer wrong"})
+        assert resp.status_code == 401
+
+    def test_no_key_configured_refuses(self, monkeypatch):
+        monkeypatch.delenv("MCP_API_KEY", raising=False)
+        monkeypatch.delenv("MCP_ALLOW_NO_AUTH", raising=False)
+        resp = self._get(self._build())
+        assert resp.status_code == 401
+        assert "not_configured" in resp.json()["detail"]
+
+    def test_allow_no_auth_bypass(self, monkeypatch):
+        monkeypatch.delenv("MCP_API_KEY", raising=False)
+        monkeypatch.setenv("MCP_ALLOW_NO_AUTH", "1")
+        resp = self._get(self._build())
+        assert resp.status_code == 200

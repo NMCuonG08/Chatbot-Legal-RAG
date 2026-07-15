@@ -79,6 +79,69 @@ mcp dev src/mcp_server/server.py:mcp
 
 Lưu ý: chạy từ thư mục `backend/src/` (hoặc set `PYTHONPATH` tới `backend/src`) để các import `legal_*` resolve.
 
+## Auth (HTTP transport)
+
+stdio **không** cần auth (local process). HTTP transport bắt buộc **1 bearer key chung** cho mọi client — set 1 env là xong, dễ deploy.
+
+### Sinh key
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+# ví dụ: p7xQ9...k3A  -> paste vào MCP_API_KEY
+```
+
+### Env
+
+```bash
+MCP_TRANSPORT=http
+MCP_HTTP_PORT=8100
+MCP_API_KEY=p7xQ9...k3A          # bắt buộc khi HTTP
+MCP_ALLOW_NO_AUTH=0               # dev only = 1 (bỏ qua auth, KHÔNG dùng prod)
+```
+
+Khi `MCP_API_KEY` trống và `MCP_ALLOW_NO_AUTH != 1`, server **refuse start** (chống leak tool public). Client gửi header:
+
+```
+Authorization: Bearer <MCP_API_KEY>
+```
+
+Sai/thiếu key → `401 {"error":"unauthorized","detail":"..."}`. So sánh constant-time (`secrets.compare_digest`).
+
+### Chạy HTTP
+
+```bash
+cd backend/src
+export MCP_API_KEY="$(python -c 'import secrets;print(secrets.token_urlsafe(32))')"
+python -m mcp_server --transport http --host 0.0.0.0 --port 8100
+# endpoint: http://<host>:8100/mcp
+```
+
+### Claude Desktop / Cloud Desktop — remote HTTP (streamable-http)
+
+MCP server chạy remote (VPS/docker), client chỉ cần URL + header bearer. Config `claude_desktop_config.json` (hoặc Connectors panel trên claude.ai):
+
+```json
+{
+  "mcpServers": {
+    "legal-tools-vn": {
+      "type": "streamable-http",
+      "url": "https://your-deploy.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer p7xQ9...k3A"
+      }
+    }
+  }
+}
+```
+
+**Cloud desktop (claude.ai)**: Settings → Connectors → Add custom connector → dán URL `https://your-deploy.example.com/mcp` + header `Authorization: Bearer <key>`. Key chung cho cả workspace.
+
+**Lưu ý prod:**
+- Đặt server sau HTTPS reverse proxy (nginx/caddy) — bearer header chỉ an toàn qua TLS.
+- Rotate key bằng cách đổi `MCP_API_KEY` + restart; toàn bộ client cũ bị kick ngay.
+- Không log key. `BearerAuthMiddleware` không bao giờ echo key trong response/error.
+- 1 key = all-or-nothing. Cần per-user (rate limit, audit theo user) → dùng `auth.py` JWT layer thay vì key này.
+
 ## Test
 
 ```bash
