@@ -256,6 +256,28 @@ Four pillars:
 *   **LLM fallback:** Vietnamese LLM / Ollama-main → Groq on error.
 *   **Atomic SQL transactions** for metadata edits with automatic rollback; Redis distributed locks prevent concurrent-indexing races.
 
+### 7.1 Agent lifecycle retry & resilience (4 layers)
+
+The agent runtime treats failure/retry as a layered lifecycle — each layer retries
+its own transient failure class before surfacing, so a brief infra hiccup never
+becomes a user-visible error. Layers, from hottest to coarsest:
+
+| Layer | Mechanism | File | Guard |
+|-------|----------|------|-------|
+| 1. LLM call | `FallbackLLM` retries the primary provider 3× with exponential backoff (`with_retry` sync / `awith_retry` async) **before** cross-provider fallback. **Every** `_build_llm` path is wrapped — single-provider configs use `FallbackLLM(primary=llm, fallback=llm)` so the retry is the resilience even with no second provider. Only transient errors (HTTP 429/5xx, connection/timeout via `is_retryable_exception`) retry; logic errors propagate at once. | `backend/src/agent.py`, `backend/src/retry_utils.py` | `max_attempts=3`, backoff `1→2→4→8s` cap |
+| 2. Embedding | own retry loop with API-key rotation across configured keys (Cohere cloud fallback if local :5000 is down). | `backend/src/custom_embedding.py` | `max_retries = len(keys) * 3` |
+| 3. Graph node (self-correction) | CRAG loop `retrieve → grade → {generate \| rewrite_query → retrieve \| web_search}`; PEV `verify_answer` loops back to `rewrite_query` on `unsupported`/`partial`; supervisor multi-agent handoff. All cyclic edges are capped so the graph can never loop forever. | `backend/src/tasks.py` | `REFLECTION_MAX=2`, `VERIFY_MAX_RETRIES=2`, `MAX_HANDOFF_STEPS=5` (+ per-edge flags) |
+| 4. Celery task | Idempotent tasks (`bot_rag_answer_message`, `bot_route_answer_message`) use `@shared_task(autoretry_for=..., retry_backoff=True, retry_jitter=True)` — Celery auto-retries transient infra exceptions (Redis/DB/Qdrant/HTTP via `build_transient_exceptions`) with capped backoff + jitter. | `backend/src/tasks.py` | `TASK_MAX_RETRIES=3`, `TASK_RETRY_BACKOFF_MAX=60` |
+
+**`llm_handle_message` is deliberately NOT Celery-autoretried.** Its `update_chat_conversation` write is append-only (non-idempotent), so a task-level retry would duplicate the user message + reply. Instead, the LangGraph `run_chat_graph` invoke is wrapped in `with_retry` (3× backoff): a retry re-invokes with the same `thread_id`, so LangGraph **resumes from its last checkpoint** — no duplicate user message, no duplicate reply. If all retries are exhausted, the task degrades gracefully: it returns a user-facing Vietnamese "overloaded / reconnecting infrastructure" message, emits `run_end(status="error")`, and **succeeds** as a Celery task (no dead-task, no client exception). On degrade, semantic-cache write and episodic-memory ingestion are skipped (an error must never be cached as an answer nor extracted as a user fact).
+
+**Retry policy invariants:**
+*   Only transient errors retry — `is_retryable_exception` checks `status_code` (429/500/502/503/504) and `requests`/Redis connection+timeout. Non-retryable errors (auth, validation, value errors) propagate immediately to preserve existing `try/except` fallback contracts.
+*   `awith_retry` (async) sleeps via `asyncio.sleep` so it never blocks the event loop. It applies to coroutine functions only — generator-based streaming methods cannot be retried by a decorator (the body runs lazily after `return`), so streams keep their own `try/except` provider-fallback path.
+*   Stream methods (`stream_chat`/`stream_complete`) fall back on first error but do not retry — mid-stream retry would double-emit tokens.
+
+---
+
 ---
 
 ## 8. Where things live
@@ -266,6 +288,7 @@ Four pillars:
 | Celery + LangGraph workflow | `backend/src/tasks.py` |
 | LLM routing + intent/router | `backend/src/brain.py` |
 | ReAct agent + tools | `backend/src/agent.py` |
+| Retry / backoff (`with_retry`, `awith_retry`, `build_transient_exceptions`) | `backend/src/retry_utils.py` |
 | Legal calculation logic | `backend/src/legal_tools.py` |
 | Security (admin API-key, path guard, CORS) | `backend/src/security.py` |
 | Authentication (JWT, bcrypt) | `backend/src/auth.py` |

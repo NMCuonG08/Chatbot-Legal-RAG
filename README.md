@@ -156,7 +156,8 @@ Chatbot-Legal-RAG/
 │   │   ├── models.py             # Pydantic data models & GraphRun/AgentStep/AgentFeedback DB models
 │   │   ├── search.py             # Hybrid search index + BM25 retriever
 │   │   ├── semantic_cache.py     # Qdrant-based vector caching (user-scoped, sentinel-aware)
-│   │   ├── config.py             # CRAG + PEV + metacognitive + RLHF tuning constants
+│   │   ├── config.py             # CRAG + PEV + metacognitive + RLHF + task-retry tuning constants
+│   │   ├── retry_utils.py         # with_retry / awith_retry + build_transient_exceptions (lifecycle retry)
 │   │   ├── database.py           # Database connection & session orchestration
 │   │   ├── cache.py              # Redis cache integration
 │   │   ├── tasks.py              # Celery tasks + LangGraph StateGraph (CRAG loop, PEV verify, metacognitive, RLHF, handoff, trace, checkpoint)
@@ -349,7 +350,7 @@ Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing t
 *   `log_audit(user_id, action, resource, ip, payload)` is best-effort: any DB failure is caught + logged server-side so an audit-store outage never breaks a request. `GET /audit` (admin) lists entries with optional user/action filters. Login/register/chat/admin-decision events are recorded.
 
 ### 8. Multi-Provider LLM Routing
-Generation routes by `LLM_PROVIDER` (`groq` | `ollama` | `openai`) with graceful fallback (Vietnamese LLM API → Groq; Ollama main → Groq). Token usage is accumulated in-process via a `usage_accumulator` contextvar for cost metrics — no external tracing service required.
+Generation routes by `LLM_PROVIDER` (`groq` | `ollama` | `openai`) with graceful fallback (Vietnamese LLM API → Groq; Ollama main → Groq). Every provider path is wrapped in `FallbackLLM` so transient calls (429/5xx/timeout) retry 3× with exponential backoff before cross-provider fallback — single-provider configs use `primary==fallback` so the retry itself is the resilience. Token usage is accumulated in-process via a `usage_accumulator` contextvar for cost metrics — no external tracing service required. See [Failure handling §7.1](docs/ARCHITECTURE.md#71-agent-lifecycle-retry--resilience-4-layers) for the full 4-layer retry lifecycle (LLM call → embedding → graph self-correction → Celery task).
 
 ### 9. Comprehensive RAG Evaluation Suite
 A 4-pillar framework tracking operational metrics (token count, API cost, latency TTFT/TTLT), quality metrics (LLM-as-judge faithfulness/relevance), agentic metrics (tool-call success via the `agent_tool_calls` contextvar, router accuracy), and failure-mode analysis (Retrieval / Routing / Hallucination / Execution).

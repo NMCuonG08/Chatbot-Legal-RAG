@@ -27,3 +27,16 @@ ESCALATION_CONFIDENCE_THRESHOLD = 0.6
 # 👍-marked answer for the current user. Small so a good-answer source wins
 # ties without overriding a clearly-more-relevant chunk.
 RLHF_RERANK_BOOST = 0.05
+
+# ---- Task-level failure/retry (lifecycle resilience) ----
+# Celery autoretry knobs for idempotent tasks whose only realistic failure mode
+# is transient infra (Redis/DB/Qdrant/HTTP down). Side-effectful tasks with
+# non-idempotent writes (llm_handle_message) do NOT autoretry — they degrade
+# gracefully instead — because a retry would duplicate the user message + reply.
+TASK_MAX_RETRIES = 3
+# Exponential backoff: Celery sleeps 1, 2, 4 ... seconds (capped) between
+# attempts when retry_backoff=True. Jitter spreads a thundering herd of
+# retries after a shared outage.
+TASK_RETRY_BACKOFF = True
+TASK_RETRY_BACKOFF_MAX = 60
+TASK_RETRY_JITTER = True

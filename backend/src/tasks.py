@@ -48,6 +48,28 @@ from config import (
     ALL_IRRELEVANT_THRESHOLD,
     VERIFY_MAX_RETRIES,
     RLHF_RERANK_BOOST,
+    TASK_MAX_RETRIES,
+    TASK_RETRY_BACKOFF,
+    TASK_RETRY_BACKOFF_MAX,
+    TASK_RETRY_JITTER,
+)
+from retry_utils import with_retry, build_transient_exceptions
+
+# Exception classes whose transient failure should trigger a Celery task retry.
+# Built once at import; optional deps (redis/sqlalchemy/requests) imported lazily
+# inside build_transient_exceptions so a missing client lib never breaks import.
+_TRANSIENT_EXCEPTIONS = build_transient_exceptions()
+
+# Shared autoretry kwargs for idempotent tasks. Applied ONLY to tasks with no
+# non-idempotent side effects (or idempotent ones like uuid5-dedup episodic
+# writes). Side-effectful tasks with append-only writes (llm_handle_message)
+# must NOT use this — a retry would duplicate the user message + reply.
+_AUTORETRY_KWARGS = dict(
+    autoretry_for=_TRANSIENT_EXCEPTIONS,
+    max_retries=TASK_MAX_RETRIES,
+    retry_backoff=TASK_RETRY_BACKOFF,
+    retry_backoff_max=TASK_RETRY_BACKOFF_MAX,
+    retry_jitter=TASK_RETRY_JITTER,
 )
 from database import get_celery_app, SessionLocal, settings
 from models import (
@@ -1156,7 +1178,7 @@ def run_chat_graph(history, question, user_id=None, conversation_id=None, run_id
     }
 
 
-@shared_task()
+@shared_task(**_AUTORETRY_KWARGS)
 def bot_rag_answer_message(history, question):
     standalone_question = follow_up_question(history, question)
     ans, sources = generate_rag_answer(history, standalone_question)
@@ -1321,7 +1343,7 @@ def get_summarized_response(response):
     return output
 
 
-@shared_task()
+@shared_task(**_AUTORETRY_KWARGS)
 def bot_route_answer_message(history, question):
     return run_chat_graph(history, question)
 
@@ -1529,8 +1551,16 @@ def llm_handle_message(self, bot_id, user_id, question, role=None):
                 trace_redis.setex(f"trace:run:{celery_task_id}", 600, run_id)
             except Exception as e:
                 logger.warning(f"trace:run key set failed: {e}")
+        # Retry transient infra failures (RedisSaver/DB/Qdrant hiccups) on the
+        # graph invoke itself, NOT at Celery task level. Retrying here re-invokes
+        # with the same thread_id, so LangGraph resumes from its last checkpoint
+        # — no duplicate user message (the user msg was saved BEFORE the graph),
+        # no duplicate reply. We do NOT use Celery autoretry for this task because
+        # it would re-run the append-only user-message save and duplicate the turn.
+        _run_graph_retried = with_retry(max_attempts=3, base_delay=1.0, max_delay=8.0)(run_chat_graph)
+        graph_failed = False
         try:
-            graph_result = run_chat_graph(
+            graph_result = _run_graph_retried(
                 history, question, user_id=user_id,
                 conversation_id=conversation_id, run_id=run_id, role=role,
             )
@@ -1546,8 +1576,30 @@ def llm_handle_message(self, bot_id, user_id, question, role=None):
                 tool_calls_json=tool_calls if tool_calls else None,
             )
         except Exception as graph_err:
+            # All retries exhausted (or a non-transient error). Degrade
+            # gracefully: return a user-facing error instead of raising, so the
+            # Celery task SUCCEEDS (no dead-task, no client exception) and the
+            # user gets a clear retry prompt. Skip cache + episodic (an error
+            # message must not be cached as an answer, nor extracted as a fact).
+            graph_failed = True
             emit_run_end(run_id, conversation_id, status="error")
-            raise
+            logger.exception("Chat graph failed after retries; degrading gracefully: %s", graph_err)
+            graph_result = {
+                "response": (
+                    "Xin lỗi, hệ thống đang tạm thời quá tải hoặc không kết nối được với "
+                    "hạ tầng lưu trữ (Redis/DB/Qdrant). Vui lòng thử lại sau ít phút."
+                ),
+                "sources": [],
+                "tool_calls": [],
+                "route": "error",
+                "reflection_count": 0,
+                "verify_score": 0.0,
+                "verify_verdict": "",
+                "retry_verify": 0,
+            }
+            response_text = graph_result["response"]
+            sources = []
+            tool_calls = []
 
     # Save full response to history (to preserve all details like the specific age)
     update_chat_conversation(bot_id, user_id, response_text, False)
@@ -1555,8 +1607,14 @@ def llm_handle_message(self, bot_id, user_id, question, role=None):
     # 4. Save to Semantic Cache if not blocked. Skip for shared sentinel
     # user_ids: the answer may carry this client's private facts, and caching
     # it under either user:<sentinel> or common would replay it to other
-    # clients. No cache is better than a leaking cache here.
-    if not blocked_response and (user_id or "").strip() not in _SHARED_USER_SENTINELS and "nocache" not in (user_id or ""):
+    # clients. No cache is better than a leaking cache here. Also skip when the
+    # graph degraded to an error reply — never cache an error as an answer.
+    if (
+        not blocked_response
+        and not graph_failed
+        and (user_id or "").strip() not in _SHARED_USER_SENTINELS
+        and "nocache" not in (user_id or "")
+    ):
         try:
             import sys
             import os
@@ -1578,8 +1636,9 @@ def llm_handle_message(self, bot_id, user_id, question, role=None):
     # Skip when: (a) the input was blocked by guardrails — never persist a
     # blocked/jailbreak message as a "user fact"; (b) user_id is a shared
     # sentinel — writing would leak one client's private facts into the
-    # shared bucket every other sentinel client reads from.
-    if not blocked_response and (user_id or "").strip() not in _SHARED_USER_SENTINELS:
+    # shared bucket every other sentinel client reads from; (c) the graph
+    # degraded to an error — an error reply carries no real user facts.
+    if not blocked_response and not graph_failed and (user_id or "").strip() not in _SHARED_USER_SENTINELS:
         try:
             save_episodic_memory_task.delay(user_id, conversation_id)
             logger.info("Triggered save_episodic_memory_task asynchronously")

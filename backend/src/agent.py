@@ -28,6 +28,8 @@ from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.llms import ChatMessage, CustomLLM, CompletionResponse, ChatResponse, LLMMetadata, MessageRole
 from llama_index.core.llms.callbacks import llm_chat_callback, llm_completion_callback
 
+from retry_utils import with_retry, awith_retry
+
 # Re-export tracking symbols for back-compat (tests/eval import via `agent.*`).
 from agent_tool_tracking import agent_tool_calls, track_tool_call, agent_user_id  # noqa: F401
 from agent_tool_wrappers import all_tools  # noqa: F401
@@ -56,36 +58,55 @@ class FallbackLLM(CustomLLM):
 
     @llm_chat_callback()
     def chat(self, messages: List[ChatMessage], **kwargs) -> ChatResponse:
-        try:
+        # Retry transient primary errors (429/5xx/timeout) before falling back,
+        # so a brief rate-limit burst does NOT immediately switch providers.
+        # Non-retryable errors skip retry and fall back at once.
+        @with_retry(max_attempts=3, base_delay=1.0, max_delay=8.0)
+        def _primary():
             logger.info(f"[FallbackLLM] Attempting chat using primary LLM ({type(self.primary_llm).__name__})...")
             return self.primary_llm.chat(messages, **kwargs)
+
+        try:
+            return _primary()
         except Exception as e:
             logger.warning(f"[FallbackLLM] Primary LLM failed: {e}. Falling back to ({type(self.fallback_llm).__name__})...")
             return self.fallback_llm.chat(messages, **kwargs)
 
     @llm_chat_callback()
     async def achat(self, messages: List[ChatMessage], **kwargs) -> ChatResponse:
-        try:
+        @awith_retry(max_attempts=3, base_delay=1.0, max_delay=8.0)
+        async def _primary():
             logger.info(f"[FallbackLLM] Attempting async chat using primary LLM ({type(self.primary_llm).__name__})...")
             return await self.primary_llm.achat(messages, **kwargs)
+
+        try:
+            return await _primary()
         except Exception as e:
             logger.warning(f"[FallbackLLM] Primary LLM failed: {e}. Falling back to ({type(self.fallback_llm).__name__})...")
             return await self.fallback_llm.achat(messages, **kwargs)
 
     @llm_completion_callback()
     def complete(self, prompt: str, **kwargs) -> CompletionResponse:
-        try:
+        @with_retry(max_attempts=3, base_delay=1.0, max_delay=8.0)
+        def _primary():
             logger.info(f"[FallbackLLM] Attempting complete using primary LLM ({type(self.primary_llm).__name__})...")
             return self.primary_llm.complete(prompt, **kwargs)
+
+        try:
+            return _primary()
         except Exception as e:
             logger.warning(f"[FallbackLLM] Primary LLM failed: {e}. Falling back to ({type(self.fallback_llm).__name__})...")
             return self.fallback_llm.complete(prompt, **kwargs)
 
     @llm_completion_callback()
     async def acomplete(self, prompt: str, **kwargs) -> CompletionResponse:
-        try:
+        @awith_retry(max_attempts=3, base_delay=1.0, max_delay=8.0)
+        async def _primary():
             logger.info(f"[FallbackLLM] Attempting async complete using primary LLM ({type(self.primary_llm).__name__})...")
             return await self.primary_llm.acomplete(prompt, **kwargs)
+
+        try:
+            return await _primary()
         except Exception as e:
             logger.warning(f"[FallbackLLM] Primary LLM failed: {e}. Falling back to ({type(self.fallback_llm).__name__})...")
             return await self.fallback_llm.acomplete(prompt, **kwargs)
@@ -116,7 +137,13 @@ class FallbackLLM(CustomLLM):
 
 def _build_llm():
     """Build the LlamaIndex LLM from env vars. Returns None if config missing.
-    Supports fallback if USE_OLLAMA_AS_MAIN=true.
+
+    ALWAYS wraps the chosen provider in FallbackLLM so transient call errors
+    (429 rate limits, 5xx, connection/timeout) are retried with exponential
+    backoff before surfacing — even when only ONE provider is configured. With a
+    single provider, primary==fallback, so the wrapper's value is the retry, not
+    provider switching. With Ollama-as-main + Groq configured, primary=Ollama /
+    fallback=Groq gives genuine cross-provider failover on top of the retry.
     """
     # 1. Build Groq (as fallback or primary)
     from llama_index.llms.groq import Groq
@@ -144,26 +171,50 @@ def _build_llm():
 
     # Check routing
     use_ollama_as_main = os.environ.get("USE_OLLAMA_AS_MAIN", "false").lower() == "true"
-    
+
+    def _single(llm):
+        """Wrap a lone provider as FallbackLLM(primary=llm, fallback=llm).
+
+        primary==fallback is intentional: there is no second provider to switch
+        to, so the point of the wrapper is NOT provider fallback — it is the
+        transient-call retry (``with_retry``/``awith_retry`` baked into
+        FallbackLLM.chat/complete/achat/acomplete). On exhaustion the "fallback"
+        simply re-runs the same provider once more, i.e. a second retry burst.
+        Returns None when ``llm`` is None (no provider configured at all).
+        """
+        if llm is None:
+            return None
+        logger.info(f"Using FallbackLLM (single-provider retry): {type(llm).__name__}")
+        return FallbackLLM(primary_llm=llm, fallback_llm=llm)
+
     if use_ollama_as_main:
         if groq_llm:
             logger.info("Using FallbackLLM: Primary = Ollama, Fallback = Groq")
             return FallbackLLM(primary_llm=ollama_llm, fallback_llm=groq_llm)
-        else:
-            logger.info("Ollama is main, but Groq is not configured. Using Ollama only.")
-            return ollama_llm
+        logger.info("Ollama is main, but Groq is not configured. Using Ollama only (retry-wrapped).")
+        return _single(ollama_llm)
 
     # Default routing behavior based on LLM_PROVIDER
     llm_provider = os.environ.get("LLM_PROVIDER", "groq").lower()
     if llm_provider == "ollama":
-        return ollama_llm
+        return _single(ollama_llm)
     elif llm_provider == "openai":
         from llama_index.llms.openai import OpenAI
         openai_key = os.environ.get("OPENAI_API_KEY")
         openai_base = os.environ.get("OPENAI_API_BASE")
-        return OpenAI(model=os.environ.get("LLM_MODEL"), api_key=openai_key, api_base=openai_base, temperature=0.1)
+        openai_llm = OpenAI(
+            model=os.environ.get("LLM_MODEL"),
+            api_key=openai_key,
+            api_base=openai_base,
+            temperature=0.1,
+        )
+        return _single(openai_llm)
     else:
-        return groq_llm
+        # Default provider = Groq. Return None (not a wrapped None) when no key
+        # is configured so callers' `if _llm is None` guard still works.
+        if groq_llm is None:
+            return None
+        return _single(groq_llm)
 
 
 def _get_agent_system_prompt(history_summary: str = "") -> str:
