@@ -2,6 +2,7 @@
 
 > Tóm tắt: đã xây xong **hệ thống eval/harness 7 phase** (P1–P7) cho Legal chatbot. Tất cả code + test đã commit (`9dd0782`→`ef24020`).
 > **Một entry duy nhất: `scripts/dev.sh`** — infra / app / test / eval / prod đều qua nó. Ops/MLOps/opsdev gọi cùng path.
+> **Onboard nhanh**: đọc `CODEBASE_GUIDE.md` (knowledge-graph dạng markdown — architecture layers + component map + flows + guided tour, sinh bằng method Understand-Anything).
 
 ## ⚡ Cheat sheet (1 lệnh / việc)
 
