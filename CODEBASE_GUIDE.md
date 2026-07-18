@@ -269,7 +269,7 @@ scripts/dev.sh prod      # full boot runbook
 - **9 module test collection error**: langchain-groq 1.1.3 / langchain-core `ModelProfile` import mismatch (ngoài eval harness) — ignore trong offline gate (`pytest.ini` comment). Tracked riêng.
 - **2 module drift**: `test_react_toolcalls`, `test_per_conversation_memory` — `agent._get_ai_agent` xóa trong refactor.
 - **sandbox.py wired opt-in**: `@sandboxable` decorator trên 16 pure-compute wrappers + `config.SANDBOX_ENABLED` (default off). Khi bật, tool chạy trong subprocess scrubbed-env + timeout; khi tắt, passthrough in-process (zero overhead). Test: `test_sandboxable.py`.
-- **Stop condition regex**: supervisor/planner parse `<handoff>`/`<step>` free-text, chưa structured JSON.
+- **Stop condition structured JSON**: supervisor/planner giờ yêu cầu JSON terminal (`{"next":...}` / `{"steps":[...]}`) + schema-validate qua `llm_json.extract_json`; legacy `<handoff>`/`<step>` tag là fallback. Test: `test_structured_stop.py`.
 - **Trace per-tool-call + latency**: `@track_tool_call` emit `tool_call` event với `latency_ms` qua `agent_run_id`/`agent_thread_id` contextvar. `run_id` per-message (per-turn), `thread_id` per-session — `load_session_trace(thread_id)` replay cả hội thoại thành 1 trace.
 - **Self-preference judge**: Llama judge Llama. Mitigate swap+CoT+Ollama+kappa.
 

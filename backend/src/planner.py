@@ -22,6 +22,8 @@ import logging
 import re
 from typing import Dict, List
 
+from llm_json import extract_json
+
 logger = logging.getLogger(__name__)
 
 # Specialists the planner may assign. "rag" = vector retrieve + CRAG;
@@ -32,12 +34,9 @@ MAX_PLAN_STEPS = 5
 
 _PLAN_PROMPT_TMPL = """\
 Bạn là bộ lập kế hoạch (planner) cho hệ thống pháp luật Việt Nam.
-Phân tích câu hỏi và lịch sử, rồi đưa ra kế hoạch thực hiện dạng:
+Phân tích câu hỏi và lịch sử, rồi đưa ra kế hoạch thực hiện dạng JSON:
 
-<plan>
-<step specialist="rag|tool|web|chat" goal="mô tả mục tiêu bước này bằng tiếng Việt" />
-<step specialist="..." goal="..." />
-</plan>
+{{"steps": [{{"specialist": "rag|tool|web|chat", "goal": "mô tả mục tiêu bước này bằng tiếng Việt"}}, ...]}}
 
 Quy ước specialist:
 - rag: tra cứu tài liệu luật / điều luật / án lệ (truy xuất vector).
@@ -48,7 +47,7 @@ Quy ước specialist:
 Quy tắc:
 - Câu hỏi đơn giản -> đúng 1 bước.
 - Câu hỏi nhiều ý -> nhiều bước, mỗi bước một specialist, tối đa {max_steps} bước.
-- Chỉ trả về khối <plan>...</plan>, không giải thích thêm.
+- Chỉ trả về JSON, không giải thích, không markdown, không thẻ <plan>.
 
 Câu hỏi: {question}
 Lịch sử tóm tắt: {history}
@@ -94,14 +93,45 @@ def _extract(pattern: re.Pattern, text: str) -> List[Dict[str, str]]:
     return out
 
 
+def _json_steps(obj: object) -> List[Dict[str, str]]:
+    """Schema-validate a parsed JSON object into plan steps. Returns [] if
+    the object is not ``{"steps": [{"specialist","goal"}, ...]}`` or any step
+    is malformed."""
+    if not isinstance(obj, dict):
+        return []
+    raw_steps = obj.get("steps")
+    if not isinstance(raw_steps, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for s in raw_steps:
+        if not isinstance(s, dict):
+            continue
+        specialist = str(s.get("specialist", "")).strip().lower()
+        goal = str(s.get("goal", "") or "").strip()
+        if specialist not in SPECIALISTS:
+            specialist = _ALIAS.get(specialist, specialist)
+        if specialist not in SPECIALISTS or not goal:
+            continue
+        out.append({"specialist": specialist, "goal": goal})
+    return out
+
+
 def parse_plan(text: str) -> List[Dict[str, str]]:
     """Extract steps from the LLM plan response. Returns [] on no match.
 
+    Primary path (structured stop condition): parse a JSON object
+    ``{"steps": [{"specialist","goal"}, ...]}`` and schema-validate each step.
+    Fallback path: the legacy ``<step .../>`` tag regex (kept so an LLM that
+    emits the old format still works + the existing test suite stays green).
+
     Robust to: missing <plan> wrapper, attribute order, single vs double
-    quotes, extra prose around the block.
+    quotes, extra prose around the block, ```json``` fences.
     """
     if not text:
         return []
+    steps = _json_steps(extract_json(text))
+    if steps:
+        return steps
     steps = _extract(_STEP_RE, text)
     if not steps:
         steps = _extract(_STEP_RE_LOOSE, text)

@@ -25,6 +25,8 @@ import logging
 import re
 from typing import Callable, Dict, List, Optional
 
+from llm_json import extract_json
+
 logger = logging.getLogger(__name__)
 
 SPECIALISTS = ("rag", "tool", "web", "chat")
@@ -50,12 +52,12 @@ Câu hỏi gốc: {question}
 Kế hoạch: {plan}
 Kết quả specialist vừa làm: {answer}
 
-Trả lời đúng một dòng dạng:
-<handoff next="rag|tool|web|chat|END" rationale="lý do ngắn bằng tiếng Việt" />
+Trả lời bằng JSON đúng một object, không thêm gì khác:
+{{"next": "rag|tool|web|chat|END", "rationale": "lý do ngắn bằng tiếng Việt"}}
 
 - next="END" khi câu hỏi đã được trả lời đầy đủ.
 - next là specialist khác khi cần bổ sung thông tin/tính toán.
-- Chỉ trả về thẻ <handoff>, không thêm gì khác.
+- Chỉ trả về JSON, không giải thích, không markdown.
 """
 
 
@@ -89,17 +91,38 @@ _ALIAS = {
 }
 
 
+def _normalize_next(nxt: str) -> str:
+    """Lowercase + alias-map a specialist token; "" if invalid."""
+    nxt = (nxt or "").strip().lower()
+    if nxt not in SPECIALISTS and nxt != "end":
+        nxt = _ALIAS.get(nxt, "")
+    return nxt
+
+
 def parse_supervisor_decision(text: str) -> Dict[str, str]:
-    """Return {next, rationale} from the LLM handoff response, or
-    ``{"next": "", "rationale": ""}`` when no tag is found."""
+    """Return {next, rationale} from the LLM supervisor response.
+
+    Primary path (structured stop condition): parse a JSON object
+    ``{"next": "...", "rationale": "..."}`` and schema-validate ``next``
+    against SPECIALISTS ∪ {end}. Fallback path: the legacy ``<handoff .../>``
+    tag regex (kept so an LLM that emits the old format still works + the
+    existing test suite stays green). Returns ``{"next": "", "rationale": ""}``
+    when neither parses.
+    """
     if not text:
         return {"next": "", "rationale": ""}
+
+    obj = extract_json(text)
+    if isinstance(obj, dict):
+        nxt = _normalize_next(str(obj.get("next", "")))
+        rat = str(obj.get("rationale", "") or "").strip()
+        if nxt in SPECIALISTS or nxt == "end":
+            return {"next": nxt, "rationale": rat}
+
     for pattern in (_HANDOFF_RE, _HANDOFF_RE_LOOSE):
         m = pattern.search(text)
         if m:
-            nxt = m.group(1).strip().lower()
-            if nxt not in SPECIALISTS and nxt != "end":
-                nxt = _ALIAS.get(nxt, "")
+            nxt = _normalize_next(m.group(1))
             return {"next": nxt, "rationale": m.group(2).strip()}
     return {"next": "", "rationale": ""}
 
