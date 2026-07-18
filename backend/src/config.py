@@ -60,3 +60,22 @@ REGRESSION_ALPHA = float(_os.environ.get("REGRESSION_ALPHA", "0.05"))
 GUARDRAILS_PII_OUTPUT_ENABLED = (
     _os.environ.get("GUARDRAILS_PII_OUTPUT_ENABLED", "false").lower() == "true"
 )
+
+# ---- OpenTelemetry bridge (Phase P6) ----
+# Default OFF. When true + OTEL_EXPORTER_OTLP_ENDPOINT set, trace.py mirrors
+# emit_* calls as OTel spans (fire-and-forget; MySQL+Redis trace unchanged).
+OTEL_BRIDGE_ENABLED = (
+    _os.environ.get("OTEL_BRIDGE_ENABLED", "false").lower() == "true"
+)
+
+# ---- Cost-aware routing + canary/shadow (Phase P6) ----
+# When true, run_chat_graph picks the agent model per route (legal_rag -> big,
+# others -> small) via cost_routing.select_model_for_route + LLM_MODEL_CONTEXTVAR.
+COST_ROUTING_ENABLED = (
+    _os.environ.get("COST_ROUTING_ENABLED", "false").lower() == "true"
+)
+# Shadow mode: run candidate variant alongside primary, persist both, return
+# primary to user. Default OFF (doubles Groq cost — nightly/opt-in only).
+SHADOW_MODE_ENABLED = (
+    _os.environ.get("SHADOW_MODE_ENABLED", "false").lower() == "true"
+)

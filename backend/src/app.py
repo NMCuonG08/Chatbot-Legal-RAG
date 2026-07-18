@@ -136,6 +136,10 @@ class CompleteRequest(BaseModel):
     user_id: Optional[str] = "anonymous"
     user_message: str
     sync_request: Optional[bool] = False
+    # P6 canary/shadow knobs. variant = explicit model override; shadow = also
+    # run candidate + persist for offline compare (user still gets primary).
+    variant: Optional[str] = None
+    shadow: Optional[bool] = False
 
 
 # Phase 2 — auth / approval request schemas
@@ -588,7 +592,7 @@ async def complete(
         # llm_handle_message is sync (Celery task called directly). Run in a
         # worker thread so the uvicorn event loop is NOT blocked for the whole
         # generation latency.
-        response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message, role)
+        response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message, role, data.variant, data.shadow)
         return {
             "response": response.get("content", ""),
             "sources": response.get("sources", []),
@@ -597,14 +601,14 @@ async def complete(
         }
     else:
         try:
-            task = llm_handle_message.delay(bot_id, user_id, user_message, role)
+            task = llm_handle_message.delay(bot_id, user_id, user_message, role, data.variant, data.shadow)
             return {"task_id": task.id}
         except Exception as broker_err:
             # Broker/broker-down: fall back to the in-process sync path so a
             # transient Redis/Celery outage does not hard-500 a chat that the
             # sync handler could still serve.
             logger.warning(f"[CHAT] broker dispatch failed, falling back to sync: {broker_err}")
-            response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message, role)
+            response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message, role, data.variant, data.shadow)
             return {
                 "response": response.get("content", ""),
                 "sources": response.get("sources", []),

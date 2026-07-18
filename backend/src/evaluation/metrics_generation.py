@@ -374,6 +374,7 @@ def aggregate_generation_scores(
 PRICING_MAP = {
     "llama-3.1-8b-instant": {"prompt": 0.05, "completion": 0.08},
     "llama-3.1-70b-versatile": {"prompt": 0.59, "completion": 0.79},
+    "llama-3.3-70b-versatile": {"prompt": 0.59, "completion": 0.79},  # same tier as 3.1-70b
     "vietnamese-legal-llm": {"prompt": 0.0, "completion": 0.0},  # private/local
 }
 

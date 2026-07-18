@@ -62,6 +62,18 @@ def _publish(run_id: str, thread_id: str, node: str, step_index: int,
         logger.warning(f"trace publish failed: {e}")
 
 
+def _bridge(fn_name: str, **kwargs) -> None:
+    """Mirror a trace event to the OTel bridge if enabled. Never raises."""
+    try:
+        from config import OTEL_BRIDGE_ENABLED
+        if not OTEL_BRIDGE_ENABLED:
+            return
+        from evaluation import otel_bridge
+        getattr(otel_bridge, fn_name)(**kwargs)
+    except Exception as e:
+        logger.debug(f"otel bridge {fn_name} skipped: {e}")
+
+
 def emit_step(run_id: str, thread_id: str, node: str, event_type: str, payload) -> None:
     """Record one trace event: persist to agent_steps + publish to Redis channel."""
     try:
@@ -70,6 +82,8 @@ def emit_step(run_id: str, thread_id: str, node: str, event_type: str, payload) 
         _publish(run_id, thread_id, node, idx, event_type, payload)
     except Exception as e:
         logger.warning(f"trace emit_step failed ({node}/{event_type}): {e}")
+    _bridge("bridge_emit_step", run_id=run_id, thread_id=thread_id,
+            node=node, event_type=event_type, payload=payload)
 
 
 def emit_run_start(run_id: str, thread_id: str, user_id: str | None, question: str) -> None:
@@ -79,6 +93,8 @@ def emit_run_start(run_id: str, thread_id: str, user_id: str | None, question: s
         emit_step(run_id, thread_id, "__root__", "run_start", {"question": question})
     except Exception as e:
         logger.warning(f"trace emit_run_start failed: {e}")
+    _bridge("bridge_emit_run_start", run_id=run_id, thread_id=thread_id,
+            user_id=user_id, question=question)
 
 
 def emit_run_end(run_id: str, thread_id: str, *, status: str = "completed",
@@ -96,3 +112,4 @@ def emit_run_end(run_id: str, thread_id: str, *, status: str = "completed",
         emit_step(run_id, thread_id, "__root__", "run_end", {"status": status})
     except Exception as e:
         logger.warning(f"trace emit_run_end failed: {e}")
+    _bridge("bridge_emit_run_end", run_id=run_id, status=status, route=route)

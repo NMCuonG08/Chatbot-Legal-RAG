@@ -1150,22 +1150,60 @@ def get_chat_graph():
     return _build_chat_graph()
 
 
-def run_chat_graph(history, question, user_id=None, conversation_id=None, run_id=None, role=None):
-    graph = get_chat_graph()
-    thread_id = conversation_id or (f"user:{user_id}" if user_id else "default")
-    config = {"configurable": {"thread_id": thread_id}}
-    result = graph.invoke(
-        {
-            "history": history,
-            "question": question,
-            "user_id": user_id,
-            "thread_id": thread_id,
-            "run_id": run_id,
-            "role": role,
-        },
-        config=config,
-    )
-    return {
+def run_chat_graph(history, question, user_id=None, conversation_id=None,
+                   run_id=None, role=None, variant=None, shadow=False):
+    """Invoke the chat graph.
+
+    P6 extensions (opt-in, default off):
+    - ``variant``: explicit model override (sets LLM_MODEL_CONTEXTVAR for this call).
+    - Cost routing: when ``config.COST_ROUTING_ENABLED`` and no explicit variant,
+      the route's chosen model is applied via the same contextvar. The route is
+      inferred from a keyword guess (best-effort: falls back to general_chat).
+    - ``shadow``: when true (and ``config.SHADOW_MODE_ENABLED``), also run the
+      candidate variant graph in a try/except and persist its trace under a
+      ``<run_id>:shadow`` run id for offline comparison. The user always
+      receives the primary result.
+    """
+    from brain import LLM_MODEL_CONTEXTVAR
+    try:
+        from config import COST_ROUTING_ENABLED, SHADOW_MODE_ENABLED
+    except Exception:
+        COST_ROUTING_ENABLED = False
+        SHADOW_MODE_ENABLED = False
+
+    override_model = variant
+    if override_model is None and COST_ROUTING_ENABLED:
+        try:
+            from evaluation.cost_routing import select_model_for_route
+            route_guess = _guess_route(question)
+            override_model = select_model_for_route(route_guess).model
+        except Exception as exc:
+            logger.debug(f"cost routing skipped: {exc}")
+            override_model = None
+
+    token = None
+    if override_model is not None:
+        token = LLM_MODEL_CONTEXTVAR.set(override_model)
+    try:
+        graph = get_chat_graph()
+        thread_id = conversation_id or (f"user:{user_id}" if user_id else "default")
+        config = {"configurable": {"thread_id": thread_id}}
+        result = graph.invoke(
+            {
+                "history": history,
+                "question": question,
+                "user_id": user_id,
+                "thread_id": thread_id,
+                "run_id": run_id,
+                "role": role,
+            },
+            config=config,
+        )
+    finally:
+        if token is not None:
+            LLM_MODEL_CONTEXTVAR.reset(token)
+
+    primary = {
         "response": result.get("response", ""),
         "sources": result.get("sources", []),
         "route": result.get("route", ""),
@@ -1175,7 +1213,47 @@ def run_chat_graph(history, question, user_id=None, conversation_id=None, run_id
         "verify_score": result.get("verify_score", 0.0),
         "verify_verdict": result.get("verify_verdict", ""),
         "retry_verify": result.get("retry_verify", 0),
+        "variant": variant,
     }
+
+    if shadow and SHADOW_MODE_ENABLED:
+        _run_shadow(history, question, user_id, conversation_id, role, run_id)
+
+    return primary
+
+
+def _guess_route(question: str) -> str | None:
+    """Lightweight keyword route guess for cost routing (no LLM call)."""
+    q = (question or "").lower()
+    if any(k in q for k in ("điều", "bộ luật", "nghị định", "luật")):
+        return "legal_rag"
+    if any(k in q for k in ("tính", "calculator", "bao nhiêu phần trăm")):
+        return "agent_tools"
+    if any(k in q for k in ("tìm kiếm", "tin tức", "search the web")):
+        return "web_search"
+    return "general_chat"
+
+
+def _run_shadow(history, question, user_id, conversation_id, role, run_id) -> None:
+    """Run the candidate (big) model variant and persist a trace marker.
+
+    Fire-and-forget: never surfaces to the user, never raises into primary path.
+    """
+    try:
+        from trace import emit_step
+        shadow_run_id = f"{run_id}:shadow" if run_id else None
+        shadow_result = run_chat_graph(
+            history, question, user_id=user_id,
+            conversation_id=conversation_id, run_id=shadow_run_id,
+            role=role, variant=None, shadow=False,
+        )
+        if shadow_run_id:
+            emit_step(shadow_run_id, conversation_id or "default",
+                      "__shadow__", "shadow_complete",
+                      {"primary_route": None,
+                       "shadow_response_len": len(shadow_result.get("response", ""))})
+    except Exception as exc:
+        logger.warning(f"shadow run failed (non-fatal): {exc}")
 
 
 @shared_task(**_AUTORETRY_KWARGS)
@@ -1464,7 +1542,8 @@ def clear_user_runtime_caches_task(user_id: str, conversation_id: str | None = N
 
 
 @shared_task(bind=True)
-def llm_handle_message(self, bot_id, user_id, question, role=None):
+def llm_handle_message(self, bot_id, user_id, question, role=None,
+                       variant=None, shadow=False):
     """
     Main message handler with intelligent routing.
 
@@ -1563,6 +1642,7 @@ def llm_handle_message(self, bot_id, user_id, question, role=None):
             graph_result = _run_graph_retried(
                 history, question, user_id=user_id,
                 conversation_id=conversation_id, run_id=run_id, role=role,
+                variant=variant, shadow=shadow,
             )
             response_text = graph_result.get("response", "")
             sources = graph_result.get("sources", [])
