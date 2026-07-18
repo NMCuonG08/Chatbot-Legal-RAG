@@ -136,7 +136,7 @@ Layer trong knowledge graph (node group). Mỗi layer = 1 trách nhiệm, phụ 
 | `approval.py` | Human-in-loop `ToolApproval` pending→approved/rejected | `request_approval`(70) `evaluate_tool_gate`(171) `await_approval_response`(206) |
 | `audit.py` | Tamper-evident `AuditLog` (best-effort) | `log_audit` `list_audit_entries` |
 | `security.py` | Path-traversal guard + `X-API-Key` admin + CORS + collection-name regex | `resolve_safe_data_path` `require_api_key` |
-| `sandbox.py` | Subprocess sandbox pure-compute tools — **dead code (chưa wire)** | `SAFE_TO_SANDBOX`(33) `run_in_sandbox`(73) |
+| `sandbox.py` | Subprocess sandbox pure-compute tools — **opt-in wired** via `@sandboxable` (default off) | `SAFE_TO_SANDBOX`(33) `run_in_sandbox`(73) |
 
 ### 4.6 Memory / trace
 
@@ -258,6 +258,7 @@ scripts/dev.sh prod      # full boot runbook
 | `JUDGE_PROVIDER`/`JUDGE_MODEL` | groq / llama-3.1-8b-instant | judge pin (riêng agent model) |
 | `GUARDRAILS_PII_OUTPUT_ENABLED` | false | PII redact eval-time only |
 | `OTEL_BRIDGE_ENABLED` | false | OTel span mirror |
+| `SANDBOX_ENABLED` | false | opt-in subprocess isolation cho 16 pure-compute tool (`@sandboxable`); off = passthrough in-process |
 | `COST_ROUTING_ENABLED` | false | route→model (legal_rag big, rest small) |
 | `SHADOW_MODE_ENABLED` | false | candidate song song (doubles Groq cost) |
 
@@ -267,9 +268,9 @@ scripts/dev.sh prod      # full boot runbook
 
 - **9 module test collection error**: langchain-groq 1.1.3 / langchain-core `ModelProfile` import mismatch (ngoài eval harness) — ignore trong offline gate (`pytest.ini` comment). Tracked riêng.
 - **2 module drift**: `test_react_toolcalls`, `test_per_conversation_memory` — `agent._get_ai_agent` xóa trong refactor.
-- **sandbox.py dead code**: `SAFE_TO_SANDBOX` + `run_in_sandbox` defined, **0 importer** — pure-compute tool chưa isolate thật.
+- **sandbox.py wired opt-in**: `@sandboxable` decorator trên 16 pure-compute wrappers + `config.SANDBOX_ENABLED` (default off). Khi bật, tool chạy trong subprocess scrubbed-env + timeout; khi tắt, passthrough in-process (zero overhead). Test: `test_sandboxable.py`.
 - **Stop condition regex**: supervisor/planner parse `<handoff>`/`<step>` free-text, chưa structured JSON.
-- **Trace coarse**: `emit_step` payload chỉ `node_end` aggregate, chưa per-tool-call + latency + token cost. `run_id` per-message, chưa per-session (multi-turn không replay-able thành 1 trace).
+- **Trace per-tool-call + latency**: `@track_tool_call` emit `tool_call` event với `latency_ms` qua `agent_run_id`/`agent_thread_id` contextvar. `run_id` per-message (per-turn), `thread_id` per-session — `load_session_trace(thread_id)` replay cả hội thoại thành 1 trace.
 - **Self-preference judge**: Llama judge Llama. Mitigate swap+CoT+Ollama+kappa.
 
 ---

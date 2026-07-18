@@ -16,6 +16,15 @@ GRAPH_RECURSION_LIMIT = int(_os_loop.environ.get("GRAPH_RECURSION_LIMIT", "32"))
 # unblocks and returns a user-facing error.
 GRAPH_RUN_TIMEOUT_S = float(_os_loop.environ.get("GRAPH_RUN_TIMEOUT_S", "120"))
 
+# ---- Pure-compute tool sandbox (defense-in-depth, OPT-IN) ----
+# When true, the @sandboxable pure-compute tools (contract_penalty, pit,
+# legal_age, ...) execute in a throwaway subprocess with a scrubbed env + hard
+# timeout via sandbox.run_in_sandbox, instead of in-process. Default OFF: the
+# tools are pure functions with their own input-validation guardrails, so
+# process isolation is a defense-in-depth option, not a default. Reads at call
+# time so ops can flip it without a redeploy (and tests can monkeypatch).
+SANDBOX_ENABLED = _os_loop.environ.get("SANDBOX_ENABLED", "").lower() in ("1", "true", "yes", "on")
+
 # ---- Self-Corrective RAG (CRAG) tuning constants ----
 # Max retrieval-rewrite loop iterations before forcing a web_search fallback.
 REFLECTION_MAX = 2

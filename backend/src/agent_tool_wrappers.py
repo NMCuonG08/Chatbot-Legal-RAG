@@ -8,12 +8,16 @@ Extracted from ``agent.py`` to keep ``agent.py`` focused on agent runtime
 (LLM, memory, prompt, execution). ``agent.py`` imports ``all_tools`` from here.
 """
 
+import functools
+import inspect
 import json
 import logging
 
 from llama_index.core.tools import FunctionTool
 
+import config
 from agent_tool_tracking import track_tool_call
+from sandbox import run_in_sandbox
 from legal_graph_tools import recall_legal_graph_tool
 from legal_tools import (
     calculate_contract_penalty,
@@ -51,10 +55,43 @@ from tavily_tool import tavily_qna, tavily_search_legal
 logger = logging.getLogger(__name__)
 
 
+def sandboxable(tool_name: str):
+    """Opt-in subprocess isolation for a pure-compute tool wrapper.
+
+    Stacks UNDER ``@track_tool_call`` (so the call is still traced). When
+    ``config.SANDBOX_ENABLED`` is false (default) it is a pure passthrough to
+    the wrapped function — zero behavior change, zero subprocess overhead.
+    When true, it dispatches the call to ``sandbox.run_in_sandbox`` (scrubbed
+    env + hard timeout in a throwaway child) instead of running the impl
+    in-process. Read at call time so the flag can be flipped without redeploy.
+
+    The wrapper's own input-validation guardrails are SKIPPED when sandboxed —
+    the sandbox worker calls the raw impl directly. Acceptable trade: process
+    isolation is the stronger guard for a pure-compute fn, and the flag is off
+    by default so validation still runs in the normal path.
+    """
+    def _deco(fn):
+        @functools.wraps(fn)
+        def _wrapped(*args, **kwargs):
+            if not getattr(config, "SANDBOX_ENABLED", False):
+                return fn(*args, **kwargs)
+            try:
+                bound = inspect.signature(fn).bind(*args, **kwargs)
+                bound.apply_defaults()
+                result = run_in_sandbox(tool_name, dict(bound.arguments))
+            except Exception as exc:  # sandbox dispatch must never break the tool
+                logger.warning("sandboxable dispatch failed for %s: %s", tool_name, exc)
+                return fn(*args, **kwargs)  # fall back to in-process impl
+            return json.dumps(result, ensure_ascii=False, indent=2, default=str)
+        return _wrapped
+    return _deco
+
+
 # ===== LEGAL CALCULATION TOOLS =====
 
 
 @track_tool_call
+@sandboxable("contract_penalty_calculator")
 def contract_penalty_calculator(
     contract_value: float, penalty_rate: float, days_late: int
 ) -> str:
@@ -82,6 +119,7 @@ def contract_penalty_calculator(
 
 
 @track_tool_call
+@sandboxable("legal_age_checker")
 def legal_age_checker(
     birth_year: int, action_type: str = "sign_contract", gender: str = ""
 ) -> str:
@@ -118,6 +156,7 @@ def legal_age_checker(
 
 
 @track_tool_call
+@sandboxable("inheritance_calculator")
 def inheritance_calculator(total_value: float, heirs_json: str) -> str:
     """
     Tính phần thừa kế theo pháp luật Việt Nam (hàng thừa kế thứ nhất).
@@ -144,6 +183,7 @@ def inheritance_calculator(total_value: float, heirs_json: str) -> str:
 
 
 @track_tool_call
+@sandboxable("business_name_validator")
 def business_name_validator(business_name: str) -> str:
     """
     Kiểm tra tên doanh nghiệp có hợp lệ theo Luật Doanh nghiệp Việt Nam.
@@ -165,6 +205,7 @@ def business_name_validator(business_name: str) -> str:
 
 
 @track_tool_call
+@sandboxable("statute_lookup")
 def statute_lookup(case_type: str) -> str:
     """
     Tra cứu thời hiệu khởi kiện theo pháp luật Việt Nam.
@@ -355,6 +396,7 @@ def verify_citation_tool(law_name: str, article_number: int, claimed_text: str) 
 
 
 @track_tool_call
+@sandboxable("severance_pay_tool")
 def severance_pay_tool(monthly_salary: float, months_worked: int) -> str:
     """
     Tính trợ cấp thôi việc theo Điều 48 Bộ luật Lao động 2019.
@@ -371,6 +413,7 @@ def severance_pay_tool(monthly_salary: float, months_worked: int) -> str:
 
 
 @track_tool_call
+@sandboxable("overtime_pay_tool")
 def overtime_pay_tool(hourly_wage: float, hours: float, day_type: str = "weekday") -> str:
     """
     Tính tiền làm thêm giờ theo Điều 107 Bộ luật Lao động 2019.
@@ -388,6 +431,7 @@ def overtime_pay_tool(hourly_wage: float, hours: float, day_type: str = "weekday
 
 
 @track_tool_call
+@sandboxable("pit_monthly_tool")
 def pit_monthly_tool(taxable_income: float) -> str:
     """
     Tính thuế TNCN lương tháng theo biểu lũy tiến (Luật Thuế TNCN + TT 111/2013).
@@ -403,6 +447,7 @@ def pit_monthly_tool(taxable_income: float) -> str:
 
 
 @track_tool_call
+@sandboxable("land_registration_fee_tool")
 def land_registration_fee_tool(property_value: float, is_first_home: bool = True) -> str:
     """
     Tính lệ phí trước bạ nhà đất (ND 10/2022; TT 80/2020). Mức 0,5%.
@@ -419,6 +464,7 @@ def land_registration_fee_tool(property_value: float, is_first_home: bool = True
 
 
 @track_tool_call
+@sandboxable("vehicle_registration_fee_tool")
 def vehicle_registration_fee_tool(vehicle_value: float, vehicle_type: str = "car", is_first_time: bool = True) -> str:
     """
     Tính lệ phí trước bạ xe (ND 10/2022; TT 80/2020).
@@ -436,6 +482,7 @@ def vehicle_registration_fee_tool(vehicle_value: float, vehicle_type: str = "car
 
 
 @track_tool_call
+@sandboxable("court_fee_tool")
 def court_fee_tool(claim_value: float, case_type: str = "civil_first") -> str:
     """
     Tính án phí dân sự theo NQ 326/2016/UBTVQH14.
@@ -452,6 +499,7 @@ def court_fee_tool(claim_value: float, case_type: str = "civil_first") -> str:
 
 
 @track_tool_call
+@sandboxable("admin_fine_lookup_tool")
 def admin_fine_lookup_tool(violation_type: str) -> str:
     """
     Tra mức phạt vi phạm hành chính phổ biến (giao thông, kinh doanh, đất đai).
@@ -468,6 +516,7 @@ def admin_fine_lookup_tool(violation_type: str) -> str:
 
 
 @track_tool_call
+@sandboxable("child_support_tool")
 def child_support_tool(payer_income: float, num_children: int = 1) -> str:
     """
     Ước lượng mức cấp dưỡng nuôi con sau ly hôn (Đ82 Luật HNGĐ 2014).
@@ -484,6 +533,7 @@ def child_support_tool(payer_income: float, num_children: int = 1) -> str:
 
 
 @track_tool_call
+@sandboxable("procedure_wizard_tool")
 def procedure_wizard_tool(procedure_type: str) -> str:
     """
     Hướng dẫn thủ tục pháp lý: hồ sơ, phí, cơ quan thụ lý, bước, thời hạn.
@@ -500,6 +550,7 @@ def procedure_wizard_tool(procedure_type: str) -> str:
 
 
 @track_tool_call
+@sandboxable("jurisdiction_resolver_tool")
 def jurisdiction_resolver_tool(dispute_type: str, claim_value: float = 0, location: str = "") -> str:
     """
     Xác định tòa/cơ quan có thẩm quyền thụ lý tranh chấp.
@@ -536,6 +587,7 @@ def generate_document_template_tool(doc_type: str, params_json: str = "{}") -> s
 
 
 @track_tool_call
+@sandboxable("law_version_tool")
 def law_version_tool(law_key: str, effective_year: int = 0) -> str:
     """
     Tra phiên bản/lịch sử hiệu lực của một luật Việt Nam.
