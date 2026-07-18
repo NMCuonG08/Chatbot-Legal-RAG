@@ -219,7 +219,7 @@ def main() -> int:
     parser.add_argument(
         "--mode",
         choices=["retrieval", "generation", "e2e", "all", "pairwise",
-                 "scenario"],
+                 "scenario", "redteam"],
         default="retrieval",
         help="Which evaluation stage(s) to run",
     )
@@ -303,6 +303,12 @@ def main() -> int:
         type=int,
         default=8,
         help="Scenario mode: max conversation turns per scenario.",
+    )
+    parser.add_argument(
+        "--redteam-category",
+        type=str,
+        default="all",
+        help="Redteam mode: probe category (all|jailbreak_legal|...).",
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -499,6 +505,51 @@ def main() -> int:
             for s in scores
         ]
         payload["scenario_persona"] = args.persona
+
+    if args.mode == "redteam":
+        from evaluation.redteam.dataset import (
+            CATEGORIES, load_redteam_dataset,
+        )
+        from evaluation.redteam.metrics import (
+            evaluate_redteam, redteam_metrics_to_dict,
+        )
+
+        cat = None if args.redteam_category == "all" else args.redteam_category
+        if cat and cat not in CATEGORIES:
+            print(f"Unknown redteam category: {cat}")
+            return 2
+        probes = load_redteam_dataset(category=cat)
+        if not probes:
+            print("No red-team probes loaded (probes.jsonl missing?).")
+            return 2
+        from tasks import run_chat_graph
+        from evaluation.parallel import _conversation_id
+
+        results = []
+        for p in probes:
+            try:
+                res = run_chat_graph([], p.prompt,
+                                     conversation_id=_conversation_id(
+                                         meta.run_id, p.probe_id))
+                results.append({
+                    "response": res.get("response", ""),
+                    "route": res.get("route"),
+                    "blocked": False,
+                    "verify_verdict": res.get("verify_verdict"),
+                    "escalated": bool(res.get("escalated")),
+                })
+            except Exception as exc:
+                logger.warning("redteam probe %s failed: %s", p.probe_id, exc)
+                results.append({"response": "", "route": None, "blocked": True,
+                                "verify_verdict": None, "escalated": False})
+        metrics = evaluate_redteam(probes, results)
+        payload["redteam_summary"] = redteam_metrics_to_dict(metrics)
+        payload["redteam_results"] = [
+            {"probe_id": p.probe_id, "category": p.category,
+             "response": r.get("response", ""), "blocked": r.get("blocked"),
+             "route": r.get("route")}
+            for p, r in zip(probes, results)
+        ]
 
     # Failure Classification
     if args.mode in ("generation", "e2e", "all"):

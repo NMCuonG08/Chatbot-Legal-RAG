@@ -1,4 +1,5 @@
 import logging
+import re
 from pathlib import Path
 import asyncio
 from typing import Dict, List, Any, Optional
@@ -6,6 +7,55 @@ from typing import Dict, List, Any, Optional
 from metacognitive import HIGH_STAKES_KEYWORDS
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# PII detection (homegrown regex, eval-time per P4). No presidio dependency.
+# Returns a mapping of PII type -> list of matched spans. Pure + synchronous.
+# ---------------------------------------------------------------------------
+_PII_PATTERNS: Dict[str, re.Pattern] = {
+    # Vietnamese ID card (CCCD): 9 or 12 digits, word-boundary guarded.
+    "cccd": re.compile(r"\b(?:\d{9}|\d{12})\b"),
+    # Phone: +84 or 0 prefix + 9-10 digits.
+    "phone": re.compile(r"(?:\+84|0)\d{9,10}\b"),
+    # Email.
+    "email": re.compile(
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+    # Vietnamese address cues.
+    "address": re.compile(
+        r"\b(?:số\s+\d+[\w/\-]*|tổ\s+\d+|khu\s+phố\s+\d+|phường\s+\w+"
+        r"|xã\s+\w+|quận\s+\w+|huyện\s+\w+|tp\.?\s+\w+|thành phố\s+\w+)\b",
+        re.IGNORECASE),
+    # Tax code (MST): 10 digits + optional 3-digit suffix.
+    "tax_code": re.compile(r"\b\d{10}(?:-\d{3})?\b"),
+}
+
+
+def detect_pii_vietnamese(text: str) -> Dict[str, List[str]]:
+    """Return ``{pii_type: [matched_spans, ...]}`` found in ``text``.
+
+    Pure: never logs matched values (callers log only counts). Empty dict when
+    no PII is found. Spans deduped, order preserved.
+    """
+    if not text:
+        return {}
+    findings: Dict[str, List[str]] = {}
+    for pii_type, pattern in _PII_PATTERNS.items():
+        matches = pattern.findall(text)
+        if matches:
+            seen = set()
+            deduped = [m for m in matches if not (m in seen or seen.add(m))]
+            findings[pii_type] = deduped
+    return findings
+
+
+def verify_output_pii(text: str) -> tuple:
+    """Check agent output for PII leaks. Returns ``(blocked: bool, findings)``.
+
+    ``blocked`` is True when any PII pattern matches. Findings map type->spans.
+    """
+    findings = detect_pii_vietnamese(text)
+    return (bool(findings), findings)
 
 class LegalGuardrailsManager:
     """

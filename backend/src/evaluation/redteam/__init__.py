@@ -1,0 +1,1 @@
+"""Red-team evaluation subpackage: probes, safety metrics, promptfoo config."""

@@ -52,3 +52,11 @@ JUDGE_TEMPERATURE = float(_os.environ.get("JUDGE_TEMPERATURE", "0.0"))
 EVAL_MAX_WORKERS = int(_os.environ.get("EVAL_MAX_WORKERS", "8"))
 EVAL_JUDGE_CONCURRENCY = int(_os.environ.get("EVAL_JUDGE_CONCURRENCY", "4"))
 REGRESSION_ALPHA = float(_os.environ.get("REGRESSION_ALPHA", "0.05"))
+
+# ---- PII output guardrail (Phase P4) ----
+# Eval-time PII detection on agent outputs. Default OFF so production behavior
+# is unchanged; set GUARDRAILS_PII_OUTPUT_ENABLED=true to redact/block PII in
+# run_chat_graph output (post-verify). Homegrown regex — no presidio dependency.
+GUARDRAILS_PII_OUTPUT_ENABLED = (
+    _os.environ.get("GUARDRAILS_PII_OUTPUT_ENABLED", "false").lower() == "true"
+)
