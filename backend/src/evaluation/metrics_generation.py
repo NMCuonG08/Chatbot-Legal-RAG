@@ -111,6 +111,42 @@ def _call_judge(prompt: str, judge_fn) -> JudgeResult:
 
 
 # ---------------------------------------------------------------------------
+# Judge prompt registry — source text pinned for run-metadata hashing.
+# ``run_metadata`` hashes these so a regression diff can tell a judge-prompt
+# change from an agent change. Keep this tuple in sync with the prompt builders
+# below; the hashes are computed from these exact strings.
+# ---------------------------------------------------------------------------
+JUDGE_PROMPT_TEMPLATES = (
+    # faithfulness (claim decomposition) — see _faithfulness_prompt
+    """Hãy đánh giá độ TRUNG THỰC (faithfulness) của câu trả lời so với tài liệu.
+
+Bước 1: Phân tách câu trả lời thành các NHẬN ĐỊNH NGUYÊN TỬ (atomic claims).
+Bước 2: Với mỗi claim, đánh dấu "supported": true nếu được chứng minh bởi tài liệu.
+
+Trả về DUY NHẤT một JSON dạng:
+{{"claims": [...], "supported": [true, false, ...], "reason": "<lý do ngắn>"}}""",
+    # answer_relevance — see _answer_relevance_prompt
+    """Hãy đánh giá độ LIÊN QUAN (answer relevance) của câu trả lời so với câu hỏi.
+Score = 1.0 trực tiếp giải đáp; 0.5 chạm chủ đề nhưng lạc đề một phần; 0.0 lạc đề.
+
+Trả về DUY NHẤT một JSON dạng:
+{{"score": <0.0..1.0>, "reason": "<lý do ngắn 1-2 câu>"}}""",
+    # context_precision — see _context_precision_prompt
+    """Đánh giá ĐỘ CHÍNH XÁC NGỮ CẢNH (context precision): trong các tài liệu được
+truy xuất, có bao nhiêu phần trăm thực sự liên quan tới câu hỏi.
+
+Trả về DUY NHẤT một JSON dạng:
+{{"score": <0.0..1.0>, "relevant_indices": [<các chỉ số 1-based>], "reason": "<lý do ngắn>"}}""",
+)
+
+
+def get_judge_prompt_hashes() -> str:
+    """sha256 over the judge prompt templates (single hash for run metadata)."""
+    from evaluation.run_metadata import compute_prompt_hash
+    return compute_prompt_hash(JUDGE_PROMPT_TEMPLATES)
+
+
+# ---------------------------------------------------------------------------
 # Metric prompts
 # ---------------------------------------------------------------------------
 

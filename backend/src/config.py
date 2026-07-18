@@ -40,3 +40,15 @@ TASK_MAX_RETRIES = 3
 TASK_RETRY_BACKOFF = True
 TASK_RETRY_BACKOFF_MAX = 60
 TASK_RETRY_JITTER = True
+
+# ---- Evaluation harness (Phase P1) ----
+# Judge is pinned + separate from the agent model so a judge swap is auditable
+# and regression diffs can attribute score changes to the judge vs. the agent.
+# Groq + Ollama only (no OpenAI/Anthropic key in this project).
+import os as _os
+JUDGE_PROVIDER = _os.environ.get("JUDGE_PROVIDER", "groq").lower()
+JUDGE_MODEL = _os.environ.get("JUDGE_MODEL", "llama-3.1-8b-instant")
+JUDGE_TEMPERATURE = float(_os.environ.get("JUDGE_TEMPERATURE", "0.0"))
+EVAL_MAX_WORKERS = int(_os.environ.get("EVAL_MAX_WORKERS", "8"))
+EVAL_JUDGE_CONCURRENCY = int(_os.environ.get("EVAL_JUDGE_CONCURRENCY", "4"))
+REGRESSION_ALPHA = float(_os.environ.get("REGRESSION_ALPHA", "0.05"))

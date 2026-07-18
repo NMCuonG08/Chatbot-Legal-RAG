@@ -243,12 +243,51 @@ def main() -> int:
         default=None,
         help="Path to train.jsonl (defaults to repo data/train.jsonl)",
     )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        help="Worker count for parallel eval (>1 = concurrent run_chat_graph).",
+    )
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="Explicit run id (default: generated uuid).",
+    )
+    parser.add_argument(
+        "--judge-provider",
+        type=str,
+        default=None,
+        help="Override judge provider (groq|ollama). Default: config.JUDGE_PROVIDER.",
+    )
+    parser.add_argument(
+        "--judge-model",
+        type=str,
+        default=None,
+        help="Override judge model. Default: config.JUDGE_MODEL.",
+    )
+    parser.add_argument(
+        "--baseline",
+        type=str,
+        default=None,
+        help="Path to a baseline run JSON to diff against (regression report).",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     _setup_logging(args.verbose)
 
+    from config import (
+        EVAL_JUDGE_CONCURRENCY,
+        EVAL_MAX_WORKERS,
+        JUDGE_MODEL,
+        JUDGE_PROVIDER,
+        JUDGE_TEMPERATURE,
+    )
     from evaluation.dataset import DEFAULT_DATA_FILE, load_eval_dataset
+    from evaluation.metrics_generation import get_judge_prompt_hashes
+    from evaluation.run_metadata import build_run_metadata, metadata_to_dict
 
     data_path = Path(args.data_file) if args.data_file else DEFAULT_DATA_FILE
     samples = load_eval_dataset(path=data_path, n_samples=args.n, seed=args.seed)
@@ -257,17 +296,31 @@ def main() -> int:
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    judge_provider = (args.judge_provider or JUDGE_PROVIDER).lower()
+    judge_model = args.judge_model or JUDGE_MODEL
+    meta = build_run_metadata(
+        judge_provider=judge_provider,
+        judge_model=judge_model,
+        judge_temperature=JUDGE_TEMPERATURE,
+        judge_prompt_hash=get_judge_prompt_hashes(),
+        run_id=args.run_id,
+        extra={"mode": args.mode, "n_samples": len(samples), "seed": args.seed,
+               "top_k": args.top_k, "parallel": args.parallel},
+    )
+
     payload: dict = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "mode": args.mode,
         "n_samples": len(samples),
         "seed": args.seed,
         "top_k": args.top_k,
+        "run_metadata": metadata_to_dict(meta),
     }
 
     retrieval_results = None
     gen_results = None
     e2e_results = None
+    use_parallel = args.parallel and args.parallel > 1
 
     if args.mode in ("retrieval", "all"):
         from evaluation.eval_retrieval import run_retrieval_eval
@@ -290,7 +343,19 @@ def main() -> int:
             summarize_generation_results,
         )
 
-        gen_results = run_generation_eval(samples, top_k=min(args.top_k, 5))
+        if use_parallel:
+            from evaluation.parallel import ParallelConfig, run_generation_parallel
+            from brain import groq_chat_complete
+            cfg = ParallelConfig(
+                max_workers=min(args.parallel, EVAL_MAX_WORKERS),
+                judge_concurrency=EVAL_JUDGE_CONCURRENCY,
+            )
+            gen_results = run_generation_parallel(
+                samples, cfg, meta.run_id, groq_chat_complete,
+                top_k=min(args.top_k, 5),
+            )
+        else:
+            gen_results = run_generation_eval(samples, top_k=min(args.top_k, 5))
         payload["generation_summary"] = summarize_generation_results(gen_results)
         payload["generation_results"] = [
             {
@@ -308,7 +373,15 @@ def main() -> int:
     if args.mode in ("e2e", "all"):
         from evaluation.eval_e2e import run_e2e_eval, summarize_e2e_results
 
-        e2e_results = run_e2e_eval(samples)
+        if use_parallel:
+            from evaluation.parallel import ParallelConfig, run_e2e_parallel
+            cfg = ParallelConfig(
+                max_workers=min(args.parallel, EVAL_MAX_WORKERS),
+                judge_concurrency=EVAL_JUDGE_CONCURRENCY,
+            )
+            e2e_results = run_e2e_parallel(samples, cfg, meta.run_id)
+        else:
+            e2e_results = run_e2e_eval(samples)
         payload["e2e_summary"] = summarize_e2e_results(e2e_results)
         payload["e2e_results"] = [
             {
@@ -378,8 +451,26 @@ def main() -> int:
         json.dump(payload, fp, ensure_ascii=False, indent=2, default=_json_default)
     md_path.write_text(report_md, encoding="utf-8")
 
+    # Persist a run-keyed copy for regression diffs (eval_reports/runs/<run_id>.json).
+    runs_dir = output_dir / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    run_path = runs_dir / f"{meta.run_id}.json"
+    with run_path.open("w", encoding="utf-8") as fp:
+        json.dump(payload, fp, ensure_ascii=False, indent=2, default=_json_default)
     logger.info("Wrote %s", json_path)
     logger.info("Wrote %s", md_path)
+    logger.info("Wrote run %s", run_path)
+
+    # Optional regression diff against a baseline run.
+    if args.baseline:
+        from evaluation.regression import diff_runs, write_regression_report
+        report = diff_runs(args.baseline, run_path)
+        reg_path = write_regression_report(report, output_dir / "regression_report.md")
+        logger.info("Regression gate: %s (wrote %s)", report.gate, reg_path)
+        print(f"\nRegression gate: {report.gate}")
+        for reason in report.gate_reasons:
+            print(f"  - {reason}")
+
     print("\n" + report_md)
     return 0
 
