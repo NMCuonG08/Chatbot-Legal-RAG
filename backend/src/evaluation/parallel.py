@@ -162,10 +162,61 @@ def run_generation_parallel(
     return [r for r in results if r is not None]
 
 
+def _run_one_scenario(scenario, persona, run_id, max_turns, judge_fn=None):
+    """Run one multi-turn scenario: simulate conversation + score it."""
+    from tasks import run_chat_graph
+    from evaluation.sim_user import simulate_conversation
+    from evaluation.scenarios import score_scenario
+
+    conv_id = _conversation_id(run_id, scenario.scenario_id)
+
+    def agent_runner(history, user_msg):
+        return run_chat_graph(history, user_msg, conversation_id=conv_id)
+
+    log = simulate_conversation(scenario, agent_runner, persona,
+                                max_turns=max_turns)
+    return score_scenario(log, scenario, judge_fn=judge_fn)
+
+
+def run_scenario_parallel(
+    scenarios, persona, cfg: ParallelConfig, run_id: str,
+    *, max_turns: int = 8, judge_fn=None, progress_every: int = 5,
+) -> list:
+    """Run scenarios concurrently, preserving input order."""
+    set_judge_concurrency(cfg.judge_concurrency)
+    from evaluation.scenarios import ScenarioScore
+    results: List[Optional[ScenarioScore]] = [None] * len(scenarios)
+    done = 0
+    with ThreadPoolExecutor(max_workers=max(1, cfg.max_workers)) as ex:
+        futs = {
+            ex.submit(_run_one_scenario, sc, persona, run_id, max_turns,
+                      judge_fn): i
+            for i, sc in enumerate(scenarios)
+        }
+        for fut in as_completed(futs):
+            idx = futs[fut]
+            try:
+                results[idx] = fut.result()
+            except Exception as exc:
+                logger.warning("scenario worker crashed for %s: %s",
+                               scenarios[idx].scenario_id, exc)
+                results[idx] = ScenarioScore(
+                    scenario_id=scenarios[idx].scenario_id,
+                    r_action=0.0, r_output=0.0, r_composite=0.0,
+                    success=False, reached_goal=False, n_turns=0,
+                    notes=f"worker_crash: {exc}",
+                )
+            done += 1
+            if done % progress_every == 0:
+                logger.info("parallel scenario: %d/%d", done, len(scenarios))
+    return [r for r in results if r is not None]
+
+
 __all__ = [
     "ParallelConfig",
     "run_e2e_parallel",
     "run_generation_parallel",
+    "run_scenario_parallel",
     "set_judge_concurrency",
     "get_judge_semaphore",
 ]

@@ -218,7 +218,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run RAG evaluation suite")
     parser.add_argument(
         "--mode",
-        choices=["retrieval", "generation", "e2e", "all", "pairwise"],
+        choices=["retrieval", "generation", "e2e", "all", "pairwise",
+                 "scenario"],
         default="retrieval",
         help="Which evaluation stage(s) to run",
     )
@@ -284,6 +285,24 @@ def main() -> int:
         type=str,
         default=None,
         help='Pairwise mode: JSON config {"name","provider","model"} for variant B.',
+    )
+    parser.add_argument(
+        "--scenario-n",
+        type=int,
+        default=10,
+        help="Scenario mode: number of scenarios to generate/run.",
+    )
+    parser.add_argument(
+        "--persona",
+        type=str,
+        default="layperson",
+        help="Scenario mode: user persona (layperson|business|junior_lawyer).",
+    )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=8,
+        help="Scenario mode: max conversation turns per scenario.",
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -442,6 +461,44 @@ def main() -> int:
             "a": {"name": agent_a.name, "provider": agent_a.provider, "model": agent_a.model},
             "b": {"name": agent_b.name, "provider": agent_b.provider, "model": agent_b.model},
         }
+
+    if args.mode == "scenario":
+        from evaluation.scenarios import (
+            generate_scenarios_from_dataset,
+            summarize_scenario_scores,
+        )
+        from evaluation.sim_user import build_persona
+        from brain import build_judge_fn
+
+        scenarios = generate_scenarios_from_dataset(
+            path=data_path, n=args.scenario_n, seed=args.seed)
+        persona = build_persona(args.persona)
+        judge_fn = build_judge_fn(judge_provider, judge_model, JUDGE_TEMPERATURE)
+        if use_parallel:
+            from evaluation.parallel import ParallelConfig, run_scenario_parallel
+            pcfg = ParallelConfig(
+                max_workers=min(args.parallel, EVAL_MAX_WORKERS),
+                judge_concurrency=EVAL_JUDGE_CONCURRENCY,
+            )
+            scores = run_scenario_parallel(
+                scenarios, persona, pcfg, meta.run_id,
+                max_turns=args.max_turns, judge_fn=judge_fn)
+        else:
+            from evaluation.parallel import _run_one_scenario
+            scores = [
+                _run_one_scenario(sc, persona, meta.run_id,
+                                  args.max_turns, judge_fn)
+                for sc in scenarios
+            ]
+        payload["scenario_summary"] = summarize_scenario_scores(scores)
+        payload["scenario_results"] = [
+            {"scenario_id": s.scenario_id, "r_action": s.r_action,
+             "r_output": s.r_output, "r_composite": s.r_composite,
+             "success": s.success, "reached_goal": s.reached_goal,
+             "n_turns": s.n_turns, "notes": s.notes}
+            for s in scores
+        ]
+        payload["scenario_persona"] = args.persona
 
     # Failure Classification
     if args.mode in ("generation", "e2e", "all"):

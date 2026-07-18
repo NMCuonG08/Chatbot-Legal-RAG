@@ -39,6 +39,10 @@ class EvalSample:
     # with an ``expected_route`` field lets routing_accuracy measure against
     # gold labels instead of a noisy proxy.
     expected_route: Optional[str] = None
+    # P3 scenario fields (all optional; old train.jsonl rows load unchanged).
+    expected_answer: Optional[str] = None
+    expected_tool: Optional[str] = None
+    expected_block: bool = False
 
     @property
     def gold_hash(self) -> int:
@@ -95,12 +99,18 @@ def load_eval_dataset(
             continue
         # Optional human routing label; None when the row has no annotation.
         expected_route = (row.get("expected_route") or None)
+        expected_answer = (row.get("expected_answer") or None)
+        expected_tool = (row.get("expected_tool") or None)
+        expected_block = bool(row.get("expected_block", False))
         raw.append(
             EvalSample(
                 sample_id=f"train-{idx}",
                 question=question,
                 gold_context=context,
                 expected_route=expected_route,
+                expected_answer=expected_answer,
+                expected_tool=expected_tool,
+                expected_block=expected_block,
             )
         )
 
