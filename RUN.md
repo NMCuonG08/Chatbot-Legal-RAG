@@ -1,10 +1,31 @@
 # RUN.md — Trang duy nhất để chạy mọi thứ
 
-> Tóm tắt: tôi đã xây xong **hệ thống eval/harness 7 phase** (P1–P7) cho Legal chatbot. Tất cả code + test đã commit (9 commit, `9dd0782`→`ef24020`). Trang này chỉ lệnh copy-paste.
+> Tóm tắt: đã xây xong **hệ thống eval/harness 7 phase** (P1–P7) cho Legal chatbot. Tất cả code + test đã commit (`9dd0782`→`ef24020`).
+> **Một entry duy nhất: `scripts/dev.sh`** — infra / app / test / eval / prod đều qua nó. Ops/MLOps/opsdev gọi cùng path.
 
-Tất cả lệnh chạy từ repo root `E:\MachineLearning\Legal`. Shell bash.
+## ⚡ Cheat sheet (1 lệnh / việc)
+
+```bash
+scripts/dev.sh up            # boot Redis/MariaDB/Qdrant/Prometheus/Grafana
+scripts/dev.sh setup          # (1 lần) pip install + DB schema + Qdrant collections
+scripts/dev.sh app            # Celery + FastAPI :8002 + Streamlit :8501 (Ctrl-C stop all)
+scripts/dev.sh test           # offline gate (không cần service/key)
+scripts/dev.sh gate           # pytest + mypy + black (mirror CI)
+scripts/dev.sh phase P1       # chạy test phase P1..P7 riêng
+scripts/dev.sh golden         # build data/golden_unified.jsonl
+scripts/dev.sh eval           # eval --mode all, judge Groq  (env N, PARALLEL)
+scripts/dev.sh eval --ollama  # judge Ollama (không tốn Groq quota)
+scripts/dev.sh drift B.json R.json   # PSI+KL drift giữa 2 run
+scripts/dev.sh redteam        # promptfoo red-team (cần Node + app :8002)
+scripts/dev.sh prod           # full boot: infra -> wait -> seed -> app
+scripts/dev.sh ci-check       # mirror .github/workflows/ci.yml
+```
+
+`scripts/dev.sh` (không args) in ra full usage. Tất cả lệnh chạy từ repo root, shell bash.
 
 ---
+
+## Chi tiết (khi cần override)
 
 ## 0. Cài môi trường (1 lần)
 
