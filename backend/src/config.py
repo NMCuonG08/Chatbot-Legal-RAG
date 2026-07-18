@@ -1,4 +1,20 @@
+import os as _os_loop  # loop-control env reads before the shared `import os as _os` block below
+
 DEFAULT_COLLECTION_NAME = "llm"
+
+# ---- LangGraph loop control (senior: bound the loop, never hang) ----
+# Hard recursion cap on the graph. LangGraph default is 25; we raise slightly
+# because supervisor handoffs + ReAct + verify loops can legitimately stack a few
+# layers. Anything exceeding this is a runaway loop -> GraphRecursionError
+# (caught + degraded, NOT retried). Set via env so ops can tune per-env.
+GRAPH_RECURSION_LIMIT = int(_os_loop.environ.get("GRAPH_RECURSION_LIMIT", "32"))
+# Wall-clock deadline for one graph.invoke (seconds). Per-LLM request_timeout=60
+# already bounds a single model call, but a chain of nodes + a stuck tool could
+# still hang a Celery worker indefinitely. On timeout we raise GraphRunTimeout
+# (non-retryable) and degrade gracefully. The hung invoke thread cannot be
+# killed in Python; it is abandoned and left to fail on its own — the worker
+# unblocks and returns a user-facing error.
+GRAPH_RUN_TIMEOUT_S = float(_os_loop.environ.get("GRAPH_RUN_TIMEOUT_S", "120"))
 
 # ---- Self-Corrective RAG (CRAG) tuning constants ----
 # Max retrieval-rewrite loop iterations before forcing a web_search fallback.

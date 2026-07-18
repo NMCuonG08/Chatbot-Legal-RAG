@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import logging
@@ -52,8 +53,11 @@ from config import (
     TASK_RETRY_BACKOFF,
     TASK_RETRY_BACKOFF_MAX,
     TASK_RETRY_JITTER,
+    GRAPH_RECURSION_LIMIT,
+    GRAPH_RUN_TIMEOUT_S,
 )
 from retry_utils import with_retry, build_transient_exceptions
+from graph_loop_control import GraphRunTimeout, _invoke_with_deadline
 
 # Exception classes whose transient failure should trigger a Celery task retry.
 # Built once at import; optional deps (redis/sqlalchemy/requests) imported lazily
@@ -1187,8 +1191,15 @@ def run_chat_graph(history, question, user_id=None, conversation_id=None,
     try:
         graph = get_chat_graph()
         thread_id = conversation_id or (f"user:{user_id}" if user_id else "default")
-        config = {"configurable": {"thread_id": thread_id}}
-        result = graph.invoke(
+        config = {
+            "configurable": {"thread_id": thread_id},
+            # Hard recursion cap — runaway supervisor/ReAct/verify loops raise
+            # GraphRecursionError instead of spinning forever. Bounded above by
+            # GRAPH_RECURSION_LIMIT (env-tunable). Caught + degraded, NOT retried.
+            "recursion_limit": GRAPH_RECURSION_LIMIT,
+        }
+        result = _invoke_with_deadline(
+            graph,
             {
                 "history": history,
                 "question": question,
@@ -1198,6 +1209,7 @@ def run_chat_graph(history, question, user_id=None, conversation_id=None,
                 "role": role,
             },
             config=config,
+            timeout_s=GRAPH_RUN_TIMEOUT_S,
         )
     finally:
         if token is not None:
