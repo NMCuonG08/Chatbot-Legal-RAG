@@ -1,0 +1,61 @@
+# .understandignore — patterns for files/dirs to exclude from analysis
+# Syntax: same as .gitignore (globs, # comments, ! negation, trailing / for dirs)
+# Lines below are suggestions — uncomment to activate.
+# Use ! prefix to force-include something excluded by defaults.
+#
+# Built-in defaults (always excluded unless negated):
+#   node_modules/, .git/, dist/, build/, obj/, *.lock, *.min.js, etc.
+#
+# --- From .gitignore (uncomment to exclude) ---
+
+# .DS_Store
+# Thumbs.db
+# *.py[cod]
+# *$py.class
+# env/
+# ENV/
+# *.egg-info/
+# .eggs/
+# pip-wheel-metadata/
+# .pytest_cache/
+# .mypy_cache/
+# .ruff_cache/
+# .coverage
+# .coverage.*
+# htmlcov/
+# .ipynb_checkpoints/
+# *.pid
+# *.out
+# *.err
+# *.jsonl
+# .env
+# .env.*
+# !.env.example
+# *.swp
+# *.swo
+# qdrant_storage/
+# *.sqlite3
+# data/
+# backend/data/
+# data_pipeline/data/
+# llm_finetuning_serving/final_model/
+# llm_finetuning_serving/outputs/
+# llm_finetuning_serving/checkpoints/
+# .gradio/
+# embed_serving/models/
+# storage/
+# qdrant-win/
+# qdrant.zip
+# .qdrant-initialized
+
+# --- Detected directories (uncomment to exclude) ---
+
+# tests/
+# docs/
+# scripts/
+
+# --- Test file patterns (uncomment to exclude) ---
+
+# *.test.*
+# *.spec.*
+# *.snap
