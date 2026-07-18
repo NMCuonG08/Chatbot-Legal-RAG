@@ -189,3 +189,10 @@ Trong `eval_retrieval.py`, thêm hàm `_config_<tên>` rồi đăng ký vào `CO
 - Match substring có thể false-positive khi 2 đoạn ngắn đều phổ biến (ví dụ "Theo Điều 1"). Với eval pháp luật thì các chunk đủ dài nên ít khi gặp.
 - Cohere rerank cần `COHERE_API_KEY`. Không có key thì `hybrid_rerank` và `full` sẽ tự fallback về top-N của input (đo hơi không công bằng — module sẽ vẫn chạy, chỉ là score sẽ giống `hybrid`).
 - Full eval với 89k câu là không khả thi về cost LLM. Default n=50 đủ tin cậy thống kê cho retrieval; n=30 cho generation đã tốn ~120 LLM calls.
+
+## Judge hardening & pairwise — hạn chế (P2)
+
+- **Self-preference / cross-family hạn chế**: judge chỉ Groq (Llama) + Ollama (Llama/glm nếu cấu hình). Không có key OpenAI/Anthropic nên panel cùng họ Llama → ít đa dạng gia đình. Mitigate: swap augmentation (position bias), CoT-before-score (G-Eval), multi-judge panel, Cohen's kappa calibration. Khuyến nghị: khi có key cross-family, thêm judge thứ ba.
+- **Swap augmentation chi phí gấp đôi**: `swap_augment_pairwise` gọi judge 2 lần/sample → cost x2. Tắt nếu chỉ survey nhanh.
+- **nest_asyncio**: `run_chat_graph` sync, mỗi thread trong `ThreadPoolExecutor` có event loop riêng → không cần `nest_asyncio`. Nếu node dùng `asyncio.get_event_loop().run_until_complete` trên loop đang chạy, patch sang `asyncio.run` (flag, chỉ fix khi test fail).
+- **Pairwise A/B**: `run_pairwise_eval` pin provider/model qua contextvars (`LLM_PROVIDER_CONTEXTVAR`/`LLM_MODEL_CONTEXTVAR`); không mutate env. Swap inconsistency → tie. Sign test (binomtest) cho p-value, bootstrap CI cho win rate.

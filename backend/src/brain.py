@@ -20,6 +20,13 @@ VIETNAMESE_LLM_API_URL = os.environ.get("VIETNAMESE_LLM_API_URL", default=None)
 # Stores list of dicts: {"provider": str, "model": str, "prompt_tokens": int, "completion_tokens": int}
 usage_accumulator = contextvars.ContextVar("usage_accumulator", default=None)
 
+# Per-call provider/model override (P2: judge hardening + pairwise A/B + cost
+# routing). When set, get_main_provider() / build_groq_provider() honor these
+# over the env defaults, so a judge call or shadow-variant run can pin a
+# different model without mutating global env. None = use env default.
+LLM_PROVIDER_CONTEXTVAR = contextvars.ContextVar("llm_provider_override", default=None)
+LLM_MODEL_CONTEXTVAR = contextvars.ContextVar("llm_model_override", default=None)
+
 
 def record_usage(provider: str, model: str, usage) -> None:
     """Append a token-usage record to the active accumulator (if any).
@@ -189,7 +196,7 @@ class OllamaProvider(LLMProvider):
 # --------------------------------------------------------------------------- #
 
 def build_groq_provider(model: str | None = None) -> GroqProvider:
-    m = model or os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
+    m = model or LLM_MODEL_CONTEXTVAR.get() or os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile")
     if m and "cloud" in m.lower():
         m = "llama-3.3-70b-versatile"
     return GroqProvider(m)
@@ -203,24 +210,51 @@ def build_ollama_provider(model: str | None = None) -> OllamaProvider:
     # localhost as http (local Ollama has no TLS).
     if base.startswith("http://") and "localhost" not in base and "127.0.0.1" not in base:
         base = "https://" + base[len("http://"):]
-    return OllamaProvider(
-        base,
-        model or os.environ.get("OLLAMA_LLM_MODEL") or os.environ.get("OLLAMA_MODEL") or "llama3.1:latest",
-        os.environ.get("OLLAMA_API_KEY"),
-    )
+    m = model or LLM_MODEL_CONTEXTVAR.get() or os.environ.get("OLLAMA_LLM_MODEL") or os.environ.get("OLLAMA_MODEL") or "llama3.1:latest"
+    return OllamaProvider(base, m, os.environ.get("OLLAMA_API_KEY"))
 
 
 def get_main_provider() -> LLMProvider:
-    """Router: pick the main LLM provider from LLM_PROVIDER (groq|ollama).
-    Default groq. Unknown values (including the legacy 'openai' branch) fall
-    back to groq with a warning — OpenAI is not a class yet."""
-    provider = os.environ.get("LLM_PROVIDER", "groq").lower()
+    """Router: pick the main LLM provider from LLM_PROVIDER (groq|ollama),
+    honoring a per-call contextvar override first (P2). Default groq. Unknown
+    values fall back to groq with a warning."""
+    provider = (LLM_PROVIDER_CONTEXTVAR.get() or os.environ.get("LLM_PROVIDER", "groq")).lower()
     if provider == "ollama":
         return build_ollama_provider()
     if provider == "groq":
         return build_groq_provider()
     logger.warning(f"Unknown LLM_PROVIDER '{provider}', falling back to groq")
     return build_groq_provider()
+
+
+def build_judge_fn(provider: str = "groq", model: str | None = None,
+                   temperature: float = 0.0):
+    """Build a judge_fn(messages) -> str closure pinned to a provider+model.
+
+    Groq + Ollama only (no OpenAI/Anthropic key in this project). The closure
+    sets the provider/model contextvars for its call so usage_accumulator
+    records the right model, then restores them. Returns a callable matching
+    the ``judge_fn`` contract used by metrics_generation / verify_answer.
+    """
+    prov = (provider or "groq").lower()
+    model = model or os.environ.get("JUDGE_MODEL", "llama-3.1-8b-instant")
+
+    def _judge(messages, *, _prov=prov, _model=model, _temp=temperature):
+        pv_tok = LLM_PROVIDER_CONTEXTVAR.set(_prov)
+        mv_tok = LLM_MODEL_CONTEXTVAR.set(_model)
+        try:
+            if _prov == "ollama":
+                p = build_ollama_provider(_model)
+            else:
+                p = build_groq_provider(_model)
+            return p.chat(messages, temperature=_temp)
+        finally:
+            LLM_PROVIDER_CONTEXTVAR.reset(pv_tok)
+            LLM_MODEL_CONTEXTVAR.reset(mv_tok)
+
+    _judge.provider = prov  # type: ignore[attr-defined]
+    _judge.model = model  # type: ignore[attr-defined]
+    return _judge
 
 
 def vietnamese_llm_chat_complete(messages=(), temperature=0.7, max_tokens=512):

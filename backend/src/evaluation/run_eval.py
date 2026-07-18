@@ -218,7 +218,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run RAG evaluation suite")
     parser.add_argument(
         "--mode",
-        choices=["retrieval", "generation", "e2e", "all"],
+        choices=["retrieval", "generation", "e2e", "all", "pairwise"],
         default="retrieval",
         help="Which evaluation stage(s) to run",
     )
@@ -272,6 +272,18 @@ def main() -> int:
         type=str,
         default=None,
         help="Path to a baseline run JSON to diff against (regression report).",
+    )
+    parser.add_argument(
+        "--agent-a",
+        type=str,
+        default=None,
+        help='Pairwise mode: JSON config {"name","provider","model"} for variant A.',
+    )
+    parser.add_argument(
+        "--agent-b",
+        type=str,
+        default=None,
+        help='Pairwise mode: JSON config {"name","provider","model"} for variant B.',
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -397,6 +409,39 @@ def main() -> int:
             }
             for r in e2e_results
         ]
+
+    if args.mode == "pairwise":
+        if not args.agent_a or not args.agent_b:
+            print("--mode pairwise requires --agent-a and --agent-b JSON configs")
+            return 2
+        from evaluation.pairwise_eval import (
+            AgentConfig,
+            pairwise_summary_to_dict,
+            run_pairwise_eval,
+        )
+        from brain import build_judge_fn
+
+        a_cfg = json.loads(args.agent_a)
+        b_cfg = json.loads(args.agent_b)
+        agent_a = AgentConfig(
+            name=a_cfg.get("name", "A"),
+            provider=a_cfg.get("provider"),
+            model=a_cfg.get("model"),
+        )
+        agent_b = AgentConfig(
+            name=b_cfg.get("name", "B"),
+            provider=b_cfg.get("provider"),
+            model=b_cfg.get("model"),
+        )
+        judge_fn = build_judge_fn(judge_provider, judge_model, JUDGE_TEMPERATURE)
+        summary = run_pairwise_eval(
+            samples, agent_a, agent_b, judge_fn, top_k=args.top_k,
+        )
+        payload["pairwise_summary"] = pairwise_summary_to_dict(summary)
+        payload["pairwise_agents"] = {
+            "a": {"name": agent_a.name, "provider": agent_a.provider, "model": agent_a.model},
+            "b": {"name": agent_b.name, "provider": agent_b.provider, "model": agent_b.model},
+        }
 
     # Failure Classification
     if args.mode in ("generation", "e2e", "all"):

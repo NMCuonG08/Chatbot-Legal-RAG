@@ -13,10 +13,10 @@ Verdict vocabulary mirrors ``legal_retrieval_tools.verify_citation``:
 from __future__ import annotations
 
 import logging
-from typing import Dict, List
+from typing import Callable, Dict, List, Optional
 
-from brain import groq_chat_complete
-from config import VERIFY_ANSWER_THRESHOLD, VERIFY_PARTIAL_THRESHOLD
+from brain import build_judge_fn
+from config import JUDGE_MODEL, JUDGE_PROVIDER, JUDGE_TEMPERATURE, VERIFY_ANSWER_THRESHOLD, VERIFY_PARTIAL_THRESHOLD
 from evaluation.metrics_generation import evaluate_faithfulness
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 _MIN_ANSWER_LEN = 15
 
 
-def judge_answer(question: str, answer: str, sources: List[Dict]) -> Dict:
+def judge_answer(question: str, answer: str, sources: List[Dict],
+                 judge_fn: Optional[Callable] = None) -> Dict:
     """Score an answer against its retrieval sources.
 
     Args:
@@ -33,6 +34,9 @@ def judge_answer(question: str, answer: str, sources: List[Dict]) -> Dict:
         answer: candidate final response text.
         sources: retrieved source chunks (RAG route only). Each entry may
             carry a ``content`` field used as grounding context.
+        judge_fn: optional override judge callable (messages -> str). Defaults
+            to a pinned judge built from JUDGE_PROVIDER/JUDGE_MODEL so a judge
+            swap is auditable instead of hardcoded to the agent's Groq call.
 
     Returns:
         ``{"score": float, "rationale": str, "verdict": str}`` where verdict is
@@ -61,8 +65,9 @@ def judge_answer(question: str, answer: str, sources: List[Dict]) -> Dict:
             "verdict": "supported",
         }
 
+    j_fn = judge_fn or build_judge_fn(JUDGE_PROVIDER, JUDGE_MODEL, JUDGE_TEMPERATURE)
     try:
-        jr = evaluate_faithfulness(question, answer, contexts, judge_fn=groq_chat_complete)
+        jr = evaluate_faithfulness(question, answer, contexts, judge_fn=j_fn)
     except Exception as exc:  # judge failure must not break the graph
         logger.warning("verify_answer judge failed: %s", exc)
         return {"score": 0.0, "rationale": f"judge_error: {exc}", "verdict": "unsupported"}
