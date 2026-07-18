@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 # Repo root: backend/src/evaluation/dataset.py -> repo
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_DATA_FILE = REPO_ROOT / "data" / "train.jsonl"
+DEFAULT_GOLDEN_FILE = REPO_ROOT / "data" / "golden_unified.jsonl"
 
 
 @dataclass
@@ -50,6 +51,19 @@ class EvalSample:
         return int(
             hashlib.sha1(self.gold_context.encode("utf-8")).hexdigest()[:16],
             16,
+        )
+
+    @classmethod
+    def from_golden_item(cls, item) -> "EvalSample":
+        """Adapt a ``golden_unified.GoldenItem`` to an EvalSample."""
+        return cls(
+            sample_id=item.sample_id,
+            question=item.question,
+            gold_context=item.expected_answer or "",
+            expected_route=item.expected_route,
+            expected_answer=item.expected_answer,
+            expected_tool=item.expected_tool,
+            expected_block=item.expected_block,
         )
 
 

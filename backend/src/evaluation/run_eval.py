@@ -310,6 +310,12 @@ def main() -> int:
         default="all",
         help="Redteam mode: probe category (all|jailbreak_legal|...).",
     )
+    parser.add_argument(
+        "--slice",
+        action="append",
+        default=None,
+        help="Slice name to report (repeatable): intent|difficulty|language|oos.",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -597,6 +603,36 @@ def main() -> int:
     md_payload = dict(payload)
     md_payload["retrieval_results"] = payload.pop("_retrieval_runs", None)
     report_md = _build_markdown_report(md_payload)
+
+    # ----- P5: slicing + extended metrics (opt-in via --slice) -----
+    if args.slice:
+        from evaluation.slicing import (
+            slice_by_difficulty, slice_by_intent, slice_by_language,
+            slice_by_oos, summarize_by_slice,
+        )
+        slice_fns = {
+            "intent": slice_by_intent, "difficulty": slice_by_difficulty,
+            "language": slice_by_language, "oos": slice_by_oos,
+        }
+        slices_payload = {}
+        for name in args.slice:
+            fn = slice_fns.get(name)
+            if fn is None:
+                continue
+            slices_payload[name] = {
+                k: {"n": len(v)} for k, v in fn(samples).items()
+            }
+        payload["slices"] = slices_payload
+
+    # Extended metrics over e2e/gen results when present.
+    if e2e_results:
+        from evaluation.metrics_extended import hallucination_rate, latency_p99
+        latencies = [r.latency_ms for r in e2e_results if r.latency_ms]
+        payload["latency_p99_ms"] = latency_p99(latencies)
+    if gen_results:
+        from evaluation.metrics_extended import hallucination_rate
+        faith = [r.scores.get("faithfulness", 0.0) for r in gen_results]
+        payload["hallucination_rate"] = hallucination_rate(faith)
 
     json_path = output_dir / "report.json"
     md_path = output_dir / "report.md"
