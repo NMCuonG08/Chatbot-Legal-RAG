@@ -420,6 +420,34 @@ def load_agent_steps(run_id: str, db: Session = None) -> list[AgentStep]:
             db.close()
 
 
+def load_session_trace(thread_id: str, db: Session = None) -> list[AgentStep]:
+    """Load all trace events for a whole conversation session (multi-turn replay).
+
+    ``run_id`` is per-message, so a multi-turn conversation spans several runs.
+    ``GraphRun.thread_id`` (= conversation_id) is the session key. This joins
+    ``AgentStep.run_id == GraphRun.id`` filtered by ``thread_id`` and orders by
+    run creation then step_index, so the caller can replay an entire session
+    as one trace (senior observability: trace_id spans the whole session).
+
+    Returns an empty list if the thread_id has no runs.
+    """
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        return (
+            db.query(AgentStep)
+            .join(GraphRun, AgentStep.run_id == GraphRun.id)
+            .filter(GraphRun.thread_id == thread_id)
+            .order_by(GraphRun.started_at.asc(), AgentStep.step_index.asc(), AgentStep.id.asc())
+            .all()
+        )
+    finally:
+        if session_created:
+            db.close()
+
+
 def save_user_episode(user_id: str, summary: str, db: Session = None):
     session_created = False
     if db is None:
