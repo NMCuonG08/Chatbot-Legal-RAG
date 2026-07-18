@@ -31,7 +31,13 @@ from llama_index.core.llms.callbacks import llm_chat_callback, llm_completion_ca
 from retry_utils import with_retry, awith_retry
 
 # Re-export tracking symbols for back-compat (tests/eval import via `agent.*`).
-from agent_tool_tracking import agent_tool_calls, track_tool_call, agent_user_id  # noqa: F401
+from agent_tool_tracking import (  # noqa: F401
+    agent_tool_calls,
+    track_tool_call,
+    agent_user_id,
+    agent_run_id,
+    agent_thread_id,
+)
 from agent_tool_wrappers import all_tools  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -692,6 +698,8 @@ def ai_agent_handle(
     conversation_id: Optional[str] = None,
     history: Optional[List[Dict]] = None,
     role: Optional[str] = None,
+    run_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
 ) -> Tuple[str, List[Dict]]:
     """
     Handle user question using ReAct agent with tools.
@@ -713,6 +721,9 @@ def ai_agent_handle(
     # only this turn's calls. contextvars propagate into asyncio.run coroutines.
     token = agent_tool_calls.set([])
     user_token = agent_user_id.set(user_id)
+    # Trace identity for per-tool-call events (None outside a graph run => silent).
+    rid_token = agent_run_id.set(run_id)
+    tid_token = agent_thread_id.set(thread_id)
     try:
         global _llm
         if _llm is None:
@@ -858,6 +869,8 @@ def ai_agent_handle(
     finally:
         agent_tool_calls.reset(token)
         agent_user_id.reset(user_token)
+        agent_run_id.reset(rid_token)
+        agent_thread_id.reset(tid_token)
 
 
 def get_agent_tools_summary() -> Dict:

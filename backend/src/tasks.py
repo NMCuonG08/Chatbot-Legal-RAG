@@ -614,10 +614,12 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
     return assistant_answer, ranked_docs
 
 
-def generate_agent_answer(history, question, user_id=None, conversation_id=None, role=None):
+def generate_agent_answer(history, question, user_id=None, conversation_id=None, role=None,
+                          run_id=None, thread_id=None):
     logger.info("Using ReAct agent with tools")
     answer, tool_calls = ai_agent_handle(
-        question, user_id, conversation_id, history=history, role=role
+        question, user_id, conversation_id, history=history, role=role,
+        run_id=run_id, thread_id=thread_id,
     )
     return answer, tool_calls
 
@@ -1001,7 +1003,8 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
             return {"response": gate_resp, "sources": [], "tool_calls": []}
 
         resp, tool_calls = generate_agent_answer(
-            history, question, user_id=user_id, conversation_id=thread_id, role=role
+            history, question, user_id=user_id, conversation_id=thread_id, role=role,
+            run_id=run_id, thread_id=thread_id,
         )
         if guardrails_manager.initialized:
             resp = guardrails_manager.add_legal_disclaimer(resp, question)

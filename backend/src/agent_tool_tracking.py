@@ -2,7 +2,9 @@
 
 ``agent_tool_calls`` is a contextvar accumulating the list of tool-call records
 for the current run. ``track_tool_call`` is a decorator that wraps a tool fn so
-every call appends a record (name, args, status, error, truncated result).
+every call appends a record (name, args, status, error, truncated result) AND
+emits a per-tool-call trace event with latency (bridge loop -> harness: clean
+per-step data for eval slicing).
 
 Extracted from ``agent.py`` so the tool-wrapper module can import the decorator
 without a circular import (agent.py imports the wrappers which import tracking).
@@ -13,6 +15,7 @@ import functools
 import inspect
 import json
 import logging
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -31,9 +34,46 @@ agent_user_id: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
     "agent_user_id", default=None
 )
 
+# Per-run trace identity so @track_tool_call can emit a per-tool-call trace
+# event (event_type="tool_call") with latency. Set in ai_agent_handle from the
+# graph state (run_id, thread_id). Default None => no trace emit (silent for
+# casual calls outside a graph run).
+agent_run_id: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "agent_run_id", default=None
+)
+agent_thread_id: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "agent_thread_id", default=None
+)
+
+
+def _emit_tool_trace(call_record: dict, latency_ms: float) -> None:
+    """Best-effort per-tool-call trace event. Never raises (trace failure must
+    not break the chat flow). Only emits when run_id is set (inside a graph run).
+    """
+    run_id = agent_run_id.get()
+    if run_id is None:
+        return
+    try:
+        from trace import emit_step
+        emit_step(
+            run_id,
+            agent_thread_id.get() or "",
+            "agent_tools",
+            "tool_call",
+            {
+                "tool_name": call_record["tool_name"],
+                "status": call_record["status"],
+                "error": call_record["error"],
+                "latency_ms": round(latency_ms, 2),
+            },
+        )
+    except Exception as exc:  # pragma: no cover - trace is best-effort
+        logger.debug(f"tool-call trace emit skipped: {exc}")
+
 
 def track_tool_call(func):
-    """Decorator: record each call of a tool fn into ``agent_tool_calls``.
+    """Decorator: record each call of a tool fn into ``agent_tool_calls`` and
+    emit a per-tool-call trace event with latency.
 
     On exception the record is marked ``status="error"`` and the exception is
     re-raised. On a JSON result containing an ``error`` key the record is marked
@@ -59,6 +99,7 @@ def track_tool_call(func):
         }
         acc.append(call_record)
 
+        t0 = time.perf_counter()
         try:
             res = func(*args, **kwargs)
             call_record["result"] = str(res)[:1000]
@@ -75,5 +116,7 @@ def track_tool_call(func):
             call_record["status"] = "error"
             call_record["error"] = f"{type(exc).__name__}: {exc}"
             raise exc
+        finally:
+            _emit_tool_trace(call_record, (time.perf_counter() - t0) * 1000.0)
 
     return wrapper
