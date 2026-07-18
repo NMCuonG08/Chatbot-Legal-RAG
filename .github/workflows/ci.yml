@@ -1,16 +1,28 @@
 name: ci
 
+# Offline gate — runs on every push / PR. No live services, no API keys.
+# pytest.ini addopts already filters out integration/slow/redteam_live/live
+# markers and ignores modules blocked by the pre-existing langchain-groq
+# ModelProfile import mismatch (unrelated to the eval harness).
 on:
   push:
   pull_request:
 
 jobs:
-  test:
+  offline-gate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements_dev.txt
-      - run: pytest -q
+      - name: Install dev deps
+        run: pip install -r requirements_dev.txt
+      - name: Offline eval gate (pytest, addopts filter applied)
+        run: pytest -q
+      - name: Type-check eval harness
+        run: mypy backend/src/evaluation --ignore-missing-imports
+        continue-on-error: true
+      - name: Format check eval harness
+        run: black --check backend/src/evaluation
+        continue-on-error: true

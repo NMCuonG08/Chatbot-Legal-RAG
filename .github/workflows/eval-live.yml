@@ -1,0 +1,129 @@
+name: eval-live
+
+# Live eval workflow — nightly + manual. Boots the full service stack
+# (Qdrant/Neo4j/Redis via docker-compose), seeds legal data, runs the complete
+# eval suite against the real Groq-backed agent + judge, then regression-diffs
+# against an optional baseline run and runs the red-team suite (promptfoo via
+# npx + DeepEval live markers). On failure, opens a tracking issue.
+#
+# Trigger:
+#  - schedule: nightly 02:07 UTC (off the :00 mark to spread fleet load)
+#  - workflow_dispatch: optional inputs baseline_run_id + candidate_ref
+on:
+  schedule:
+    - cron: "7 2 * * *"
+  workflow_dispatch:
+    inputs:
+      baseline_run_id:
+        description: "Baseline run id (under eval_reports/runs/) to diff against"
+        required: false
+      candidate_ref:
+        description: "Git ref/branch to evaluate (defaults to current)"
+        required: false
+
+env:
+  PYTHONPATH: backend/src:.
+  JUDGE_PROVIDER: groq
+  JUDGE_MODEL: ${{ secrets.JUDGE_MODEL || 'llama-3.1-8b-instant' }}
+
+jobs:
+  live-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.candidate_ref || github.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install promptfoo (Node CLI)
+        run: npm install -g promptfoo
+
+      - name: Install Python dev deps
+        run: pip install -r requirements_dev.txt
+
+      - name: Start services (Qdrant/Neo4j/Redis)
+        run: docker compose up -d
+
+      - name: Wait for services
+        run: |
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:6333/healthz && break || sleep 5
+          done
+
+      - name: Seed legal data
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: python backend/src/import_data.py
+
+      - name: Build unified golden set
+        run: python -c "from evaluation.golden_unified import write_unified_dataset; write_unified_dataset()"
+
+      - name: Run full eval suite (all modes, parallel)
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+        run: |
+          python backend/src/evaluation/run_eval.py \
+            --mode all \
+            --data-file data/golden_unified.jsonl \
+            --parallel 8 \
+            --output eval_reports/live/$(date -u +%Y%m%d-%H%M%S)
+
+      - name: Regression diff vs baseline (if provided)
+        if: ${{ github.event.inputs.baseline_run_id != '' }}
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          python backend/src/evaluation/run_eval.py --baseline \
+            eval_reports/runs/${{ github.event.inputs.baseline_run_id }}.json
+
+      - name: Red-team (promptfoo)
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          python -c "from evaluation.redteam.promptfoo_config import write_promptfoo_config; from evaluation.redteam.dataset import load_redteam_dataset; write_promptfoo_config(load_redteam_dataset(), 'promptfoo_tests.json', agent_endpoint='http://localhost:8000/chat')"
+          npx promptfoo eval -c promptfoo_tests.json || true
+
+      - name: Red-team live markers (DeepEval)
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: pytest -m "redteam_live or redteam" -q
+
+      - name: Drift detection
+        if: ${{ github.event.inputs.baseline_run_id != '' }}
+        run: |
+          python -c "from evaluation.drift import detect_drift; import json,sys; reps=detect_drift('eval_reports/runs/${{ github.event.inputs.baseline_run_id }}.json', sys.argv[1]); print(json.dumps([r.__dict__ for r in reps], indent=2, default=str))" \
+            eval_reports/live/latest/report.json || true
+
+      - name: Upload eval artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-reports
+          path: eval_reports/
+
+      - name: Open issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `eval-live failed: ${context.runId}`,
+              body: `Nightly/manual live eval failed. See run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              labels: ['eval-failure']
+            })

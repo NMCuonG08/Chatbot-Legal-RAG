@@ -196,3 +196,95 @@ Trong `eval_retrieval.py`, thêm hàm `_config_<tên>` rồi đăng ký vào `CO
 - **Swap augmentation chi phí gấp đôi**: `swap_augment_pairwise` gọi judge 2 lần/sample → cost x2. Tắt nếu chỉ survey nhanh.
 - **nest_asyncio**: `run_chat_graph` sync, mỗi thread trong `ThreadPoolExecutor` có event loop riêng → không cần `nest_asyncio`. Nếu node dùng `asyncio.get_event_loop().run_until_complete` trên loop đang chạy, patch sang `asyncio.run` (flag, chỉ fix khi test fail).
 - **Pairwise A/B**: `run_pairwise_eval` pin provider/model qua contextvars (`LLM_PROVIDER_CONTEXTVAR`/`LLM_MODEL_CONTEXTVAR`); không mutate env. Swap inconsistency → tie. Sign test (binomtest) cho p-value, bootstrap CI cho win rate.
+
+## Chạy eval — offline vs live (P1–P7)
+
+### Offline gate (mỗi push / PR)
+
+Không cần service sống hay API key. `pytest.ini` addopts đã lọc marker `integration/slow/redteam_live/live` và ignore các module bị pre-existing langchain-groq `ModelProfile` import mismatch (ngoài eval harness).
+
+```bash
+pip install -r requirements_dev.txt
+PYTHONPATH=backend/src:. pytest -q
+```
+
+Chạy riêng từng phase test:
+
+```bash
+PYTHONPATH=backend/src:. pytest tests/test_run_metadata.py tests/test_stats.py tests/test_parallel.py tests/test_regression.py -q   # P1
+PYTHONPATH=backend/src:. pytest tests/test_judge_panel.py tests/test_pairwise_eval.py -q                                          # P2
+PYTHONPATH=backend/src:. pytest tests/test_sim_user.py tests/test_scenarios.py -q                                                 # P3
+PYTHONPATH=backend/src:. pytest tests/test_redteam_dataset.py tests/test_redteam_metrics.py tests/test_pii_detector.py tests/test_redteam_deepeval.py -q  # P4
+PYTHONPATH=backend/src:. pytest tests/test_slicing.py tests/test_metrics_extended.py tests/test_golden_unified.py -q               # P5
+PYTHONPATH=backend/src:. pytest tests/test_cost_routing.py tests/test_drift.py tests/test_otel_bridge.py tests/test_canary_shadow.py -q  # P6
+PYTHONPATH=backend/src:. pytest tests/test_ci_markers.py tests/test_deepeval_gate.py -q                                            # P7
+```
+
+### Live eval (nightly / manual)
+
+Workflow `.github/workflows/eval-live.yml`:
+
+- trigger: `schedule: cron "7 2 * * *"` + `workflow_dispatch` (inputs `baseline_run_id`, `candidate_ref`).
+- boot `docker compose up -d` (Qdrant/Neo4j/Redis) → `import_data.py` seed → build `golden_unified.jsonl` → `run_eval.py --mode all --data-file data/golden_unified.jsonl --parallel 8` → regression diff (nếu có baseline) → red-team (promptfoo + `pytest -m redteam_live or redteam`) → drift → upload artifact + mở issue khi fail.
+- secrets: `GROQ_API_KEY`, `TAVILY_API_KEY`, `DATABASE_URL`, `REDIS_URL`, `JUDGE_MODEL`, `JUDGE_PROVIDER`.
+
+Chạy live thủ công local (cần service sống + Groq key):
+
+```bash
+GROQ_API_KEY=... JUDGE_PROVIDER=groq JUDGE_MODEL=llama-3.1-8b-instant \
+PYTHONPATH=backend/src:. python backend/src/evaluation/run_eval.py \
+  --mode all --data-file data/golden_unified.jsonl --parallel 8 \
+  --output eval_reports/live/manual
+```
+
+### CLI modes (run_eval.py)
+
+`--mode {e2e,generation,retrieval,pairwise,scenario,redteam,all}` + `--n`, `--parallel`, `--output`, `--baseline`, `--slice` (repeatable: `legal_rag`, `oos`, `vi`, `en`, `easy`...), `--agent-a/--agent-b` (JSON, pairwise), `--scenario-n`, `--persona`, `--max-turns`, `--redteam-category`.
+
+### promptfoo (Node CLI)
+
+Red-team promptfoo chạy **chỉ trong live workflow** qua `npx` (cần Node 20). Offline gate thay bằng DeepEval (`test_redteam_deepeval.py`, `test_deepeval_gate.py`, mocked model). Config sinh bởi `evaluation/redteam/promptfoo_config.py`.
+
+```bash
+npm install -g promptfoo
+python -c "from evaluation.redteam.promptfoo_config import write_promptfoo_config; from evaluation.redteam.dataset import load_redteam_dataset; write_promptfoo_config(load_redteam_dataset(), 'promptfoo_tests.json', agent_endpoint='http://localhost:8000/chat')"
+npx promptfoo eval -c promptfoo_tests.json
+```
+
+## CI markers
+
+`unit, integration, smoke, slow, redteam, redteam_live, live`. Offline gate = `-m "not integration and not slow and not redteam_live and not live"`. Live workflow = `pytest -m "redteam_live or redteam"`.
+
+## Module map (P1–P7)
+
+| Phase | Module | Mục đích |
+|-------|--------|----------|
+| P1 | `run_metadata.py` | pin git sha + model + prompt hash + env snapshot |
+| P1 | `stats.py` | bootstrap CI, McNemar, Wilcoxon, pass@k/pass^k, Hedges' g, Holm |
+| P1 | `parallel.py` | ThreadPoolExecutor quanh sync `run_chat_graph` + scenario parallel |
+| P1 | `regression.py` | diff_runs + GatePolicy (PASS/FAIL/INCONCLUSIVE) |
+| P2 | `judge_panel.py` | swap augmentation, CoT G-Eval, multi-judge panel, Cohen's kappa |
+| P2 | `pairwise_eval.py` | A/B với contextvar isolation, sign test, bootstrap CI |
+| P3 | `sim_user.py` | LLM-as-user persona, multi-turn, terminate cue |
+| P3 | `scenarios.py` | τ-bench-style r_action + r_output, composite ≥0.7 |
+| P4 | `redteam/` | 6 category probes + safety metrics + PII detector + promptfoo config |
+| P5 | `slicing.py` | slice by intent/difficulty/language/oos + summarize |
+| P5 | `metrics_extended.py` | tool-call accuracy, noise sensitivity, context utilization, hallucination, p99 |
+| P5 | `golden_unified.py` | unify 3 golden set (run_question_test + eval_router + eval_prompts), dedup |
+| P6 | `otel_bridge.py` | OTel span mirror (fire-and-forget, default off) |
+| P6 | `drift.py` | PSI + symmetric KL giữa 2 run payload |
+| P6 | `cost_routing.py` | route → model (legal_rag big, rest small) + savings |
+| P6 | `tasks.run_chat_graph` | variant/shadow + cost routing override via contextvar |
+
+## Bật tính năng P6 (opt-in, default off)
+
+```bash
+# OTel bridge (cần OTLP collector)
+OTEL_BRIDGE_ENABLED=true OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+
+# Cost-aware routing
+COST_ROUTING_ENABLED=true
+
+# Shadow mode (doubles Groq cost — nightly only)
+SHADOW_MODE_ENABLED=true
+```
