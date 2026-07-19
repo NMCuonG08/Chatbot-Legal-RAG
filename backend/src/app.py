@@ -219,6 +219,92 @@ async def health():
     return {"status": "healthy", "service": "Vietnamese Legal Chatbot Backend"}
 
 
+@app.get("/health/detailed")
+async def health_detailed():
+    # 1. Database check
+    db_status = "healthy"
+    db_error = None
+    try:
+        from sqlalchemy import text
+        from database import engine
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception as e:
+        db_status = "unhealthy"
+        db_error = str(e)
+
+    # 2. Redis check
+    redis_status = "healthy"
+    redis_error = None
+    try:
+        import redis
+        from database import settings as db_settings
+        r = redis.from_url(db_settings.redis_url)
+        r.ping()
+    except Exception as e:
+        redis_status = "unhealthy"
+        redis_error = str(e)
+
+    # 3. Qdrant check
+    qdrant_status = "healthy"
+    qdrant_error = None
+    try:
+        from vectorize import get_client
+        qclient = get_client()
+        qclient.get_collections()
+    except Exception as e:
+        qdrant_status = "unhealthy"
+        qdrant_error = str(e)
+
+    # 4. Celery check
+    celery_status = "healthy"
+    celery_error = None
+    active_workers = []
+    try:
+        from tasks import celery_app
+        ping_result = celery_app.control.ping(timeout=0.3)
+        if ping_result:
+            for worker_res in ping_result:
+                active_workers.extend(worker_res.keys())
+        else:
+            celery_status = "no_workers"
+            celery_error = "No active Celery workers found"
+    except Exception as e:
+        celery_status = "unhealthy"
+        celery_error = str(e)
+
+    # 5. Ollama check (if configured)
+    ollama_status = "healthy"
+    ollama_error = None
+    ollama_configured = False
+    llm_provider = os.getenv("LLM_PROVIDER", "groq")
+    use_ollama = os.getenv("USE_OLLAMA_AS_MAIN", "false").lower() == "true"
+    if llm_provider == "ollama" or use_ollama:
+        ollama_configured = True
+        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        try:
+            import requests
+            resp = requests.get(f"{ollama_url}/api/tags", timeout=2)
+            if resp.status_code != 200:
+                ollama_status = "unhealthy"
+                ollama_error = f"Ollama returned status {resp.status_code}"
+        except Exception as e:
+            ollama_status = "unhealthy"
+            ollama_error = str(e)
+    else:
+        ollama_status = "not_configured"
+
+    return {
+        "status": "healthy" if all(s in ["healthy", "not_configured"] for s in [db_status, redis_status, qdrant_status, celery_status, ollama_status]) else "unhealthy",
+        "database": {"status": db_status, "error": db_error},
+        "redis": {"status": redis_status, "error": redis_error},
+        "qdrant": {"status": qdrant_status, "error": qdrant_error},
+        "celery": {"status": celery_status, "active_workers": active_workers, "error": celery_error},
+        "ollama": {"status": ollama_status, "configured": ollama_configured, "error": ollama_error}
+    }
+
+
+
 # ---- Phase 2: auth / RBAC / approval / audit endpoints ----
 def _client_ip(request: "Request") -> Optional[str]:
     fwd = request.headers.get("x-forwarded-for")
@@ -631,6 +717,20 @@ async def get_response(task_id: str):
     return result
 
 
+def _make_immediate_run_end(status: str, cached: bool = False):
+    async def event_generator_finished():
+        yield {
+            "event": "run_end",
+            "data": json.dumps({
+                "run_id": "completed_early",
+                "node": "__ROOT__",
+                "event_type": "run_end",
+                "payload": {"status": status.lower(), "cached": cached, "completed_early": True}
+            }, ensure_ascii=False, default=str),
+        }
+    return EventSourceResponse(event_generator_finished())
+
+
 async def _resolve_run_id(task_id: str, timeout: float = 15.0) -> Optional[str]:
     """Resolve the trace run_id for a Celery task_id from Redis (set by the worker).
 
@@ -640,10 +740,17 @@ async def _resolve_run_id(task_id: str, timeout: float = 15.0) -> Optional[str]:
     client = aioredis.from_url(db_settings.trace_redis_url, decode_responses=True)
     try:
         deadline = time.monotonic() + timeout
+        task_result = AsyncResult(task_id)
         while time.monotonic() < deadline:
             run_id = await client.get(f"trace:run:{task_id}")
             if run_id:
                 return run_id
+            
+            # If the task finishes or fails while we poll, stop waiting
+            if task_result.status in ["SUCCESS", "FAILURE", "REVOKED"]:
+                logger.info(f"Task {task_id} transitioned to {task_result.status} during short-poll")
+                return None
+                
             await asyncio.sleep(0.2)
         return None
     finally:
@@ -658,25 +765,19 @@ async def chat_stream(task_id: str):
     by the run_id bound to this task_id, and closes the stream on `run_end`.
     Contract: the existing `/chat/complete` + `/chat` endpoints are unchanged.
     """
-    # 0. Check if the task is already completed (e.g., Semantic Cache HIT)
+    # 0. Check if the task is already completed (e.g., Semantic Cache HIT or Guardrail Block)
     # If completed, we do not need to wait for a run_id or subscribe to pub/sub
     task_result = AsyncResult(task_id)
-    if task_result.status == "SUCCESS":
-        logger.info(f"⚡ Task {task_id} already completed (Cache HIT). Returning immediate run_end.")
-        async def event_generator_finished():
-            yield {
-                "event": "run_end",
-                "data": json.dumps({
-                    "run_id": "cached",
-                    "node": "__ROOT__",
-                    "event_type": "run_end",
-                    "payload": {"status": "completed", "cached": True}
-                }, ensure_ascii=False, default=str),
-            }
-        return EventSourceResponse(event_generator_finished())
+    if task_result.status in ["SUCCESS", "FAILURE", "REVOKED"]:
+        logger.info(f"⚡ Task {task_id} already completed early (status={task_result.status}). Returning immediate run_end.")
+        return _make_immediate_run_end(task_result.status, cached=(task_result.status == "SUCCESS"))
 
     run_id = await _resolve_run_id(task_id)
     if not run_id:
+        # Re-check task status in case it transitioned during poll
+        if task_result.status in ["SUCCESS", "FAILURE", "REVOKED"]:
+            logger.info(f"⚡ Task {task_id} completed during poll (status={task_result.status}). Returning immediate run_end.")
+            return _make_immediate_run_end(task_result.status, cached=(task_result.status == "SUCCESS"))
         raise HTTPException(status_code=404, detail=f"No trace run found for task {task_id}")
 
     channel = db_settings.trace_redis_channel

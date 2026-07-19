@@ -70,6 +70,18 @@ class LegalGuardrailsManager:
     def _init_engine(self):
         try:
             import os
+            # Monkeypatch missing GoogleSearchAPIWrapper inside langchain_community.utilities
+            # to satisfy NeMo Guardrails' buggy built-in action file imports.
+            try:
+                import langchain_community.utilities as utils
+                if not hasattr(utils, "GoogleSearchAPIWrapper"):
+                    class DummyGoogleSearchAPIWrapper:
+                        def __init__(self, *args, **kwargs):
+                            pass
+                    setattr(utils, "GoogleSearchAPIWrapper", DummyGoogleSearchAPIWrapper)
+            except Exception as mp_err:
+                logger.debug(f"Langchain community monkeypatch warning: {mp_err}")
+
             from nemoguardrails import RailsConfig, LLMRails
             
             config_dir = Path(__file__).parent.resolve() / "guardrails"

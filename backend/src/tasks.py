@@ -1751,4 +1751,12 @@ def llm_handle_message(self, bot_id, user_id, question, role=None,
         result["route"] = graph_result["route"]
     elif blocked_response:
         result["route"] = "guardrails"
+
+    # Flush Langfuse traces to ensure they are sent before the task terminates
+    try:
+        from agent import flush_langfuse
+        flush_langfuse()
+    except Exception as e:
+        logger.warning(f"Failed to flush Langfuse at task exit: {e}")
+
     return result

@@ -12,6 +12,26 @@ from retry_utils import with_retry
 
 logger = logging.getLogger(__name__)
 
+def log_to_langfuse(name, model, messages, output, prompt_tokens=None, completion_tokens=None):
+    try:
+        from agent import _langfuse_handler
+        if _langfuse_handler and _langfuse_handler.langfuse:
+            lf = _langfuse_handler.langfuse
+            lf.generation(
+                name=name,
+                model=model,
+                input=messages,
+                output=output,
+                usage={
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens
+                } if prompt_tokens or completion_tokens else None
+            )
+            lf.flush()
+    except Exception as e:
+        logger.warning(f"Failed to log direct call to Langfuse: {e}")
+
+
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", default=None)
 # Vietnamese LLM endpoint must be configured explicitly. No hardcoded public IP
 # default — sending chat traffic to an unknown third-party box is a data-leak risk.
@@ -126,10 +146,16 @@ class GroqProvider(LLMProvider):
         try:
             response = _groq_chat_create(self.model, messages, temperature, max_tokens)
             usage = getattr(response, "usage", None)
+            output = response.choices[0].message
+            
+            # Log direct generation to Langfuse
+            pt = getattr(usage, "prompt_tokens", None) if usage else None
+            ct = getattr(usage, "completion_tokens", None) if usage else None
+            log_to_langfuse(f"chat-{self.name}", self.model, messages, output.content, pt, ct)
+            
             if raw:
                 record_usage(self.name, self.model, usage)
                 return response.choices[0].message
-            output = response.choices[0].message
             logger.info(f"Groq chat complete output: {output.content[:100]}")
             record_usage(self.name, self.model, usage)
             return output.content
@@ -144,7 +170,7 @@ class OllamaProvider(LLMProvider):
     default can never leak into local generation."""
     name = "ollama"
 
-    def __init__(self, base_url: str, model: str, api_key: str | None = None, timeout: int = 120):
+    def __init__(self, base_url: str, model: str, api_key: str | None = None, timeout: int = 30):
         super().__init__(model)
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -181,6 +207,13 @@ class OllamaProvider(LLMProvider):
             result = response.json()
             content = result["choices"][0]["message"]["content"]
             logger.info(f"Ollama chat complete output: {content[:100]}")
+            
+            # Log direct generation to Langfuse
+            usage = result.get("usage")
+            pt = usage.get("prompt_tokens") if usage else None
+            ct = usage.get("completion_tokens") if usage else None
+            log_to_langfuse(f"chat-{self.name}", self.model, messages, content, pt, ct)
+            
             record_usage(self.name, self.model, result.get("usage"))
             if raw:
                 from types import SimpleNamespace

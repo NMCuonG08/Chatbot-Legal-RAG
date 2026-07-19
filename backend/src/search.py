@@ -370,17 +370,127 @@ def force_initialize_if_needed() -> bool:
     return False
 
 
-def initialize_from_vector_store(limit: int = 100000) -> bool:
+import threading
+
+_rebuild_lock = threading.Lock()
+_rebuilding = False
+
+def _bg_rebuild_cache(limit: int, qdrant_count: int, cache_dir: Path, metadata_path: Path, cache_path: Path):
+    global _rebuilding, _rebuild_lock, _bm25_retriever, _docstore, _search_engine_initialized
+    with _rebuild_lock:
+        if _rebuilding:
+            return
+        _rebuilding = True
+        
+    try:
+        logger.info("⏳ [BG-REBUILD] Starting background BM25 cache rebuild...")
+        from vectorize import get_client
+        from config import DEFAULT_COLLECTION_NAME
+        from llama_index.core.storage.docstore import SimpleDocumentStore
+        from llama_index.retrievers.bm25 import BM25Retriever
+        from llama_index.core.schema import TextNode
+        import json
+        import os
+        
+        # 1. Fetch points from Qdrant
+        points = []
+        next_offset = None
+        client = get_client()
+        
+        while len(points) < limit:
+            scroll_result = client.scroll(
+                collection_name=DEFAULT_COLLECTION_NAME,
+                limit=2000,
+                offset=next_offset,
+                with_payload=True,
+                with_vectors=False
+            )
+            batch_points, next_offset = scroll_result
+            points.extend(batch_points)
+            if not next_offset or not batch_points:
+                break
+                
+        points = points[:limit]
+        if not points:
+            logger.warning("[BG-REBUILD] No points fetched from Qdrant")
+            return
+            
+        documents = []
+        for point in points:
+            payload = point.payload
+            doc = {
+                'question': payload.get('question', ''),
+                'content': payload.get('content', ''),
+                'source': payload.get('source', 'vector_store'),
+                'doc_id': payload.get('doc_id', point.id)
+            }
+            documents.append(doc)
+            
+        # 2. Write search_documents_cache.json
+        os.makedirs(cache_path.parent, exist_ok=True)
+        temp_path = cache_path.with_suffix(".tmp")
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(documents, f, ensure_ascii=False)
+        try:
+            os.replace(temp_path, cache_path)
+        except PermissionError:
+            pass # Windows lock, ignore since content matches
+            
+        # 3. Build nodes and docstore
+        nodes = []
+        for i, doc in enumerate(documents):
+            if not doc.get('question') and not doc.get('content'):
+                continue
+            text = f"{doc.get('question', '')} {doc.get('content', '')}"
+            node = TextNode(
+                text=text,
+                id_=str(doc.get('doc_id', i)),
+                metadata={
+                    "question": doc.get('question', ''),
+                    "source": doc.get('source', 'unknown'),
+                    "doc_id": doc.get('doc_id', i)
+                }
+            )
+            nodes.append(node)
+            
+        new_docstore = SimpleDocumentStore()
+        new_docstore.add_documents(nodes)
+        
+        new_retriever = BM25Retriever.from_defaults(
+            docstore=new_docstore,
+            similarity_top_k=5,
+        )
+        
+        # 4. Persist BM25 native cache
+        os.makedirs(cache_dir, exist_ok=True)
+        new_retriever.persist(path=str(cache_dir))
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump({"qdrant_count": qdrant_count}, f)
+            
+        # 5. Swap globals
+        _docstore = new_docstore
+        _bm25_retriever = new_retriever
+        _search_engine_initialized = True
+        logger.info(f"✅ [BG-REBUILD] Successfully rebuilt and swapped BM25 retriever in memory with {len(documents)} docs!")
+    except Exception as rebuild_err:
+        logger.error(f"❌ [BG-REBUILD] Background rebuild error: {rebuild_err}")
+    finally:
+        with _rebuild_lock:
+            _rebuilding = False
+
+
+def initialize_from_vector_store(limit: int = 300000) -> bool:
     """
     Initialize search index from existing vector store data using paginated scrolls
     with native BM25 persistence caching to achieve near-instant startup (1.7s instead of 15s).
     
     Args:
-        limit: Maximum number of documents to load (default: 100,000)
+        limit: Maximum number of documents to load (default: 300,000)
         
     Returns:
         bool: True if successful
     """
+    global _bm25_retriever, _search_engine_initialized, _docstore
     try:
         from vectorize import get_client, get_collection_stats
         from config import DEFAULT_COLLECTION_NAME
@@ -415,7 +525,6 @@ def initialize_from_vector_store(limit: int = 100000) -> bool:
                     start_time = time.monotonic()
                     loaded_retriever = BM25Retriever.from_persist_dir(path=str(cache_dir))
                     
-                    global _bm25_retriever, _search_engine_initialized, _docstore
                     _bm25_retriever = loaded_retriever
                     _search_engine_initialized = True
                     
@@ -429,7 +538,30 @@ def initialize_from_vector_store(limit: int = 100000) -> bool:
                     logger.info(f"✅ BM25 native cache loaded successfully in {time.monotonic() - start_time:.4f}s!")
                     return True
                 else:
-                    logger.info(f"⚠️ Cache count mismatch (Cache Qdrant points: {cached_qdrant_count}, Current Qdrant points: {qdrant_count}). Rebuilding index from scratch...")
+                    logger.info(f"⚠️ Cache count mismatch (Cache Qdrant points: {cached_qdrant_count}, Current Qdrant points: {qdrant_count}). Loading stale cache fallback and rebuilding in background...")
+                    start_time = time.monotonic()
+                    loaded_retriever = BM25Retriever.from_persist_dir(path=str(cache_dir))
+                    
+                    _bm25_retriever = loaded_retriever
+                    _search_engine_initialized = True
+                    
+                    corpus_len = len(loaded_retriever.corpus) if hasattr(loaded_retriever, 'corpus') else 0
+                    
+                    class DummyDocstore:
+                        def __init__(self, size):
+                            self.docs = range(size)
+                    _docstore = DummyDocstore(corpus_len)
+                    logger.info(f"✅ Stale BM25 native cache loaded successfully in {time.monotonic() - start_time:.4f}s! Spawning background rebuild...")
+                    
+                    # Spawn background rebuild thread
+                    cache_path = Path("e:/MachineLearning/Legal/data/search_documents_cache.json")
+                    t = threading.Thread(
+                        target=_bg_rebuild_cache,
+                        args=(limit, qdrant_count, cache_dir, metadata_path, cache_path),
+                        daemon=True
+                    )
+                    t.start()
+                    return True
             except Exception as cache_err:
                 logger.warning(f"⚠️ Failed to load BM25 native cache: {cache_err}")
 
@@ -443,12 +575,13 @@ def initialize_from_vector_store(limit: int = 100000) -> bool:
                 logger.info(f"💾 Found local cache file: {cache_path}. Verifying document count...")
                 with open(cache_path, "r", encoding="utf-8") as f:
                     cached_data = json.load(f)
-                if isinstance(cached_data, list) and len(cached_data) == qdrant_count:
-                    logger.info(f"✅ Cache count ({len(cached_data)}) matches Qdrant points ({qdrant_count}). Loading from cache...")
+                expected_count = min(limit, qdrant_count)
+                if isinstance(cached_data, list) and len(cached_data) == expected_count:
+                    logger.info(f"✅ Cache count ({len(cached_data)}) matches expected points ({expected_count}). Loading from cache...")
                     documents = cached_data
                     cache_loaded = True
                 else:
-                    logger.info(f"⚠️ Cache count mismatch (Cache: {len(cached_data) if isinstance(cached_data, list) else 'invalid'}, Qdrant: {qdrant_count}). Re-fetching from Qdrant...")
+                    logger.info(f"⚠️ Cache count mismatch (Cache: {len(cached_data) if isinstance(cached_data, list) else 'invalid'}, Expected: {expected_count}). Re-fetching from Qdrant...")
             except Exception as cache_err:
                 logger.warning(f"⚠️ Failed to read search cache: {cache_err}")
 
@@ -462,7 +595,7 @@ def initialize_from_vector_store(limit: int = 100000) -> bool:
             while len(points) < limit:
                 scroll_result = client.scroll(
                     collection_name=DEFAULT_COLLECTION_NAME,
-                    limit=10000,
+                    limit=2000,
                     offset=next_offset,
                     with_payload=True,
                     with_vectors=False

@@ -1,11 +1,165 @@
 import json
 import os
 import time
+import socket
+from urllib.parse import urlparse
 
 import requests
 import streamlit as st
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8002")
+
+@st.cache_data(ttl=5)
+def check_services_health(backend_url):
+    # Default statuses
+    status_dict = {
+        "backend": {"status": "offline", "label": "FastAPI Backend", "details": "Không thể kết nối"},
+        "database": {"status": "offline", "label": "Database (SQL)", "details": "Chưa kiểm tra"},
+        "qdrant": {"status": "offline", "label": "Qdrant DB", "details": "Chưa kiểm tra"},
+        "redis": {"status": "offline", "label": "Redis Cache", "details": "Chưa kiểm tra"},
+        "celery": {"status": "offline", "label": "Celery Worker", "details": "Chưa kiểm tra"},
+        "ollama": {"status": "not_configured", "label": "Ollama LLM", "details": "Chưa cấu hình"}
+    }
+    
+    def check_port(host, port, timeout=0.5):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except Exception:
+            return False
+            
+    backend_up = False
+    try:
+        resp = requests.get(f"{backend_url}/health/detailed", timeout=4.0)
+        if resp.status_code == 200:
+            backend_up = True
+            data = resp.json()
+            status_dict["backend"] = {"status": "healthy", "label": "FastAPI Backend", "details": "Hoạt động"}
+            
+            # Database
+            db_data = data.get("database", {})
+            status_dict["database"] = {
+                "status": db_data.get("status", "unhealthy"),
+                "label": "Database (SQL)",
+                "details": "Hoạt động" if db_data.get("status") == "healthy" else f"Lỗi: {db_data.get('error')}"
+            }
+            
+            # Redis
+            redis_data = data.get("redis", {})
+            status_dict["redis"] = {
+                "status": redis_data.get("status", "unhealthy"),
+                "label": "Redis Cache",
+                "details": "Hoạt động" if redis_data.get("status") == "healthy" else f"Lỗi: {redis_data.get('error')}"
+            }
+            
+            # Qdrant
+            qdrant_data = data.get("qdrant", {})
+            status_dict["qdrant"] = {
+                "status": qdrant_data.get("status", "unhealthy"),
+                "label": "Qdrant DB",
+                "details": "Hoạt động" if qdrant_data.get("status") == "healthy" else f"Lỗi: {qdrant_data.get('error')}"
+            }
+            
+            # Celery
+            celery_data = data.get("celery", {})
+            celery_status = celery_data.get("status", "unhealthy")
+            active_workers = celery_data.get("active_workers", [])
+            details_str = "Hoạt động"
+            if celery_status == "no_workers":
+                details_str = "Không tìm thấy Worker"
+            elif celery_status == "unhealthy":
+                details_str = f"Lỗi: {celery_data.get('error')}"
+            else:
+                details_str = f"Hoạt động ({len(active_workers)} workers)"
+                
+            status_dict["celery"] = {
+                "status": celery_status,
+                "label": "Celery Worker",
+                "details": details_str
+            }
+            
+            # Ollama
+            ollama_data = data.get("ollama", {})
+            ollama_status = ollama_data.get("status", "not_configured")
+            status_dict["ollama"] = {
+                "status": ollama_status,
+                "label": "Ollama LLM",
+                "details": "Hoạt động" if ollama_status == "healthy" else ("Chưa cấu hình" if ollama_status == "not_configured" else f"Lỗi: {ollama_data.get('error')}")
+            }
+    except Exception as e:
+        status_dict["backend"] = {"status": "unhealthy", "label": "FastAPI Backend", "details": f"Ngoại tuyến: {str(e)[:40]}"}
+
+    # If backend is down, do direct TCP checks
+    if not backend_up:
+        db_url = "postgresql://postgres:cuong1182004@127.0.0.1:5432/legal_chatbot"
+        redis_url = "redis://127.0.0.1:6379/0"
+        qdrant_url = "http://localhost:6333"
+        ollama_url = "http://localhost:11434"
+        
+        env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "backend", ".env")
+        if os.path.exists(env_path):
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("DATABASE_URL="):
+                            db_url = line.split("=", 1)[1]
+                        elif line.startswith("REDIS_URL="):
+                            redis_url = line.split("=", 1)[1]
+                        elif line.startswith("QDRANT_URL="):
+                            qdrant_url = line.split("=", 1)[1]
+                        elif line.startswith("OLLAMA_BASE_URL="):
+                            ollama_url = line.split("=", 1)[1]
+            except Exception:
+                pass
+                
+        def parse_host_port(url_str, default_host="127.0.0.1", default_port=80):
+            try:
+                parsed = urlparse(url_str)
+                netloc = parsed.netloc
+                if "@" in netloc:
+                    netloc = netloc.split("@")[1]
+                if ":" in netloc:
+                    host, port_str = netloc.split(":")
+                    return host, int(port_str)
+                else:
+                    return netloc or default_host, default_port
+            except Exception:
+                return default_host, default_port
+
+        # Database TCP Check
+        db_host, db_port = parse_host_port(db_url, "127.0.0.1", 5432)
+        if check_port(db_host, db_port):
+            status_dict["database"] = {"status": "healthy", "label": "Database (SQL)", "details": "Cổng TCP Mở"}
+        else:
+            status_dict["database"] = {"status": "unhealthy", "label": "Database (SQL)", "details": "Ngoại tuyến"}
+            
+        # Redis TCP Check
+        redis_host, redis_port = parse_host_port(redis_url, "127.0.0.1", 6379)
+        if check_port(redis_host, redis_port):
+            status_dict["redis"] = {"status": "healthy", "label": "Redis Cache", "details": "Cổng TCP Mở"}
+        else:
+            status_dict["redis"] = {"status": "unhealthy", "label": "Redis Cache", "details": "Ngoại tuyến"}
+
+        # Qdrant TCP Check
+        qdrant_host, qdrant_port = parse_host_port(qdrant_url, "127.0.0.1", 6333)
+        if check_port(qdrant_host, qdrant_port):
+            status_dict["qdrant"] = {"status": "healthy", "label": "Qdrant DB", "details": "Cổng TCP Mở"}
+        else:
+            status_dict["qdrant"] = {"status": "unhealthy", "label": "Qdrant DB", "details": "Ngoại tuyến"}
+
+        # Celery Check
+        status_dict["celery"] = {"status": "unhealthy", "label": "Celery Worker", "details": "Ngoại tuyến (Backend Down)"}
+        
+        # Ollama Check
+        ollama_host, ollama_port = parse_host_port(ollama_url, "127.0.0.1", 11434)
+        if check_port(ollama_host, ollama_port):
+            status_dict["ollama"] = {"status": "healthy", "label": "Ollama LLM", "details": "Cổng TCP Mở"}
+        else:
+            status_dict["ollama"] = {"status": "unhealthy", "label": "Ollama LLM", "details": "Ngoại tuyến"}
+
+    return status_dict
+
 
 st.set_page_config(page_title="Legal RAG & Agentic", page_icon="⚖️", layout="centered")
 st.title("Legal RAG & Agentic Workflow")
@@ -23,6 +177,31 @@ if "session_id" not in st.session_state:
 
 # Sidebar settings & history
 st.sidebar.title("⚙️ Cấu hình & Lịch sử")
+
+# Service Health Monitor
+with st.sidebar.expander("📊 Trạng thái Hệ thống", expanded=True):
+    health_data = check_services_health(BACKEND_URL)
+    for service_key, info in health_data.items():
+        status = info["status"]
+        label = info["label"]
+        details = info["details"]
+        
+        if status == "healthy":
+            icon = "🟢"
+        elif status == "no_workers":
+            icon = "🟡"
+        elif status == "not_configured":
+            icon = "⚪"
+        else:
+            icon = "🔴"
+            
+        st.markdown(f"{icon} **{label}**: {details}")
+        
+    if st.button("🔄 Làm mới trạng thái", key="refresh_health"):
+        st.cache_data.clear()
+        st.rerun()
+st.sidebar.markdown("---")
+
 
 # User ID input — each name is its own isolated session. Empty by default
 # so no two users accidentally share a sentinel id. Only adopt the widget
