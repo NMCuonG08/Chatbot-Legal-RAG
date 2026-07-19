@@ -12,24 +12,7 @@ from retry_utils import with_retry
 
 logger = logging.getLogger(__name__)
 
-def log_to_langfuse(name, model, messages, output, prompt_tokens=None, completion_tokens=None):
-    try:
-        from agent import _langfuse_handler
-        if _langfuse_handler and _langfuse_handler.langfuse:
-            lf = _langfuse_handler.langfuse
-            lf.generation(
-                name=name,
-                model=model,
-                input=messages,
-                output=output,
-                usage={
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens
-                } if prompt_tokens or completion_tokens else None
-            )
-            lf.flush()
-    except Exception as e:
-        logger.warning(f"Failed to log direct call to Langfuse: {e}")
+from langsmith import traceable
 
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", default=None)
@@ -139,6 +122,7 @@ class GroqProvider(LLMProvider):
     def is_available(self) -> bool:
         return client is not None
 
+    @traceable(run_type="llm")
     def chat(self, messages, temperature=0.7, max_tokens=2048, raw=False):
         if not self.is_available():
             logger.warning("GROQ_API_KEY not set, cannot use Groq provider")
@@ -147,11 +131,6 @@ class GroqProvider(LLMProvider):
             response = _groq_chat_create(self.model, messages, temperature, max_tokens)
             usage = getattr(response, "usage", None)
             output = response.choices[0].message
-            
-            # Log direct generation to Langfuse
-            pt = getattr(usage, "prompt_tokens", None) if usage else None
-            ct = getattr(usage, "completion_tokens", None) if usage else None
-            log_to_langfuse(f"chat-{self.name}", self.model, messages, output.content, pt, ct)
             
             if raw:
                 record_usage(self.name, self.model, usage)
@@ -176,6 +155,7 @@ class OllamaProvider(LLMProvider):
         self.api_key = api_key
         self.timeout = timeout
 
+    @traceable(run_type="llm")
     def chat(self, messages, temperature=0.7, max_tokens=2048, raw=False):
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -208,12 +188,6 @@ class OllamaProvider(LLMProvider):
             content = result["choices"][0]["message"]["content"]
             logger.info(f"Ollama chat complete output: {content[:100]}")
             
-            # Log direct generation to Langfuse
-            usage = result.get("usage")
-            pt = usage.get("prompt_tokens") if usage else None
-            ct = usage.get("completion_tokens") if usage else None
-            log_to_langfuse(f"chat-{self.name}", self.model, messages, content, pt, ct)
-            
             record_usage(self.name, self.model, result.get("usage"))
             if raw:
                 from types import SimpleNamespace
@@ -236,7 +210,7 @@ def build_groq_provider(model: str | None = None) -> GroqProvider:
 
 
 def build_ollama_provider(model: str | None = None) -> OllamaProvider:
-    base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+    base = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com")
     # Cloud Ollama (e.g. http://ollama.com) requires https. An http URL triggers
     # a 301 redirect that `requests` follows by converting POST->GET, which then
     # 405s on /v1/chat/completions. Upgrade non-localhost http to https; keep
@@ -517,6 +491,7 @@ def _record_route(route: str) -> None:
         _route_stats[route] += 1
 
 
+@traceable(name="detect_route", run_type="chain")
 def detect_route(history, message):
     """
     Detect the appropriate tool/route for handling the user's query.

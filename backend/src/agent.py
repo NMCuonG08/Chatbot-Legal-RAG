@@ -42,46 +42,6 @@ from agent_tool_wrappers import all_tools  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-# Configure Langfuse Callback Handler if configured in environment
-langfuse_public_key = os.environ.get("LANGFUSE_PUBLIC_KEY")
-langfuse_secret_key = os.environ.get("LANGFUSE_SECRET_KEY")
-langfuse_base_url = os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com")
-
-_langfuse_handler = None
-
-if langfuse_public_key and langfuse_secret_key:
-    try:
-        from llama_index.core import Settings
-        from llama_index.core.callbacks import CallbackManager
-        from llama_index.callbacks.langfuse import langfuse_callback_handler
-        
-        handler = langfuse_callback_handler(
-            public_key=langfuse_public_key,
-            secret_key=langfuse_secret_key,
-            host=langfuse_base_url
-        )
-        
-        # Add to LlamaIndex Settings callback manager
-        if not hasattr(Settings, "callback_manager") or not Settings.callback_manager:
-            Settings.callback_manager = CallbackManager([handler])
-        else:
-            Settings.callback_manager.add_handler(handler)
-            
-        _langfuse_handler = handler
-        logger.info("✅ Langfuse Callback Handler successfully integrated with LlamaIndex Settings")
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to initialize Langfuse callback: {e}")
-
-def flush_langfuse():
-    global _langfuse_handler
-    if _langfuse_handler:
-        try:
-            _langfuse_handler.flush()
-            logger.info("⚡ Flushed Langfuse traces successfully")
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to flush Langfuse: {e}")
-
-
 # Initialize the LLM LAZILY based on environment variables. Building at import
 # time required env vars / network at import, which broke test collection and
 # any importer that does not need the agent. We now build on first use via
@@ -203,7 +163,7 @@ def _build_llm():
 
     # 2. Build Ollama
     from llama_index.llms.ollama import Ollama
-    ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+    ollama_url = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com")
     ollama_key = os.environ.get("OLLAMA_API_KEY")
     ollama_model = os.environ.get("OLLAMA_LLM_MODEL", "glm-5.2:cloud")
     headers = {"Authorization": f"Bearer {ollama_key}"} if ollama_key else None
@@ -911,7 +871,6 @@ def ai_agent_handle(
         agent_user_id.reset(user_token)
         agent_run_id.reset(rid_token)
         agent_thread_id.reset(tid_token)
-        flush_langfuse()
 
 
 def get_agent_tools_summary() -> Dict:

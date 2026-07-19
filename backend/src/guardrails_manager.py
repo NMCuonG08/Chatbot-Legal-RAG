@@ -106,7 +106,7 @@ class LegalGuardrailsManager:
                 
                 # Configure specific provider details
                 if llm_provider == "ollama":
-                    ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+                    ollama_url = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com")
                     api_key = os.environ.get("OLLAMA_API_KEY")
                     if api_key:
                         logger.info("[GUARDRAILS] Ollama API key detected. Routing Ollama Cloud through OpenAI engine compatibility layer.")

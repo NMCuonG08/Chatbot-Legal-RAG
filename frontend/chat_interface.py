@@ -7,7 +7,7 @@ from urllib.parse import urlparse
 import requests
 import streamlit as st
 
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8002")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8002")
 
 @st.cache_data(ttl=5)
 def check_services_health(backend_url):
@@ -30,7 +30,7 @@ def check_services_health(backend_url):
             
     backend_up = False
     try:
-        resp = requests.get(f"{backend_url}/health/detailed", timeout=4.0)
+        resp = requests.get(f"{backend_url}/health/detailed", timeout=15.0)
         if resp.status_code == 200:
             backend_up = True
             data = resp.json()
@@ -93,8 +93,8 @@ def check_services_health(backend_url):
     if not backend_up:
         db_url = "postgresql://postgres:cuong1182004@127.0.0.1:5432/legal_chatbot"
         redis_url = "redis://127.0.0.1:6379/0"
-        qdrant_url = "http://localhost:6333"
-        ollama_url = "http://localhost:11434"
+        qdrant_url = "http://127.0.0.1:6333"
+        ollama_url = "https://ollama.com"
         
         env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "backend", ".env")
         if os.path.exists(env_path):
@@ -172,8 +172,9 @@ st.caption("MVP chat UI with async task polling")
 # accidentally collapse into the same session and leak facts (e.g. names)
 # to each other. The backend rejects an empty id, forcing the user to pick
 # a unique name before chatting.
-if "session_id" not in st.session_state:
-    st.session_state.session_id = ""
+if "session_id" not in st.session_state or not st.session_state.session_id:
+    import uuid
+    st.session_state.session_id = f"chat-{uuid.uuid4().hex[:6].upper()}"
 
 # Sidebar settings & history
 st.sidebar.title("⚙️ Cấu hình & Lịch sử")
@@ -203,37 +204,96 @@ with st.sidebar.expander("📊 Trạng thái Hệ thống", expanded=True):
 st.sidebar.markdown("---")
 
 
-# User ID input — each name is its own isolated session. Empty by default
-# so no two users accidentally share a sentinel id. Only adopt the widget
-# value when non-empty, so clearing the field mid-task does NOT reset
-# session_id to "" and break the in-flight task poll (which still runs
-# against the prior valid id).
-_input_id = st.sidebar.text_input(
-    "Tên người dùng / Session ID",
-    value=st.session_state.session_id,
-    placeholder="Nhập tên riêng (vd: snake) để bắt đầu",
-    help="Mỗi tên là một phiên riêng. Đừng dùng chung tên nếu không muốn lộ thông tin.",
-)
-if _input_id.strip():
-    st.session_state.session_id = _input_id.strip()
+# 1. New Chat & Delete All buttons side-by-side
+col_new, col_clear = st.sidebar.columns([0.55, 0.45])
+with col_new:
+    if st.button("➕ Hội thoại mới", use_container_width=True):
+        import uuid
+        st.session_state.session_id = f"chat-{uuid.uuid4().hex[:6].upper()}"
+        st.rerun()
+with col_clear:
+    if st.button("🗑️ Xóa tất cả", use_container_width=True, help="Xóa sạch toàn bộ lịch sử các phiên"):
+        try:
+            resp = requests.delete(f"{BACKEND_URL}/history", timeout=10)
+            if resp.status_code == 200:
+                st.sidebar.success("Đã xóa tất cả phiên!")
+                import uuid
+                st.session_state.session_id = f"chat-{uuid.uuid4().hex[:6].upper()}"
+                st.rerun()
+            else:
+                st.sidebar.error("Không thể xóa.")
+        except Exception as e:
+            st.sidebar.error(f"Lỗi: {e}")
 
-# Clear History button
-if st.sidebar.button("🗑️ Xóa lịch sử cuộc trò chuyện"):
-    try:
-        resp = requests.delete(f"{BACKEND_URL}/history/{st.session_state.session_id}", timeout=10)
-        if resp.status_code == 200:
-            st.sidebar.success("Đã xóa sạch lịch sử trò chuyện!")
-            st.rerun()
-        else:
-            st.sidebar.error("Không thể xóa lịch sử.")
-    except Exception as e:
-        st.sidebar.error(f"Lỗi: {e}")
+# 2. Fetch list of sessions from backend
+sessions_list = []
+try:
+    sess_resp = requests.get(f"{BACKEND_URL}/sessions", timeout=3)
+    if sess_resp.status_code == 200:
+        sessions_list = sess_resp.json().get("sessions", [])
+except Exception:
+    pass
 
-# Fetch and show history in sidebar
+# 3. Render Session List
+if sessions_list:
+    st.sidebar.subheader("💬 Cuộc trò chuyện gần đây")
+    for s in sessions_list:
+        sess_id = s.get("session_id")
+        title = s.get("title", f"Hội thoại {sess_id[:6]}")
+        
+        # Determine button label and visual indicator
+        is_active = (sess_id == st.session_state.session_id)
+        btn_label = f"📍 {title}" if is_active else f"📄 {title}"
+        
+        # Render session selection button and delete button side-by-side
+        col_sess, col_del = st.sidebar.columns([0.8, 0.2])
+        with col_sess:
+            if st.button(btn_label, key=f"sess_{sess_id}", use_container_width=True):
+                st.session_state.session_id = sess_id
+                st.rerun()
+        with col_del:
+            if st.button("🗑️", key=f"del_{sess_id}", use_container_width=True, help="Xóa phiên này"):
+                try:
+                    resp = requests.delete(f"{BACKEND_URL}/history/{sess_id}", timeout=5)
+                    if resp.status_code == 200:
+                        if sess_id == st.session_state.session_id:
+                            import uuid
+                            st.session_state.session_id = f"chat-{uuid.uuid4().hex[:6].upper()}"
+                        st.rerun()
+                except Exception:
+                    pass
+
+# 4. Advanced controls inside expander
+st.sidebar.markdown("---")
+with st.sidebar.expander("⚙️ Quản lý Session ID (Nâng cao)", expanded=False):
+    st.caption(f"ID hiện tại: `{st.session_state.session_id}`")
+    new_custom_id = st.text_input(
+        "Nhập ID tùy chỉnh:",
+        value=st.session_state.session_id,
+        key="custom_session_id_input"
+    )
+    if new_custom_id.strip() and new_custom_id.strip() != st.session_state.session_id:
+        st.session_state.session_id = new_custom_id.strip()
+        st.rerun()
+        
+    if st.button("🗑️ Xóa lịch sử cuộc này", use_container_width=True):
+        try:
+            resp = requests.delete(f"{BACKEND_URL}/history/{st.session_state.session_id}", timeout=10)
+            if resp.status_code == 200:
+                st.success("Đã xóa sạch lịch sử cuộc trò chuyện!")
+                import uuid
+                st.session_state.session_id = f"chat-{uuid.uuid4().hex[:6].upper()}"
+                st.rerun()
+            else:
+                st.error("Không thể xóa lịch sử.")
+        except Exception as e:
+            st.error(f"Lỗi: {e}")
+
+# 5. Fetch and show history of the active session in sidebar
 st.sidebar.markdown("---")
 st.sidebar.subheader("📜 Nhật ký hội thoại")
 if not st.session_state.session_id:
-    st.sidebar.caption("Nhập tên ở trên để xem lịch sử.")
+    st.sidebar.caption("Chưa chọn cuộc hội thoại nào.")
 else:
     try:
         hist_resp = requests.get(f"{BACKEND_URL}/history/{st.session_state.session_id}", timeout=5)
@@ -242,22 +302,58 @@ else:
             if not history_data:
                 st.sidebar.caption("Chưa có cuộc trò chuyện nào.")
             else:
-                # We display messages in a readable way, latest first
-                for idx, msg in enumerate(history_data[:15]):  # limit to last 15 messages
-                    role = "👤 Bạn" if msg.get("is_request") else "⚖️ Trợ lý"
-                    text = msg.get("message", "")
-                    created_at = msg.get("created_at", "")
-                    # Format time representation
-                    time_str = ""
-                    if created_at and "T" in created_at:
-                        time_str = created_at.split("T")[1][:5]
-                    elif created_at and " " in created_at:
-                        time_str = created_at.split(" ")[1][:5]
-                    st.sidebar.markdown(f"**{role}** {f'({time_str})' if time_str else ''}: {text[:150]}...")
+                # Group messages into turns (Q&A pairs)
+                turns = []
+                current_turn = {}
+                for msg in reversed(history_data):
+                    if msg.get("is_request"):
+                        if current_turn:
+                            turns.append(current_turn)
+                        current_turn = {"question": msg}
+                    else:
+                        if current_turn:
+                            current_turn["answer"] = msg
+                            turns.append(current_turn)
+                            current_turn = {}
+                        else:
+                            turns.append({"answer": msg})
+                if current_turn:
+                    turns.append(current_turn)
+                turns.reverse()
+
+                for idx, turn in enumerate(turns[:15]):  # limit to last 15 turns
+                    q_msg = turn.get("question")
+                    a_msg = turn.get("answer")
+                    
+                    q_text = q_msg.get("message", "") if q_msg else ""
+                    a_text = a_msg.get("message", "") if a_msg else ""
+                    
+                    q_id = q_msg.get("id") if q_msg else None
+                    a_id = a_msg.get("id") if a_msg else None
+                    
+                    col_txt, col_del = st.sidebar.columns([0.82, 0.18])
+                    with col_txt:
+                        if q_text:
+                            st.markdown(f"**👤 Bạn**: {q_text[:70]}...")
+                        if a_text:
+                            st.markdown(f"**⚖️ Trợ lý**: {a_text[:70]}...")
+                    with col_del:
+                        btn_key = f"del_turn_{q_id or 'none'}_{a_id or 'none'}_{idx}"
+                        if st.button("🗑️", key=btn_key, help="Xóa lượt hội thoại này"):
+                            try:
+                                if q_id:
+                                    requests.delete(f"{BACKEND_URL}/history/message/{q_id}", timeout=5)
+                                if a_id:
+                                    requests.delete(f"{BACKEND_URL}/history/message/{a_id}", timeout=5)
+                                st.rerun()
+                            except Exception:
+                                pass
+                    st.sidebar.markdown("---")
         else:
-            st.sidebar.caption("Không thể tải lịch sử.")
-    except Exception as e:
-        st.sidebar.caption(f"Không thể kết nối đến Backend: {e}")
+            st.sidebar.caption("Không thể tải lịch sử cuộc hội thoại.")
+    except Exception:
+        st.sidebar.caption("⏳ Máy chủ Backend đang khởi động hoặc ngoại tuyến. Vui lòng bấm 'Làm mới trạng thái' hoặc chờ ít giây...")
+
 
 def format_event(evt):
     node = evt.get("node", "?")

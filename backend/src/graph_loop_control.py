@@ -26,8 +26,10 @@ def _invoke_with_deadline(graph, state, config, timeout_s: float):
     ``GraphRunTimeout`` so the caller unblocks and degrades gracefully.
     ``shutdown(wait=False, cancel_futures=True)`` avoids joining the hung thread.
     """
+    import contextvars
+    ctx = contextvars.copy_context()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    fut = executor.submit(graph.invoke, state, config)
+    fut = executor.submit(ctx.run, graph.invoke, state, config)
     try:
         return fut.result(timeout=timeout_s)
     except concurrent.futures.TimeoutError as exc:

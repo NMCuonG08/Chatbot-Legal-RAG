@@ -15,6 +15,8 @@ from __future__ import annotations
 import logging
 from typing import Callable, Dict, List, Optional
 
+from langsmith import traceable
+
 from brain import build_judge_fn
 from config import JUDGE_MODEL, JUDGE_PROVIDER, JUDGE_TEMPERATURE, VERIFY_ANSWER_THRESHOLD, VERIFY_PARTIAL_THRESHOLD
 from evaluation.metrics_generation import evaluate_faithfulness
@@ -25,6 +27,7 @@ logger = logging.getLogger(__name__)
 _MIN_ANSWER_LEN = 15
 
 
+@traceable(name="judge_answer", run_type="chain")
 def judge_answer(question: str, answer: str, sources: List[Dict],
                  judge_fn: Optional[Callable] = None) -> Dict:
     """Score an answer against its retrieval sources.

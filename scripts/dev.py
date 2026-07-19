@@ -10,6 +10,20 @@ import urllib.error
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(REPO_ROOT)
 
+def load_env_file():
+    env_path = os.path.join(REPO_ROOT, "backend", ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip().strip('"').strip("'")
+                    os.environ[key] = val
+
+load_env_file()
+
 # Locate and configure virtualenv
 venv_dir = os.path.join(REPO_ROOT, ".venv")
 scripts_dir = ""
@@ -64,8 +78,42 @@ def wait_http(url, name, timeout=30):
         time.sleep(1)
     print(f"[ERROR] {name} not responding at {url}", file=sys.stderr)
     sys.exit(1)
+def kill_process_on_port(port):
+    """Find and kill process listening on a given port (Windows and Unix/macOS compatible)."""
+    import os
+    try:
+        if os.name == 'nt':
+            # Windows: use netstat and taskkill
+            cmd = 'netstat -ano'
+            output = subprocess.check_output(cmd, shell=True).decode()
+            pids = set()
+            for line in output.strip().split('\n'):
+                if 'LISTENING' in line and f':{port}' in line:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        pids.add(parts[-1])
+            for pid in pids:
+                print(f"Port {port} is occupied by PID {pid}. Terminating process...")
+                subprocess.run(f'taskkill /F /PID {pid}', shell=True, capture_output=True)
+        else:
+            # Unix/macOS: use lsof and kill
+            cmd = f'lsof -t -i:{port}'
+            try:
+                output = subprocess.check_output(cmd, shell=True).decode().strip()
+                if output:
+                    for pid in output.split('\n'):
+                        print(f"Port {port} is occupied by PID {pid}. Terminating process...")
+                        subprocess.run(f'kill -9 {pid}', shell=True, capture_output=True)
+            except subprocess.CalledProcessError:
+                pass
+    except Exception:
+        pass
 
 def handle_app():
+    # Clean up any processes occupying our app ports to avoid bind errors
+    kill_process_on_port(8002)
+    kill_process_on_port(8501)
+    
     print("Launching Celery worker, FastAPI, Streamlit (Ctrl-C stops all)...")
     
     celery_cmd = [get_bin("celery"), "-A", "tasks.celery_app", "worker", "--loglevel=info", "-P", "solo"]
@@ -326,7 +374,7 @@ def main():
         print("[1/4] Boot infra...")
         run_cmd(["docker", "compose", "up", "-d", "redis", "mariadb", "qdrant", "prometheus", "grafana"])
         print("[2/4] Wait Qdrant...")
-        wait_http("http://localhost:6333/healthz", "Qdrant")
+        wait_http("http://127.0.0.1:6333/healthz", "Qdrant")
         print("[3/4] Seed legal data into Qdrant...")
         run_cmd(["python", "import_data.py"], cwd=os.path.join("backend", "src"))
         print("[4/4] Launch app (Ctrl-C stops all)...")

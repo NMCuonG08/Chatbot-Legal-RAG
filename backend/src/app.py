@@ -79,23 +79,88 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    import time
+    logger.info("🚀 Starting sequential backend dependency checks...")
+
+    # 1. Check SQL DB
+    try:
+        from database import engine
+        # Test connection
+        conn = engine.connect()
+        conn.close()
+        logger.info("🟢 Database (SQL) connection verified.")
+    except Exception as e:
+        logger.critical(f"🔴 Database (SQL) check failed: {e}")
+        raise RuntimeError(f"Database check failed: {e}")
+
+    # 2. Check Redis
+    try:
+        import redis
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+        r = redis.from_url(redis_url)
+        r.ping()
+        logger.info("🟢 Redis Cache connection verified.")
+    except Exception as e:
+        logger.critical(f"🔴 Redis Cache check failed: {e}")
+        raise RuntimeError(f"Redis check failed: {e}")
+
+    # 3. Check Qdrant
+    try:
+        from vectorize import get_client
+        # This will auto-retry via our wrapper if needed
+        get_client().get_collections()
+        logger.info("🟢 Qdrant DB connection verified.")
+    except Exception as e:
+        logger.critical(f"🔴 Qdrant DB check failed: {e}")
+        raise RuntimeError(f"Qdrant check failed: {e}")
+
+    # 4. Check Celery Worker (with retries up to 15 seconds to give dev.py time to spin it up)
+    try:
+        from tasks import celery_app
+        worker_ready = False
+        logger.info("⏳ Waiting for Celery worker to become ready...")
+        for attempt in range(15):
+            try:
+                inspect = celery_app.control.inspect()
+                ping_res = inspect.ping() if inspect else None
+                if ping_res:
+                    logger.info(f"🟢 Celery Worker(s) found active: {list(ping_res.keys())}")
+                    worker_ready = True
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+
+        if not worker_ready:
+            logger.critical("🔴 Celery Worker check failed: No active workers found.")
+            raise RuntimeError("Celery Worker check failed: No active workers found.")
+    except Exception as e:
+        logger.critical(f"🔴 Celery Worker check failed: {e}")
+        raise RuntimeError(f"Celery Worker check failed: {e}")
+
+    # 5. Run DB Schema Migration
+    logger.info("⚙️ Ensuring Database Schema...")
     ensure_database_schema()
-    # Phase 2 — seed default admin from env (best-effort, idempotent).
+
+    # 6. Seed Admin
     try:
         seed_admin()
     except Exception as e:
         logger.warning(f"Seed admin failed (non-fatal): {e}")
+
+    # 7. Init Semantic Cache
+    logger.info("⚙️ Initializing Semantic Cache...")
     init_semantic_cache()
-    # One-time deploy migration: wipe legacy unscoped cache points so the new
-    # per-user scope filter starts from a clean slate. No-op unless
-    # SEMANTIC_CACHE_WIPE_LEGACY=1 is set in the environment.
+
+    # 8. Wipe legacy cache if requested
     try:
         wiped = maybe_wipe_legacy_cache()
         if wiped:
             logger.info(f"Legacy cache wipe deleted {wiped} points.")
     except Exception as e:
         logger.warning(f"Legacy cache wipe failed (non-fatal): {e}")
+
+    # 9. Create Qdrant Collections
     try:
         from vectorize import create_collection, list_collections
         existing = [c["name"] for c in list_collections()]
@@ -104,11 +169,23 @@ async def lifespan(app: FastAPI):
             logger.info("Created Qdrant collection 'user_episodes' for Episodic Memory.")
     except Exception as e:
         logger.warning(f"Could not initialize user_episodes collection on startup: {e}")
-    # Phase 4 — RLHF good-answers collection (best-effort, non-blocking).
+
+    # 10. Init RLHF collection
     try:
         init_rlhf_collection()
     except Exception as e:
         logger.warning(f"Could not initialize rlhf_good_answers collection on startup: {e}")
+
+    # 11. Pre-load local SentenceTransformer model
+    try:
+        from custom_embedding import get_embedding_service
+        logger.info("[FASTAPI] Pre-loading local SentenceTransformer model on startup...")
+        get_embedding_service()._get_sentence_transformer()
+        logger.info("[FASTAPI] ✅ Local SentenceTransformer model pre-loaded successfully.")
+    except Exception as e:
+        logger.warning(f"[FASTAPI] Could not pre-load SentenceTransformer model: {e}")
+
+    logger.info("✅ All sequential startup backend dependency checks completed successfully. Launching FastAPI backend...")
     yield
     # Shutdown: no explicit cleanup needed currently.
 
@@ -220,7 +297,7 @@ async def health():
 
 
 @app.get("/health/detailed")
-async def health_detailed():
+def health_detailed():
     # 1. Database check
     db_status = "healthy"
     db_error = None
@@ -281,7 +358,7 @@ async def health_detailed():
     use_ollama = os.getenv("USE_OLLAMA_AS_MAIN", "false").lower() == "true"
     if llm_provider == "ollama" or use_ollama:
         ollama_configured = True
-        ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        ollama_url = os.getenv("OLLAMA_BASE_URL", "https://ollama.com")
         try:
             import requests
             resp = requests.get(f"{ollama_url}/api/tags", timeout=2)
@@ -481,6 +558,12 @@ async def get_documents(limit: int = 100, offset: int = 0):
     }
 
 
+@app.get("/sessions")
+def get_sessions(limit: int = 100):
+    from models import list_unique_session_ids
+    return {"sessions": list_unique_session_ids(limit=limit)}
+
+
 @app.get("/history/{user_id}")
 async def get_user_history(
     user_id: str,
@@ -501,6 +584,32 @@ async def get_user_history(
         "limit": limit,
         "offset": offset,
     }
+
+
+@app.delete("/history")
+async def delete_all_history(principal: Optional[Principal] = Depends(get_current_user_optional)):
+    from models import delete_all_conversations
+    db_cleared = delete_all_conversations()
+    return {"status": "success", "message": "All conversations deleted", "db_cleared": db_cleared}
+
+
+@app.delete("/history/message/{message_id}")
+def delete_single_message(message_id: int):
+    from models import _new_db_session, ChatConversation
+    ensure_database_schema()
+    db = _new_db_session()
+    try:
+        db.execute(
+            delete(ChatConversation).where(ChatConversation.id == message_id)
+        )
+        db.commit()
+        return {"status": "success", "message": f"Message {message_id} deleted"}
+    except Exception as e:
+        logger.error(f"Error deleting message {message_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
 
 
 @app.delete("/history/{user_id}")

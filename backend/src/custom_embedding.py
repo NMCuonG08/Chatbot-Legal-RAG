@@ -65,24 +65,35 @@ class CustomEmbeddingService:
 
         return vector
 
+    def _get_sentence_transformer(self):
+        if not hasattr(self, "_st_model"):
+            try:
+                from sentence_transformers import SentenceTransformer
+                # Try to load local bge-m3 model first
+                local_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "embed_serving", "models", "bge-m3")
+                if not os.path.exists(local_path):
+                    local_path = "E:/MachineLearning/Legal/embed_serving/models/bge-m3"
+                
+                if os.path.exists(local_path):
+                    logger.info(f"💾 Loading local SentenceTransformer model from {local_path}...")
+                    self._st_model = SentenceTransformer(local_path)
+                else:
+                    logger.info("💾 Local model not found. Downloading BAAI/bge-m3 from HuggingFace...")
+                    self._st_model = SentenceTransformer("BAAI/bge-m3")
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize SentenceTransformer: {e}")
+                self._st_model = None
+        return getattr(self, "_st_model", None)
+
     def _local_embedding(self, text: str) -> List[float]:
-        """Generate a local embedding using Ollama first, falling back to bag-of-words if needed."""
-        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        """Generate a local embedding using SentenceTransformer (bge-m3), falling back to bag-of-words if needed."""
         try:
-            # Connect to http://localhost:11434/api/embeddings
-            url = f"{ollama_url.rstrip('/')}/api/embeddings"
-            payload = {
-                "model": "mxbai-embed-large:latest",
-                "prompt": text
-            }
-            # Short timeout to fail fast if Ollama is busy or offline
-            response = requests.post(url, json=payload, timeout=8)
-            if response.status_code == 200:
-                embedding = response.json().get("embedding", [])
-                if len(embedding) == LOCAL_EMBEDDING_DIMENSION:
-                    return embedding
+            model = self._get_sentence_transformer()
+            if model is not None:
+                vector = model.encode(text)
+                return list(map(float, vector))
         except Exception as e:
-            logger.warning(f"⚠️ Local Ollama embedding failed: {e}. Using deterministic word counter fallback.")
+            logger.warning(f"⚠️ Local SentenceTransformer embedding failed: {e}. Using deterministic word counter fallback.")
             
         return self._bag_of_words_embedding(text)
 
@@ -136,8 +147,8 @@ class CustomEmbeddingService:
         
         for idx in range(0, len(texts), sub_batch_size):
             sub_batch = texts[idx:idx + sub_batch_size]
-            max_retries = len(api_keys) * 3
-            base_delay = 5 # seconds
+            max_retries = 2  # Try once, retry once, then fail immediately and fall back to local offline BGE-M3
+            base_delay = 1 # seconds
             
             sub_embeddings = None
             for attempt in range(max_retries):
@@ -208,22 +219,15 @@ class CustomEmbeddingService:
         return all_embeddings
 
     def _local_batch_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate a batch of embeddings using local Ollama if available, fallback to sequential _local_embedding."""
-        ollama_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        """Generate a batch of embeddings using local SentenceTransformer (bge-m3), fallback to sequential _local_embedding."""
         try:
-            url = f"{ollama_url.rstrip('/')}/v1/embeddings"
-            payload = {
-                "model": "mxbai-embed-large:latest",
-                "input": texts
-            }
-            response = requests.post(url, json=payload, timeout=25)
-            if response.status_code == 200:
-                data = response.json().get("data", [])
-                embeddings = [item.get("embedding") for item in data]
-                if embeddings and all(len(emb) == LOCAL_EMBEDDING_DIMENSION for emb in embeddings):
-                    return embeddings
+            model = self._get_sentence_transformer()
+            if model is not None:
+                logger.info(f"💾 Generating {len(texts)} embeddings locally using SentenceTransformer (bge-m3)...")
+                embeddings = model.encode(texts)
+                return [list(map(float, emb)) for emb in embeddings]
         except Exception as e:
-            logger.warning(f"⚠️ Ollama batch embedding failed: {e}. Falling back to sequential embedding.")
+            logger.warning(f"⚠️ Local SentenceTransformer batch embedding failed: {e}. Falling back to sequential embedding.")
             
         return [self._local_embedding(item) for item in texts]
 

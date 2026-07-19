@@ -11,13 +11,17 @@ from copy import copy
 from pathlib import Path
 from typing import Dict, List, TypedDict
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
+
+from langsmith import traceable
+
 # Force sys.path to include the backend/src directory for Celery runtime worker threads
 src_path = str(Path(__file__).resolve().parent)
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
 from celery import shared_task
-from dotenv import load_dotenv
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -27,8 +31,6 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     RedisSaver = None  # type: ignore
     _REDIS_SAVER_AVAILABLE = False
-
-load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
 from agent import ai_agent_handle, clear_user_runtime_caches
 from verify_answer import judge_answer
@@ -307,6 +309,19 @@ celery_app = get_celery_app(__name__)
 celery_app.autodiscover_tasks()
 
 
+from celery.signals import worker_process_init
+
+@worker_process_init.connect
+def init_worker_process(**kwargs):
+    try:
+        from custom_embedding import get_embedding_service
+        logger.info("[CELERY] Pre-loading local SentenceTransformer model in worker process...")
+        get_embedding_service()._get_sentence_transformer()
+        logger.info("[CELERY] ✅ Local SentenceTransformer model pre-loaded successfully in worker process.")
+    except Exception as e:
+        logger.warning(f"[CELERY] Could not pre-load SentenceTransformer model in worker: {e}")
+
+
 def follow_up_question(history, question):
     """Handle follow-up questions by rephrasing with context"""
     user_intent = detect_user_intent(history, question)
@@ -314,6 +329,7 @@ def follow_up_question(history, question):
     return user_intent
 
 
+@traceable(name="retrieve_with_hybrid_search", run_type="retriever")
 def retrieve_with_hybrid_search(queries: List[str], top_k: int = 5) -> List[Dict]:
     """
     Enhanced retrieval using hybrid search (semantic + keyword)
@@ -1157,6 +1173,7 @@ def get_chat_graph():
     return _build_chat_graph()
 
 
+@traceable(name="run_chat_graph", run_type="chain")
 def run_chat_graph(history, question, user_id=None, conversation_id=None,
                    run_id=None, role=None, variant=None, shadow=False):
     """Invoke the chat graph.
@@ -1751,12 +1768,5 @@ def llm_handle_message(self, bot_id, user_id, question, role=None,
         result["route"] = graph_result["route"]
     elif blocked_response:
         result["route"] = "guardrails"
-
-    # Flush Langfuse traces to ensure they are sent before the task terminates
-    try:
-        from agent import flush_langfuse
-        flush_langfuse()
-    except Exception as e:
-        logger.warning(f"Failed to flush Langfuse at task exit: {e}")
 
     return result

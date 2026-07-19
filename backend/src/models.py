@@ -145,6 +145,46 @@ def list_user_conversations(user_id: str, limit: int = 100, offset: int = 0):
         db.close()
 
 
+def list_unique_session_ids(limit: int = 100) -> list[dict]:
+    ensure_database_schema()
+    db = _new_db_session()
+    try:
+        # Create a subquery to find the min(id) representing the first message of each user_id
+        subq = (
+            select(
+                ChatConversation.user_id,
+                func.min(ChatConversation.id).label("min_id")
+            )
+            .group_by(ChatConversation.user_id)
+            .subquery()
+        )
+        
+        # Select user_id and message of the first conversation turn, sorted by last active
+        query = (
+            select(
+                ChatConversation.user_id,
+                ChatConversation.message
+            )
+            .join(subq, ChatConversation.id == subq.c.min_id)
+            .order_by(ChatConversation.updated_at.desc())
+            .limit(limit)
+        )
+        
+        results = db.execute(query).all()
+        
+        sessions = []
+        for r_user_id, r_message in results:
+            if not r_user_id:
+                continue
+            title = r_message[:35] + "..." if r_message else f"Hội thoại {r_user_id[:8]}"
+            sessions.append({
+                "session_id": r_user_id,
+                "title": title
+            })
+        return sessions
+    finally:
+        db.close()
+
 def delete_user_conversations(user_id: str):
     """Delete all chat history for a specific user"""
     db = _new_db_session()
@@ -156,6 +196,21 @@ def delete_user_conversations(user_id: str):
         return True
     except Exception as e:
         logger.error(f"Error deleting user conversations: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
+def delete_all_conversations():
+    """Delete all chat conversations for all sessions"""
+    db = _new_db_session()
+    try:
+        db.execute(delete(ChatConversation))
+        db.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Error deleting all conversations: {e}")
         db.rollback()
         return False
     finally:

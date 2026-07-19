@@ -1,5 +1,7 @@
 import logging
+import re
 from typing import Dict, List
+from langsmith import traceable
 
 from brain import openai_chat_complete
 
@@ -23,12 +25,6 @@ def expand_legal_query(query: str) -> str:
         "giao kèo": ["hợp đồng", "giao kèo", "thỏa thuận"],
         "thỏa thuận": ["hợp đồng", "giao kèo", "thỏa thuận", "thoả thuận"],
         # Violation and penalty terms
-        "vi phạm": ["vi phạm", "phạm", "trái", "sai phạm", "không tuân thủ"],
-        "phạt": ["phạt", "xử phạt", "tiền phạt", "phạt tiền", "chế재"],
-        "phạt tiền": ["phạt tiền", "tiền phạt", "phạt", "xử phạt hành chính"],
-        # Inheritance terms
-        "thừa kế": ["thừa kế", "kế thừa", "gia tài", "di sản", "tài sản để lại"],
-        "kế thừa": ["thừa kế", "kế thừa", "gia tài", "di sản"],
         "di sản": ["di sản", "thừa kế", "tài sản để lại", "gia tài"],
         # Marriage and divorce terms
         "ly hôn": ["ly hôn", "li hôn", "chấm dứt hôn nhân", "giải chấm hôn nhân"],
@@ -88,6 +84,7 @@ def expand_legal_query(query: str) -> str:
     return " ".join(expanded_list)
 
 
+@traceable(name="rewrite_query_to_multi_queries", run_type="chain")
 def rewrite_query_to_multi_queries(
     original_query: str, num_queries: int = 3, use_expansion: bool = True
 ) -> List[str]:

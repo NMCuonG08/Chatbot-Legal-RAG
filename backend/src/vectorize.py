@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from qdrant_client import QdrantClient
@@ -23,10 +24,64 @@ logger = logging.getLogger(__name__)
 # Load env variables securely
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 
-client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60.0)
+def _should_reconnect_qdrant(e: Exception) -> bool:
+    err_str = str(e).lower()
+    return (
+        "10054" in err_str or
+        "connection reset" in err_str or
+        "forcibly closed" in err_str or
+        "remote host" in err_str or
+        "connecterror" in err_str or
+        "remoteprotocolerror" in err_str or
+        "pool" in err_str or
+        "timeout" in err_str or
+        "broken pipe" in err_str
+    )
+
+class QdrantClientWrapper:
+    """Proxy class that wraps QdrantClient and handles connection reset / 10054 drops automatically."""
+    def __init__(self):
+        self._local_client = None
+
+    def _get_underlying(self) -> QdrantClient:
+        if self._local_client is None:
+            self._local_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60.0)
+        return self._local_client
+
+    def _reconnect(self):
+        logger.info("🔄 QdrantClientWrapper: Re-establishing connection to Qdrant...")
+        try:
+            if self._local_client:
+                self._local_client.close()
+        except Exception:
+            pass
+        self._local_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=60.0)
+
+    def __getattr__(self, name):
+        underlying = self._get_underlying()
+        attr = getattr(underlying, name)
+        if callable(attr):
+            def wrapper(*args, **kwargs):
+                max_qdrant_attempts = 3
+                for attempt in range(max_qdrant_attempts):
+                    try:
+                        curr_underlying = self._get_underlying()
+                        curr_attr = getattr(curr_underlying, name)
+                        return curr_attr(*args, **kwargs)
+                    except Exception as e:
+                        if _should_reconnect_qdrant(e) and attempt < max_qdrant_attempts - 1:
+                            logger.warning(f"⚠️ Qdrant connection lost ({e}) during method '{name}'. Reconnecting and retrying (attempt {attempt + 1}/{max_qdrant_attempts})...")
+                            time.sleep(1)
+                            self._reconnect()
+                        else:
+                            raise e
+            return wrapper
+        return attr
+
+client = QdrantClientWrapper()
 
 
 def get_client():
