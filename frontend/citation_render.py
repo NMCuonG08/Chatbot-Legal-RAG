@@ -37,22 +37,22 @@ CITATION_CSS: str = """
 <style>
 /* Inline citation markers in the answer */
 .cite > a {
-  color: var(--primary-color, #2563eb);
+  color: var(--st-primary-color, #2563eb);
   text-decoration: none;
   font-weight: 700;
   font-size: 0.85em;
   vertical-align: super;
   padding: 1px 4px;
-  background-color: var(--secondary-background-color, #eff6ff);
-  border: 1px solid var(--secondary-background-color, #bfdbfe);
+  background-color: var(--st-secondary-background-color, #eff6ff);
+  border: 1px solid var(--st-secondary-background-color, #bfdbfe);
   border-radius: 4px;
   margin-left: 2px;
   transition: all 0.2s ease;
 }
 .cite > a:hover {
-  background-color: var(--primary-color, #2563eb);
-  color: var(--background-color, #ffffff) !important;
-  border-color: var(--primary-color, #2563eb);
+  background-color: var(--st-primary-color, #2563eb);
+  color: var(--st-background-color, #ffffff) !important;
+  border-color: var(--st-primary-color, #2563eb);
   text-decoration: none;
 }
 
@@ -60,36 +60,36 @@ CITATION_CSS: str = """
 .src-panel { font-size: 13px; line-height: 1.5; }
 .src-group { margin-bottom: 14px; }
 .src-group-h {
-  font-weight: 700; font-size: 13px; color: var(--text-color, #111);
-  border-bottom: 2px solid var(--secondary-background-color, #e5e7eb);
+  font-weight: 700; font-size: 13px; color: var(--st-text-color, #111);
+  border-bottom: 2px solid var(--st-secondary-background-color, #e5e7eb);
   padding-bottom: 4px; margin-bottom: 8px;
 }
 .src-group-h.web { border-bottom-color: #f59e0b; }
-.src-group-h.corpus { border-bottom-color: var(--primary-color, #2563eb); }
+.src-group-h.corpus { border-bottom-color: var(--st-primary-color, #2563eb); }
 .src-item {
-  border: 1px solid var(--secondary-background-color, #e5e7eb);
+  border: 1px solid var(--st-secondary-background-color, #e5e7eb);
   border-radius: 8px; padding: 8px 10px;
-  margin-bottom: 8px; background: var(--background-color, #fff);
+  margin-bottom: 8px; background: var(--st-background-color, #fff);
 }
 .src-item.web { border-left: 3px solid #f59e0b; }
-.src-item.corpus { border-left: 3px solid var(--primary-color, #2563eb); }
+.src-item.corpus { border-left: 3px solid var(--st-primary-color, #2563eb); }
 .src-n {
   display: inline-block; min-width: 22px; padding: 0 5px;
-  background: var(--primary-color, #2563eb); color: var(--background-color, #fff);
+  background: var(--st-primary-color, #2563eb); color: var(--st-background-color, #fff);
   border-radius: 5px; font-size: 11px; font-weight: 700; margin-right: 6px;
 }
 .src-item.web .src-n { background: #f59e0b; }
-.src-title { font-weight: 600; color: var(--text-color, #111); }
-.src-title a { color: var(--primary-color, #2563eb); text-decoration: none; }
+.src-title { font-weight: 600; color: var(--st-text-color, #111); }
+.src-title a { color: var(--st-primary-color, #2563eb); text-decoration: none; }
 .src-title a:hover { text-decoration: underline; }
 .src-origin { color: #6b7280; font-size: 11px; margin-top: 3px; }
 .src-snippet {
-  color: var(--text-color, #374151);
-  background: var(--secondary-background-color, #f6f8fa);
+  color: var(--st-text-color, #374151);
+  background: var(--st-secondary-background-color, #f6f8fa);
   border-radius: 6px; padding: 5px 7px; margin-top: 5px; font-size: 12px;
   max-height: 96px; overflow: auto; white-space: normal;
 }
-.src-link { display: block; margin-top: 5px; color: var(--primary-color, #2563eb);
+.src-link { display: block; margin-top: 5px; color: var(--st-primary-color, #2563eb);
   text-decoration: none; font-size: 11px; word-break: break-all; }
 .src-link:hover { text-decoration: underline; }
 .src-empty { color: #9ca3af; font-style: italic; font-size: 12px; }
@@ -131,7 +131,7 @@ CITATION_CSS: str = """
   width: 440px;
   max-width: 90vw;
   height: 100%;
-  background: var(--background-color, #ffffff);
+  background: var(--st-background-color, #ffffff);
   box-shadow: -10px 0 25px -5px rgba(0, 0, 0, 0.25);
   transition: right 0.25s cubic-bezier(0.4, 0, 0.2, 1);
   padding: 28px 24px;
@@ -139,8 +139,8 @@ CITATION_CSS: str = """
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  color: var(--text-color, #1e293b);
-  border-left: 1px solid var(--secondary-background-color, #e2e8f0);
+  color: var(--st-text-color, #1e293b);
+  border-left: 1px solid var(--st-secondary-background-color, #e2e8f0);
   font-family: var(--font, system-ui, -apple-system, sans-serif);
 }
 .drawer-overlay:target .drawer-content {
@@ -152,7 +152,7 @@ CITATION_CSS: str = """
   display: flex;
   align-items: center;
   justify-content: space-between;
-  border-bottom: 1px solid var(--secondary-background-color, #e2e8f0);
+  border-bottom: 1px solid var(--st-secondary-background-color, #e2e8f0);
   padding-bottom: 14px;
   margin-bottom: 18px;
 }
@@ -166,7 +166,7 @@ CITATION_CSS: str = """
 }
 .drawer-badge.corpus {
   background-color: rgba(37, 99, 235, 0.1);
-  color: var(--primary-color, #2563eb);
+  color: var(--st-primary-color, #2563eb);
 }
 .drawer-badge.web {
   background-color: rgba(245, 158, 11, 0.1);
@@ -182,14 +182,14 @@ CITATION_CSS: str = """
   transition: color 0.15s ease;
 }
 .drawer-close:hover {
-  color: var(--primary-color, #2563eb);
+  color: var(--st-primary-color, #2563eb);
 }
 
 /* Title & Origin */
 .drawer-title {
   font-size: 18px;
   font-weight: 700;
-  color: var(--text-color, #0f172a);
+  color: var(--st-text-color, #0f172a);
   margin-top: 0;
   margin-bottom: 8px;
   line-height: 1.35;
@@ -212,12 +212,12 @@ CITATION_CSS: str = """
 
 /* Content Snippet inside drawer */
 .drawer-snippet {
-  background-color: var(--secondary-background-color, #f8fafc);
-  border: 1px solid var(--secondary-background-color, #e2e8f0);
-  border-left: 4px solid var(--primary-color, #2563eb);
+  background-color: var(--st-secondary-background-color, #f8fafc);
+  border: 1px solid var(--st-secondary-background-color, #e2e8f0);
+  border-left: 4px solid var(--st-primary-color, #2563eb);
   border-radius: 8px;
   padding: 16px;
-  color: var(--text-color, #334155);
+  color: var(--st-text-color, #334155);
   font-size: 14px;
   line-height: 1.6;
   margin-bottom: 24px;
@@ -233,8 +233,8 @@ CITATION_CSS: str = """
   align-items: center;
   justify-content: center;
   padding: 10px 16px;
-  background-color: var(--primary-color, #2563eb);
-  color: var(--background-color, #ffffff) !important;
+  background-color: var(--st-primary-color, #2563eb);
+  color: var(--st-background-color, #ffffff) !important;
   font-weight: 600;
   font-size: 13px;
   text-decoration: none !important;
