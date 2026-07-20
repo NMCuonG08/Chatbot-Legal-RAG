@@ -416,17 +416,6 @@ def format_event(evt):
     return f"{emoji} **{node_name}**{details}"
 
 
-# Session state initialization
-if "last_result" not in st.session_state:
-    st.session_state.last_result = None
-if "current_session_id" not in st.session_state:
-    st.session_state.current_session_id = st.session_state.session_id
-
-# If user switched session in sidebar, clear the last result cache
-if st.session_state.session_id != st.session_state.current_session_id:
-    st.session_state.last_result = None
-    st.session_state.current_session_id = st.session_state.session_id
-
 # 1. Fetch history of the active session
 history_data = []
 if st.session_state.session_id:
@@ -440,16 +429,9 @@ if st.session_state.session_id:
 # Chronological order (oldest first)
 chrono_history = list(reversed(history_data))
 
-# If there is a last result in session state, filter out the last turn from history
-# to avoid rendering it twice.
-if st.session_state.last_result and chrono_history:
-    if (len(chrono_history) >= 2 and 
-        chrono_history[-1].get("message") == st.session_state.last_result["answer"] and
-        chrono_history[-2].get("message") == st.session_state.last_result["prompt"]):
-        chrono_history = chrono_history[:-2]
-
 # 2. Render Chronological History in main view
-for msg in chrono_history:
+total_msgs = len(chrono_history)
+for idx, msg in enumerate(chrono_history):
     if msg.get("is_request"):
         with st.chat_message("user"):
             st.markdown(msg.get("message", ""))
@@ -458,60 +440,51 @@ for msg in chrono_history:
             sources_val = msg.get("sources", []) or []
             full_html = render_answer_html(msg.get("message", ""), sources_val) + render_sources_drawers_html(sources_val)
             st.markdown(full_html, unsafe_allow_html=True)
-
-# 3. Render the Last Result (if present) with Drawer and Feedback
-if st.session_state.last_result:
-    last = st.session_state.last_result
-    with st.chat_message("user"):
-        st.markdown(last["prompt"])
-    with st.chat_message("assistant"):
-        full_html = render_answer_html(last["answer"], last["sources"]) + render_sources_drawers_html(last["sources"])
-        st.markdown(full_html, unsafe_allow_html=True)
-        
-        # Feedback buttons
-        fb_col1, fb_col2, _ = st.columns([1, 1, 8])
-        task_id = last["task_id"]
-        sources = last["sources"]
-        prompt_val = last["prompt"]
-        answer_val = last["answer"]
-        with fb_col1:
-            if st.button("👍", key=f"fb_good_{task_id}", help="Câu trả lời này tốt"):
-                try:
-                    requests.post(
-                        f"{BACKEND_URL}/feedback",
-                        json={
-                            "user_id": st.session_state.session_id,
-                            "conversation_id": task_id,
-                            "message_id": task_id,
-                            "rating": "good",
-                            "question": prompt_val,
-                            "response": answer_val,
-                            "sources": sources,
-                        },
-                        timeout=10,
-                    )
-                    st.toast("Cảm ơn bạn đã đánh giá! 👍")
-                except requests.RequestException as fb_exc:
-                    st.toast(f"Lỗi gửi đánh giá: {fb_exc}")
-        with fb_col2:
-            if st.button("👎", key=f"fb_bad_{task_id}", help="Câu trả lời này chưa tốt"):
-                try:
-                    requests.post(
-                        f"{BACKEND_URL}/feedback",
-                        json={
-                            "user_id": st.session_state.session_id,
-                            "conversation_id": task_id,
-                            "message_id": task_id,
-                            "rating": "bad",
-                            "question": prompt_val,
-                            "response": answer_val,
-                            "sources": sources,
-                        },
-                        timeout=10,
-                    )
-                    st.toast("Cảm ơn phản hồi — chúng tôi sẽ cải thiện. 👎")
-                except requests.RequestException as fb_exc:
-                    st.toast(f"Lỗi gửi đánh giá: {fb_exc}")
+            
+            # Show feedback buttons ONLY on the very last assistant message of the thread
+            if idx == total_msgs - 1:
+                fb_col1, fb_col2, _ = st.columns([1, 1, 8])
+                task_id = msg.get("conversation_id") or msg.get("id")
+                prompt_val = chrono_history[idx-1].get("message", "") if idx > 0 else ""
+                answer_val = msg.get("message", "")
+                with fb_col1:
+                    if st.button("👍", key=f"fb_good_{task_id}", help="Câu trả lời này tốt"):
+                        try:
+                            requests.post(
+                                f"{BACKEND_URL}/feedback",
+                                json={
+                                    "user_id": st.session_state.session_id,
+                                    "conversation_id": str(task_id),
+                                    "message_id": str(task_id),
+                                    "rating": "good",
+                                    "question": prompt_val,
+                                    "response": answer_val,
+                                    "sources": sources_val,
+                                },
+                                timeout=10,
+                            )
+                            st.toast("Cảm ơn bạn đã đánh giá! 👍")
+                        except requests.RequestException as fb_exc:
+                            st.toast(f"Lỗi gửi đánh giá: {fb_exc}")
+                with fb_col2:
+                    if st.button("👎", key=f"fb_bad_{task_id}", help="Câu trả lời này chưa tốt"):
+                        try:
+                            requests.post(
+                                f"{BACKEND_URL}/feedback",
+                                json={
+                                    "user_id": st.session_state.session_id,
+                                    "conversation_id": str(task_id),
+                                    "message_id": str(task_id),
+                                    "rating": "bad",
+                                    "question": prompt_val,
+                                    "response": answer_val,
+                                    "sources": sources_val,
+                                },
+                                timeout=10,
+                            )
+                            st.toast("Cảm ơn phản hồi — chúng tôi sẽ cải thiện. 👎")
+                        except requests.RequestException as fb_exc:
+                            st.toast(f"Lỗi gửi đánh giá: {fb_exc}")
 
 # 4. Chat Input for new questions
 prompt = st.chat_input("Nhập câu hỏi pháp lý của bạn tại đây...")
@@ -538,13 +511,7 @@ if prompt:
             blocked_msg = payload.get("response") or "Yêu cầu bị chặn bởi bộ bảo vệ."
             with st.chat_message("assistant"):
                 st.markdown(blocked_msg)
-            st.session_state.last_result = {
-                "task_id": "blocked",
-                "prompt": prompt,
-                "answer": blocked_msg,
-                "sources": []
-            }
-            st.rerun()
+            st.stop()
 
         task_id = payload["task_id"]
 
@@ -626,16 +593,6 @@ if prompt:
                 status_placeholder.warning("⚠️ Tác vụ chưa hoàn thành. Vui lòng thử lại sau.")
             else:
                 status_placeholder.success("✅ Đã hoàn thành!")
-                task_result = final_data.get("task_result", {})
-                sources = task_result.get("sources", []) or []
-                answer_text = task_result.get("content", "No result")
-                
-                st.session_state.last_result = {
-                    "task_id": task_id,
-                    "prompt": prompt,
-                    "answer": answer_text,
-                    "sources": sources
-                }
                 st.rerun()
 
     except requests.RequestException as exc:
