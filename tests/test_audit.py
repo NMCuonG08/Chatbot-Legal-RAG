@@ -19,9 +19,10 @@ def test_log_audit_never_raises_on_db_error(sqlite_db, monkeypatch):
     def _boom(*a, **kw):
         raise RuntimeError("simulated db failure")
 
-    monkeypatch.setattr("audit._new_db_session", _boom)
-    log_audit(user_id="u2", action="chat")  # must not raise
-    monkeypatch.undo()  # restore real session so the read works
+    with monkeypatch.context() as m:
+        m.setattr("audit._new_db_session", _boom)
+        log_audit(user_id="u2", action="chat")  # must not raise
+    
     assert list_audit_entries(limit=10) == []
 
 

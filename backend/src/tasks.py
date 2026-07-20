@@ -36,6 +36,7 @@ from agent import ai_agent_handle, clear_user_runtime_caches
 from verify_answer import judge_answer
 from metacognitive import build_escalation, ESCALATION_PREFIX
 from rlhf_store import find_similar_good
+from citations import CITATION_RULE, normalize_sources
 from brain import (
     detect_route,
     detect_user_intent,
@@ -93,7 +94,7 @@ from rerank import rerank_documents
 from search import hybrid_search, search_engine  # Import new hybrid search
 from splitter import split_document
 from summarizer import summarize_text
-from tavily_tool import tavily_search_legal
+from tavily_tool import tavily_search
 from langgraph.types import Command
 from utils import setup_logging
 from vectorize import add_vector, search_vector, delete_vectors_by_ids, delete_vectors_by_filter
@@ -586,7 +587,7 @@ def generate_rag_answer(history, question, user_id=None):
 5. Luôn đưa ra câu trả lời có căn cứ pháp lý
 
 QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung cấp bên dưới.
-LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG bao giờ tóm tắt, nhắc lại hay mô tả lại thông tin lịch sử của người dùng; ngữ cảnh lịch sử (nếu có) chỉ là gợi ý phụ để cá nhân hóa, tuyệt đối không dùng làm nội dung chính của câu trả lời.""" + _date_context_block()
+LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG bao giờ tóm tắt, nhắc lại hay mô tả lại thông tin lịch sử của người dùng; ngữ cảnh lịch sử (nếu có) chỉ là gợi ý phụ để cá nhân hóa, tuyệt đối không dùng làm nội dung chính của câu trả lời.""" + _date_context_block() + CITATION_RULE
 
     doc_context = gen_doc_prompt(ranked_docs)
 
@@ -626,8 +627,10 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
             )
         except Exception as e:
             logger.error(f"Error running output RAG guardrails: {e}")
-            
-    return assistant_answer, ranked_docs
+
+    # Stamp citation metadata (id/title/url/kind) so the frontend can render
+    # inline [n] popovers. id order matches gen_doc_prompt's [Tài liệu n].
+    return assistant_answer, normalize_sources(ranked_docs, kind="corpus")
 
 
 def generate_agent_answer(history, question, user_id=None, conversation_id=None, role=None,
@@ -694,11 +697,29 @@ def _date_context_block() -> str:
 
 
 def generate_web_search_answer(history, question):
+    """Web-search route answer.
+
+    Returns ``(answer, sources)`` where sources are the normalized Tavily
+    results (each with its real ``url``) so the frontend can render inline
+    ``[n]`` citation popovers linking to the actual pages — not ``sources: []``
+    like before.
+    """
     logger.info("Using Tavily web search for query")
-    search_results = tavily_search_legal(question, max_results=5)
+    raw = tavily_search(f"Việt Nam pháp luật: {question}", max_results=5, search_depth="advanced")
+    results = raw.get("results", []) if isinstance(raw, dict) else []
+
+    # Numbered context block so CITATION_RULE's [n] markers resolve to these
+    # results (same scheme as gen_doc_prompt, but web results carry url+title).
+    lines = []
+    for idx, r in enumerate(results, start=1):
+        title = (r.get("title") or "").strip()
+        url = (r.get("url") or "").strip()
+        content = (r.get("content") or "").strip()
+        lines.append(f"[Tài liệu {idx}]\nTiêu đề: {title}\nURL: {url}\nNội dung: {content}")
+    search_context = "\n\n".join(lines) or "(không có kết quả tìm kiếm)"
 
     system_prompt = """Bạn là trợ lý AI giúp tìm kiếm thông tin pháp luật trên internet.
-    Hãy tổng hợp và trả lời câu hỏi dựa trên kết quả tìm kiếm được cung cấp.""" + _date_context_block()
+    Hãy tổng hợp và trả lời câu hỏi dựa trên kết quả tìm kiếm được cung cấp.""" + _date_context_block() + CITATION_RULE
 
     openai_messages = (
         [{"role": "system", "content": system_prompt}]
@@ -706,12 +727,14 @@ def generate_web_search_answer(history, question):
         + [
             {
                 "role": "user",
-                "content": f"Kết quả tìm kiếm:\n{search_results}\n\nCâu hỏi: {question}\n\nHãy tổng hợp thông tin và trả lời.",
+                "content": f"Kết quả tìm kiếm:\n{search_context}\n\nCâu hỏi: {question}\n\nHãy tổng hợp thông tin và trả lời.",
             }
         ]
     )
 
-    return openai_chat_complete(openai_messages)
+    answer = openai_chat_complete(openai_messages)
+    sources = normalize_sources(results, kind="web")
+    return answer, sources
 
 
 def generate_general_answer(history, question):
@@ -933,7 +956,7 @@ def _build_chat_graph():
 5. Luôn đưa ra câu trả lời có căn cứ pháp lý
 
 QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung cấp bên dưới.
-LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG bao giờ tóm tắt, nhắc lại hay mô tả lại thông tin lịch sử của người dùng; ngữ cảnh lịch sử (nếu có) chỉ là gợi ý phụ để cá nhân hóa, tuyệt đối không dùng làm nội dung chính của câu trả lời.""" + _date_context_block()
+LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG bao giờ tóm tắt, nhắc lại hay mô tả lại thông tin lịch sử của người dùng; ngữ cảnh lịch sử (nếu có) chỉ là gợi ý phụ để cá nhân hóa, tuyệt đối không dùng làm nội dung chính của câu trả lời.""" + _date_context_block() + CITATION_RULE
 
         doc_context = gen_doc_prompt(ranked_docs)
 
@@ -996,7 +1019,7 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
             _trace_handoff(state, "generate", "web_search", "rag_not_found")
             return Command(goto="web_search", update={"generate_to_web_done": True})
 
-        return {"response": assistant_answer, "sources": ranked_docs}
+        return {"response": assistant_answer, "sources": normalize_sources(ranked_docs, kind="corpus")}
 
     def agent_tools_node(state: ChatGraphState):
         history = state.get("history", [])
@@ -1041,7 +1064,7 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
     def web_search_node(state: ChatGraphState):
         history = state.get("history", [])
         question = state.get("standalone_question", state.get("question", ""))
-        resp = generate_web_search_answer(history, question)
+        resp, web_sources = generate_web_search_answer(history, question)
         if guardrails_manager.initialized:
             resp = guardrails_manager.add_legal_disclaimer(resp, question)
         _trace_node_end(state, "web_search", {"answer_len": len(resp)})
@@ -1052,7 +1075,7 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
         if cmd is not None:
             return cmd
 
-        return {"response": resp, "sources": [], "web_search_fallback_used": True}
+        return {"response": resp, "sources": web_sources, "web_search_fallback_used": True}
 
     def general_chat_node(state: ChatGraphState):
         history = state.get("history", [])
@@ -1618,7 +1641,7 @@ def llm_handle_message(self, bot_id, user_id, question, role=None,
             cached = get_cached_response(question, user_id)
         if cached:
             logger.info("Semantic Cache HIT - returning cached response directly")
-            update_chat_conversation(bot_id, user_id, cached["response"], False)
+            update_chat_conversation(bot_id, user_id, cached["response"], False, sources=cached["sources"])
             return {
                 "role": "assistant",
                 "content": cached["response"],
@@ -1714,7 +1737,7 @@ def llm_handle_message(self, bot_id, user_id, question, role=None,
             tool_calls = []
 
     # Save full response to history (to preserve all details like the specific age)
-    update_chat_conversation(bot_id, user_id, response_text, False)
+    update_chat_conversation(bot_id, user_id, response_text, False, sources=sources)
 
     # 4. Save to Semantic Cache if not blocked. Skip for shared sentinel
     # user_ids: the answer may carry this client's private facts, and caching

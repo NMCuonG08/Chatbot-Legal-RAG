@@ -1,32 +1,34 @@
 
+import os
+import sys
+
 import gradio as gr
 import requests
+
+# Make frontend/ importable so we can reuse the shared citation renderer.
+_FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")
+if _FRONTEND_DIR not in sys.path:
+    sys.path.insert(0, _FRONTEND_DIR)
+
+from citation_render import CITATION_CSS, render_answer_html, render_sources_panel
 
 # Đổi endpoint cho đúng backend FastAPI
 API_URL = "http://localhost:8002/chat/complete"  # Đúng port backend
 
 def format_sources_markdown(content, sources):
-    if not sources:
-        return content
-        
-    markdown = content
-    markdown += "\n\n**Nguồn tài liệu tham khảo:**\n"
-    for i, doc in enumerate(sources, 1):
-        source_name = doc.get("source", "Tài liệu")
-        doc_id = doc.get("doc_id", "N/A")
-        question = doc.get("question", "")
-        content_text = doc.get("content", "")
-        
-        # Truncate content preview if it's too long (e.g. 200 chars)
-        content_preview = content_text[:200] + "..." if len(content_text) > 200 else content_text
-        content_preview = content_preview.replace("\n", " ")
-        
-        markdown += f"{i}. **{source_name} (ID: {doc_id})**\n"
-        if question:
-            markdown += f"   - *Câu hỏi gốc:* {question}\n"
-        markdown += f"   - *Nội dung:* {content_preview}\n"
-        
-    return markdown
+    """Render the answer with inline [n] citation links + a grouped sources
+    panel (split by kind: corpus vs web search) below the answer. Replaces the
+    old disconnected "Tài liệu 1/2/3..." dump — each [n] is keyed to its source
+    card in the panel, and web-search results are visually separated from
+    in-corpus legal documents."""
+    html_body = render_answer_html(content, sources or [])
+    panel = render_sources_panel(sources or [])
+    return (
+        html_body
+        + '<hr style="margin:14px 0;border:none;border-top:1px solid #e5e7eb;">'
+        + '<div style="font-weight:700;margin-bottom:8px;">📚 Nguồn & Dẫn chứng</div>'
+        + panel
+    )
 
 def chat_fn(message, history):
     # Chuyển history sang list các dict role/content nếu chưa đúng
@@ -149,6 +151,6 @@ with gr.Blocks() as demo:
     #chatbox-input textarea {font-size: 16px; border-radius: 8px;}
     .gr-button {background: #2563eb; color: #fff; border-radius: 8px;}
     </style>
-    """)
+    """ + CITATION_CSS)
 
 demo.launch(share=True, theme=gr.themes.Soft(primary_hue="blue", neutral_hue="gray"))

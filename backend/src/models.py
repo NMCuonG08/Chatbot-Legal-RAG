@@ -1,5 +1,8 @@
 import asyncio
+import json
 import logging
+from datetime import datetime
+from typing import List, Optional
 from xml.dom import ValidationErr
 
 from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, delete
@@ -33,6 +36,7 @@ class ChatConversation(Base):
     message = Column(String)  # Assuming TextField is equivalent to String in SQLAlchemy
     is_request = Column(Boolean, default=True)
     completed = Column(Boolean, default=False)
+    sources = Column(String, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(
         DateTime(timezone=True), onupdate=func.now(), server_default=func.now()
@@ -84,7 +88,7 @@ def convert_conversation_to_openai_messages(user_conversations):
 
 
 def update_chat_conversation(
-    bot_id: str, user_id: str, message: str, is_request: bool = True
+    bot_id: str, user_id: str, message: str, is_request: bool = True, sources: list = None
 ):
     db = _new_db_session()
     # Step 1: Create a new ChatConversation instance
@@ -97,6 +101,7 @@ def update_chat_conversation(
         message=message,
         is_request=is_request,
         completed=not is_request,
+        sources=json.dumps(sources) if sources else None,
     )
     # Step 4: Save the ChatConversation instance
     try:
@@ -138,6 +143,7 @@ def list_user_conversations(user_id: str, limit: int = 100, offset: int = 0):
                 "completed": conversation.completed,
                 "created_at": conversation.created_at,
                 "updated_at": conversation.updated_at,
+                "sources": json.loads(conversation.sources) if getattr(conversation, "sources", None) else [],
             }
             for conversation in conversations
         ]
@@ -621,6 +627,23 @@ def ensure_database_schema():
     """Create missing tables for the current database if needed."""
     try:
         Base.metadata.create_all(bind=engine)
+        # Check if 'sources' column exists in 'chat_conversations', if not add it
+        from sqlalchemy import text
+        db = _new_db_session()
+        try:
+            db.execute(text("SELECT sources FROM chat_conversations LIMIT 1"))
+        except Exception:
+            db.rollback()
+            logger.info("Adding 'sources' column to 'chat_conversations' table...")
+            try:
+                db.execute(text("ALTER TABLE chat_conversations ADD COLUMN sources TEXT"))
+                db.commit()
+                logger.info("Successfully added 'sources' column.")
+            except Exception as alter_err:
+                db.rollback()
+                logger.error(f"Failed to add 'sources' column: {alter_err}")
+        finally:
+            db.close()
     except Exception as e:
         logger.warning("Database not ready during schema initialization: %s", e)
 

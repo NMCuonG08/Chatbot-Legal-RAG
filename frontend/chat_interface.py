@@ -7,7 +7,20 @@ from urllib.parse import urlparse
 import requests
 import streamlit as st
 
+# set_page_config MUST be called before any other Streamlit command
+st.set_page_config(page_title="Legal RAG & Agentic", page_icon="⚖️", layout="centered")
+
+from citation_render import CITATION_CSS, render_answer_html, render_sources_panel, render_sources_drawers_html
+
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8002")
+
+# Inject citation + sources-panel CSS once per app run. Cached so re-runs don't
+# re-emit; the panel is emitted per answer by render_sources_panel.
+@st.cache_data
+def _citation_css_html() -> str:
+    return CITATION_CSS
+
+st.markdown(_citation_css_html(), unsafe_allow_html=True)
 
 @st.cache_data(ttl=5)
 def check_services_health(backend_url):
@@ -161,7 +174,6 @@ def check_services_health(backend_url):
     return status_dict
 
 
-st.set_page_config(page_title="Legal RAG & Agentic", page_icon="⚖️", layout="centered")
 st.title("Legal RAG & Agentic Workflow")
 st.caption("MVP chat UI with async task polling")
 
@@ -403,12 +415,115 @@ def format_event(evt):
         
     return f"{emoji} **{node_name}**{details}"
 
-prompt = st.text_area("Nhap cau hoi", placeholder="Vi du: Hay tom tat quy dinh moi ve hop dong lao dong")
 
-if st.button("Gui") and prompt.strip():
+# Session state initialization
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+if "current_session_id" not in st.session_state:
+    st.session_state.current_session_id = st.session_state.session_id
+
+# If user switched session in sidebar, clear the last result cache
+if st.session_state.session_id != st.session_state.current_session_id:
+    st.session_state.last_result = None
+    st.session_state.current_session_id = st.session_state.session_id
+
+# 1. Fetch history of the active session
+history_data = []
+if st.session_state.session_id:
+    try:
+        hist_resp = requests.get(f"{BACKEND_URL}/history/{st.session_state.session_id}", timeout=5)
+        if hist_resp.status_code == 200:
+            history_data = hist_resp.json().get("history", [])
+    except Exception:
+        pass
+
+# Chronological order (oldest first)
+chrono_history = list(reversed(history_data))
+
+# If there is a last result in session state, filter out the last turn from history
+# to avoid rendering it twice.
+if st.session_state.last_result and chrono_history:
+    if (len(chrono_history) >= 2 and 
+        chrono_history[-1].get("message") == st.session_state.last_result["answer"] and
+        chrono_history[-2].get("message") == st.session_state.last_result["prompt"]):
+        chrono_history = chrono_history[:-2]
+
+# 2. Render Chronological History in main view
+for msg in chrono_history:
+    if msg.get("is_request"):
+        with st.chat_message("user"):
+            st.markdown(msg.get("message", ""))
+    else:
+        with st.chat_message("assistant"):
+            sources_val = msg.get("sources", []) or []
+            full_html = render_answer_html(msg.get("message", ""), sources_val) + render_sources_drawers_html(sources_val)
+            st.markdown(full_html, unsafe_allow_html=True)
+
+# 3. Render the Last Result (if present) with Drawer and Feedback
+if st.session_state.last_result:
+    last = st.session_state.last_result
+    with st.chat_message("user"):
+        st.markdown(last["prompt"])
+    with st.chat_message("assistant"):
+        full_html = render_answer_html(last["answer"], last["sources"]) + render_sources_drawers_html(last["sources"])
+        st.markdown(full_html, unsafe_allow_html=True)
+        
+        # Feedback buttons
+        fb_col1, fb_col2, _ = st.columns([1, 1, 8])
+        task_id = last["task_id"]
+        sources = last["sources"]
+        prompt_val = last["prompt"]
+        answer_val = last["answer"]
+        with fb_col1:
+            if st.button("👍", key=f"fb_good_{task_id}", help="Câu trả lời này tốt"):
+                try:
+                    requests.post(
+                        f"{BACKEND_URL}/feedback",
+                        json={
+                            "user_id": st.session_state.session_id,
+                            "conversation_id": task_id,
+                            "message_id": task_id,
+                            "rating": "good",
+                            "question": prompt_val,
+                            "response": answer_val,
+                            "sources": sources,
+                        },
+                        timeout=10,
+                    )
+                    st.toast("Cảm ơn bạn đã đánh giá! 👍")
+                except requests.RequestException as fb_exc:
+                    st.toast(f"Lỗi gửi đánh giá: {fb_exc}")
+        with fb_col2:
+            if st.button("👎", key=f"fb_bad_{task_id}", help="Câu trả lời này chưa tốt"):
+                try:
+                    requests.post(
+                        f"{BACKEND_URL}/feedback",
+                        json={
+                            "user_id": st.session_state.session_id,
+                            "conversation_id": task_id,
+                            "message_id": task_id,
+                            "rating": "bad",
+                            "question": prompt_val,
+                            "response": answer_val,
+                            "sources": sources,
+                        },
+                        timeout=10,
+                    )
+                    st.toast("Cảm ơn phản hồi — chúng tôi sẽ cải thiện. 👎")
+                except requests.RequestException as fb_exc:
+                    st.toast(f"Lỗi gửi đánh giá: {fb_exc}")
+
+# 4. Chat Input for new questions
+prompt = st.chat_input("Nhập câu hỏi pháp lý của bạn tại đây...")
+
+if prompt:
     if not st.session_state.session_id.strip():
         st.error("Vui lòng nhập 'Tên người dùng / Session ID' ở thanh bên trước khi gửi.")
         st.stop()
+        
+    with st.chat_message("user"):
+        st.markdown(prompt)
+        
     try:
         submit_resp = requests.post(
             f"{BACKEND_URL}/chat/complete",
@@ -418,155 +533,110 @@ if st.button("Gui") and prompt.strip():
         submit_resp.raise_for_status()
         payload = submit_resp.json()
 
-        # Guardrail Tier1 block (jailbreak/toxic): backend returns the blocked
-        # message directly with no task_id. Display it instead of crashing.
+        # Guardrail Tier1 block
         if "task_id" not in payload:
             blocked_msg = payload.get("response") or "Yêu cầu bị chặn bởi bộ bảo vệ."
             with st.chat_message("assistant"):
                 st.markdown(blocked_msg)
-            st.stop()
+            st.session_state.last_result = {
+                "task_id": "blocked",
+                "prompt": prompt,
+                "answer": blocked_msg,
+                "sources": []
+            }
+            st.rerun()
 
         task_id = payload["task_id"]
 
-        st.info(f"Task queued: {task_id}")
-
-        # Realtime trace display
-        trace_messages = []
-        status_placeholder = st.empty()
-        status_placeholder.info("⏳ Đang chuẩn bị chạy Agent...")
-        
-        trace_expander = st.expander("🔄 Trình tự thực thi Agent (Realtime)", expanded=True)
-        trace_placeholder = trace_expander.empty()
-        
-        final_data = None
-        
-        try:
-            # We connect to the stream endpoint, retrying on 404 in case of Celery worker initialization delays
-            stream_resp = None
-            for attempt in range(25):  # Retry for up to ~125 seconds
-                try:
-                    resp = requests.get(
-                        f"{BACKEND_URL}/chat/stream/{task_id}",
-                        stream=True,
-                        timeout=(5, 60)
-                    )
-                    if resp.status_code == 200:
-                        stream_resp = resp
-                        break
-                    elif resp.status_code == 404:
-                        status_placeholder.info(f"⏳ Đang xếp hàng và thẩm định an toàn (Lượt thử {attempt+1}/25)...")
-                        time.sleep(5)
-                    else:
-                        resp.raise_for_status()
-                except Exception as stream_conn_err:
-                    if attempt == 24:
-                        raise stream_conn_err
-                    time.sleep(2)
+        with st.chat_message("assistant"):
+            status_placeholder = st.empty()
+            status_placeholder.info("⏳ Đang chuẩn bị chạy Agent...")
             
-            if stream_resp and stream_resp.status_code == 200:
-                status_placeholder.info("🚀 Agent đang thực thi workflow...")
-                
-                for raw in stream_resp.iter_lines(decode_unicode=True):
-                    if not raw:
-                        continue
-                    if raw.startswith("data:"):
-                        data_str = raw[len("data:"):].strip()
-                        try:
-                            evt = json.loads(data_str)
-                        except (json.JSONDecodeError, ValueError):
-                            continue
-                            
-                        if "event_type" not in evt:
-                            continue
-                            
-                        # Format and add to trace messages
-                        formatted = format_event(evt)
-                        if formatted:
-                            trace_messages.append(formatted)
-                            # Render live markdown bullet list
-                            trace_placeholder.markdown("\n".join([f"- {m}" for m in trace_messages]))
-                            
-                        # Break loop on run end
-                        if evt.get("event_type") == "run_end":
+            trace_expander = st.expander("🔄 Trình tự thực thi Agent (Realtime)", expanded=True)
+            trace_placeholder = trace_expander.empty()
+            
+            final_data = None
+            trace_messages = []
+            
+            try:
+                stream_resp = None
+                for attempt in range(25):
+                    try:
+                        resp = requests.get(
+                            f"{BACKEND_URL}/chat/stream/{task_id}",
+                            stream=True,
+                            timeout=(5, 60)
+                        )
+                        if resp.status_code == 200:
+                            stream_resp = resp
                             break
+                        elif resp.status_code == 404:
+                            status_placeholder.info(f"⏳ Đang xếp hàng và thẩm định an toàn (Lượt thử {attempt+1}/25)...")
+                            time.sleep(5)
+                        else:
+                            resp.raise_for_status()
+                    except Exception as stream_conn_err:
+                        if attempt == 24:
+                            raise stream_conn_err
+                        time.sleep(2)
+                
+                if stream_resp and stream_resp.status_code == 200:
+                    status_placeholder.info("🚀 Agent đang thực thi workflow...")
+                    
+                    for raw in stream_resp.iter_lines(decode_unicode=True):
+                        if not raw:
+                            continue
+                        if raw.startswith("data:"):
+                            data_str = raw[len("data:"):].strip()
+                            try:
+                                evt = json.loads(data_str)
+                            except (json.JSONDecodeError, ValueError):
+                                continue
+                                
+                            if "event_type" not in evt:
+                                continue
+                                
+                            formatted = format_event(evt)
+                            if formatted:
+                                trace_messages.append(formatted)
+                                trace_placeholder.markdown("\n".join([f"- {m}" for m in trace_messages]))
+                                
+                            if evt.get("event_type") == "run_end":
+                                break
+                else:
+                    trace_placeholder.caption("⚠️ Không thể kết nối với luồng trace thời gian thực. Đang chuyển sang chế độ chờ kết quả...")
+                                
+            except Exception as e:
+                trace_placeholder.caption(f"Không thể đọc kết nối realtime: {e}. Đang chờ tác vụ hoàn thành...")
+                
+            # Fallback / Final complete poll
+            for _ in range(30):
+                task_resp = requests.get(f"{BACKEND_URL}/chat/complete/{task_id}", timeout=20)
+                task_resp.raise_for_status()
+                result_data = task_resp.json()
+                if result_data.get("task_status") == "SUCCESS":
+                    final_data = result_data
+                    break
+                elif result_data.get("task_status") == "FAILURE":
+                    status_placeholder.error("❌ Tác vụ thất bại trong quá trình thực thi.")
+                    break
+                time.sleep(1)
+
+            if final_data is None:
+                status_placeholder.warning("⚠️ Tác vụ chưa hoàn thành. Vui lòng thử lại sau.")
             else:
-                trace_placeholder.caption("⚠️ Không thể kết nối với luồng trace thời gian thực. Đang chuyển sang chế độ chờ kết quả...")
-                            
-        except Exception as e:
-            trace_placeholder.caption(f"Không thể đọc kết nối realtime: {e}. Đang chờ tác vụ hoàn thành...")
-            
-        # Fallback / Final complete poll
-        for _ in range(30):
-            task_resp = requests.get(f"{BACKEND_URL}/chat/complete/{task_id}", timeout=20)
-            task_resp.raise_for_status()
-            result_data = task_resp.json()
-            if result_data.get("task_status") == "SUCCESS":
-                final_data = result_data
-                break
-            elif result_data.get("task_status") == "FAILURE":
-                status_placeholder.error("❌ Tác vụ thất bại trong quá trình thực thi.")
-                break
-            time.sleep(1)
-
-        if final_data is None:
-            status_placeholder.warning("⚠️ Tác vụ chưa hoàn thành. Vui lòng thử lại sau.")
-        else:
-            status_placeholder.success("✅ Đã hoàn thành!")
-            task_result = final_data.get("task_result", {})
-            st.markdown("### ⚖️ Trả lời từ Trợ lý Pháp lý:")
-            st.write(task_result.get("content", "No result"))
-            
-            # Display sources if available
-            sources = task_result.get("sources", [])
-            if sources:
-                with st.expander("📚 Nguồn tài liệu tham khảo"):
-                    for idx, src in enumerate(sources):
-                        content_text = src.get('content') or src.get('text') or ''
-                        st.markdown(f"**Tài liệu {idx+1}:** {content_text[:300]}...")
-
-            # Phase 4 — RLHF 👍/👎 feedback. Sent per-user (session_id) so the
-            # backend can store it user-scoped and reuse good answers as
-            # few-shot / rerank signal. Sentinel/empty ids are rejected server-side.
-            _resp_text = task_result.get("content", "")
-            fb_col1, fb_col2, _ = st.columns([1, 1, 6])
-            with fb_col1:
-                if st.button("👍", key=f"fb_good_{task_id}", help="Câu trả lời này tốt"):
-                    try:
-                        requests.post(
-                            f"{BACKEND_URL}/feedback",
-                            json={
-                                "user_id": st.session_state.session_id,
-                                "conversation_id": task_id,
-                                "message_id": task_id,
-                                "rating": "good",
-                                "question": prompt.strip(),
-                                "response": _resp_text,
-                                "sources": sources,
-                            },
-                            timeout=10,
-                        )
-                        st.toast("Cảm ơn bạn đã đánh giá! 👍")
-                    except requests.RequestException as fb_exc:
-                        st.toast(f"Lỗi gửi đánh giá: {fb_exc}")
-            with fb_col2:
-                if st.button("👎", key=f"fb_bad_{task_id}", help="Câu trả lời này chưa tốt"):
-                    try:
-                        requests.post(
-                            f"{BACKEND_URL}/feedback",
-                            json={
-                                "user_id": st.session_state.session_id,
-                                "conversation_id": task_id,
-                                "message_id": task_id,
-                                "rating": "bad",
-                                "question": prompt.strip(),
-                                "response": _resp_text,
-                                "sources": sources,
-                            },
-                            timeout=10,
-                        )
-                        st.toast("Cảm ơn phản hồi — chúng tôi sẽ cải thiện. 👎")
-                    except requests.RequestException as fb_exc:
-                        st.toast(f"Lỗi gửi đánh giá: {fb_exc}")
+                status_placeholder.success("✅ Đã hoàn thành!")
+                task_result = final_data.get("task_result", {})
+                sources = task_result.get("sources", []) or []
+                answer_text = task_result.get("content", "No result")
+                
+                st.session_state.last_result = {
+                    "task_id": task_id,
+                    "prompt": prompt,
+                    "answer": answer_text,
+                    "sources": sources
+                }
+                st.rerun()
 
     except requests.RequestException as exc:
         st.error(f"Yêu cầu thất bại: {exc}")

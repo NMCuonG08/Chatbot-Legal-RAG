@@ -264,7 +264,7 @@ def build_judge_fn(provider: str = "groq", model: str | None = None,
     return _judge
 
 
-def vietnamese_llm_chat_complete(messages=(), temperature=0.7, max_tokens=512):
+def vietnamese_llm_chat_complete(messages=(), temperature=0.7, max_tokens=2048):
     """Main user-facing answer path.
 
     Routing:
@@ -346,18 +346,44 @@ def get_embedding(text, model=None):
 
 
 def gen_doc_prompt(docs):
-    """
-    Document:
-    Question: Trong Bộ luật Hình sự thì bao nhiêu tuổi được xem là người già...
-    Answer: Người cao tuổi, người già...
+    """Format retrieved docs into a numbered context block for the LLM.
+
+    Each doc is labelled ``[Tài liệu n]`` (1-based, in input order) with its
+    law_name / article_number / source metadata surfaced. The matching
+    ``CITATION_RULE`` (citations.py) tells the LLM to echo ``[n]`` inline at
+    each claim, so the frontend can bind each claim to its source popup.
+
+    The 1-based index here MUST match ``citations.normalize_sources`` (both
+    iterate the same list in the same order) — that is the contract that lets
+    the frontend resolve an LLM-emitted ``[n]`` to the right source dict.
+
+    Args:
+        docs: list of retrieved chunk dicts. Required keys: ``content``.
+            Optional: ``question``, ``law_name``, ``article_number``, ``source``.
+
+    Returns:
+        str: ``"Tài liệu tham khảo:\\n[Tài liệu 1]\\n..."``.
     """
     doc_prompt = ""
-    for doc in docs:
-        doc_prompt += (
-            f"Câu hỏi: {doc['question']} \n Câu trả lời: {doc['content']} \n\n"
-        )
+    for idx, doc in enumerate(docs, start=1):
+        law_name = (doc.get("law_name") or "").strip()
+        article_number = doc.get("article_number")
+        source = (doc.get("source") or "").strip() or "—"
+        meta_parts = []
+        if law_name:
+            meta_parts.append(f"Luật: {law_name}")
+        if article_number is not None:
+            meta_parts.append(f"Điều: {article_number}")
+        meta_parts.append(f"Nguồn: {source}")
+        meta = " | ".join(meta_parts)
+        question = (doc.get("question") or "").strip()
+        content = (doc.get("content") or "").strip()
+        doc_prompt += f"[Tài liệu {idx}]\n{meta}\n"
+        if question:
+            doc_prompt += f"Câu hỏi: {question}\n"
+        doc_prompt += f"Nội dung: {content}\n\n"
 
-    return "Tài liệu tham khảo: \n{}".format(doc_prompt)
+    return "Tài liệu tham khảo:\n{}".format(doc_prompt)
 
 
 def generate_conversation_text(conversations):

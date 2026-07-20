@@ -104,12 +104,25 @@ async def lifespan(app: FastAPI):
         logger.critical(f"🔴 Redis Cache check failed: {e}")
         raise RuntimeError(f"Redis check failed: {e}")
 
-    # 3. Check Qdrant
+    # 3. Check Qdrant (with retries up to 30 seconds to allow for startup recovery)
     try:
         from vectorize import get_client
-        # This will auto-retry via our wrapper if needed
-        get_client().get_collections()
-        logger.info("🟢 Qdrant DB connection verified.")
+        qdrant_ready = False
+        logger.info("⏳ Waiting for Qdrant DB to become ready...")
+        for attempt in range(30):
+            try:
+                get_client().get_collections()
+                logger.info("🟢 Qdrant DB connection verified.")
+                qdrant_ready = True
+                break
+            except Exception as exc:
+                if attempt < 29:
+                    logger.warning(f"⚠️ Qdrant not ready yet (attempt {attempt + 1}/30): {exc}. Retrying in 1s...")
+                    time.sleep(1)
+                else:
+                    raise exc
+        if not qdrant_ready:
+            raise RuntimeError("Qdrant check failed after 30 attempts.")
     except Exception as e:
         logger.critical(f"🔴 Qdrant DB check failed: {e}")
         raise RuntimeError(f"Qdrant check failed: {e}")

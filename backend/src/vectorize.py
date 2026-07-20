@@ -31,6 +31,8 @@ def _should_reconnect_qdrant(e: Exception) -> bool:
     err_str = str(e).lower()
     return (
         "10054" in err_str or
+        "10061" in err_str or
+        "refused" in err_str or
         "connection reset" in err_str or
         "forcibly closed" in err_str or
         "remote host" in err_str or

@@ -52,6 +52,9 @@ def test_agent_tools_hands_off_to_retrieve_then_generate(monkeypatch):
     # Agent returns a marker that triggers handoff to RAG.
     monkeypatch.setattr(tasks, "generate_agent_answer", lambda history, q, **kw: ("tôi sẽ tra cứu văn bản luật", []))
     monkeypatch.setattr(tasks, "vietnamese_llm_chat_complete", lambda msgs: "RAG_ANSWER")
+    # Deterministic supervisor (heuristic fallback): the agent's "tôi sẽ tra
+    # cứu văn bản luật" marker -> heuristic handoff to rag, no real LLM needed.
+    monkeypatch.setattr(tasks, "_planner_llm_call", lambda prompt: None)
     _patch_retrieve(monkeypatch)
 
     retrieve_calls = {"n": 0}
@@ -74,8 +77,17 @@ def test_generate_hands_off_to_web_search_on_not_found(monkeypatch):
     _patch_retrieve(monkeypatch)
     # generate_node produces a not-found marker -> handoff to web_search.
     monkeypatch.setattr(tasks, "vietnamese_llm_chat_complete", lambda msgs: "không tìm thấy thông tin")
-    monkeypatch.setattr(tasks, "tavily_search_legal", lambda q, max_results=5: "WEB_RESULTS")
+    # Web route now calls tavily_search (raw dict) instead of tavily_search_legal.
+    monkeypatch.setattr(
+        tasks, "tavily_search",
+        lambda q, max_results=5, search_depth="advanced": {
+            "results": [{"title": "T", "url": "https://t.test", "content": "C"}]
+        },
+    )
     monkeypatch.setattr(tasks, "openai_chat_complete", lambda msgs: "WEB_ANSWER")
+    # Force supervisor to its deterministic heuristic fallback (no real LLM)
+    # so "WEB_ANSWER" (no lookup marker) -> END deterministically.
+    monkeypatch.setattr(tasks, "_planner_llm_call", lambda prompt: None)
 
     result = tasks.run_chat_graph(history=[], question="q", user_id=None, conversation_id="test-handoff-gen")
 
@@ -90,8 +102,16 @@ def test_handoff_guard_prevents_repeat_agent_to_rag(monkeypatch):
     # Agent keeps emitting the marker; without the guard this would loop.
     monkeypatch.setattr(tasks, "generate_agent_answer", lambda history, q, **kw: ("cần tra cứu văn bản", []))
     monkeypatch.setattr(tasks, "vietnamese_llm_chat_complete", lambda msgs: "không tìm thấy thông tin")
-    monkeypatch.setattr(tasks, "tavily_search_legal", lambda q, max_results=5: "WEB_RESULTS")
+    monkeypatch.setattr(
+        tasks, "tavily_search",
+        lambda q, max_results=5, search_depth="advanced": {
+            "results": [{"title": "T", "url": "https://t.test", "content": "C"}]
+        },
+    )
     monkeypatch.setattr(tasks, "openai_chat_complete", lambda msgs: "WEB_ANSWER")
+    # Deterministic supervisor (heuristic fallback): "WEB_ANSWER" has no marker
+    # -> END, so the guard test does not depend on a real LLM's whim.
+    monkeypatch.setattr(tasks, "_planner_llm_call", lambda prompt: None)
 
     # Path: agent -> retrieve -> grade(relevant) -> generate("not found") -> web_search -> END.
     # web_search answer "WEB_ANSWER" has no lookup marker, so no web->agent handoff. Terminates.
