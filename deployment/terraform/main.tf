@@ -38,7 +38,7 @@ data "aws_ami" "ubuntu" {
   owners      = ["099720109477"] # Canonical
   filter {
     name   = "name"
-    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-jammy-22.04-amd64-server-*"]
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
   }
 }
 
@@ -82,15 +82,27 @@ resource "aws_security_group" "legal_sg" {
   tags = { Name = "legal-chatbot-sg" }
 }
 
+# ---------- EC2 SSH key pair (registered from a local public key) -------------
+# Generate locally once:  ssh-keygen -t ed25519 -f legal-prod-key -N "" -C legal-prod
+# Terraform registers ONLY the public key with AWS. The private key
+# (legal-prod-key) stays on your machine — it NEVER enters terraform state.
+# Use legal-prod-key as the .pem for SSH + as GitHub secret EC2_SSH_KEY.
+resource "aws_key_pair" "legal" {
+  key_name   = "legal-prod-key"
+  public_key = file("${path.module}/legal-prod-key.pub")
+  tags       = { Name = "legal-prod-key" }
+}
+
 # ---------- EC2 instance ------------------------------------------------------
 resource "aws_instance" "legal_app" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
   subnet_id                   = data.aws_subnets.default.ids[0]
-  key_name                    = var.key_pair_name
+  key_name                    = aws_key_pair.legal.key_name
   vpc_security_group_ids      = [aws_security_group.legal_sg.id]
   associate_public_ip_address = true
   monitoring                  = true
+  iam_instance_profile        = aws_iam_instance_profile.legal_instance_profile.name
 
   user_data = templatefile("${path.module}/user_data.sh", {
     github_repo_url = var.github_repo_url
@@ -104,6 +116,51 @@ resource "aws_instance" "legal_app" {
   }
 
   tags = { Name = "legal-chatbot-prod" }
+}
+
+# ---------- IAM instance role (least-privilege S3 backup access) -------------
+# Lets the EC2 host run `aws s3 cp` for backups WITHOUT static AWS creds on disk.
+# Backup script (deployment/scripts/backup.sh) relies on this role.
+resource "aws_iam_role" "legal_instance_role" {
+  name = "legal-chatbot-instance-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_instance_profile" "legal_instance_profile" {
+  name = "legal-chatbot-instance-profile"
+  role = aws_iam_role.legal_instance_role.name
+}
+
+# Least privilege: only the backup bucket, only the actions backup.sh needs.
+resource "aws_iam_role_policy" "legal_s3_backup" {
+  name = "legal-s3-backup"
+  role = aws_iam_role.legal_instance_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:DeleteObject",
+          "s3:ListBucket",
+          "s3:ListBucketMultipartUploads"
+        ]
+        Resource = [
+          aws_s3_bucket.backups.arn,
+          "${aws_s3_bucket.backups.arn}/*"
+        ]
+      }
+    ]
+  })
 }
 
 # ---------- Elastic IP (static IP for Route53) --------------------------------
@@ -127,8 +184,8 @@ resource "aws_s3_bucket_versioning" "backups" {
 resource "aws_s3_bucket_public_access_block" "backups" {
   bucket                  = aws_s3_bucket.backups.id
   block_public_acls       = true
-  block_public_policy      = true
-  ignore_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
   restrict_public_buckets = true
 }
 
@@ -140,8 +197,8 @@ resource "aws_s3_bucket" "corpus" {
 resource "aws_s3_bucket_public_access_block" "corpus" {
   bucket                  = aws_s3_bucket.corpus.id
   block_public_acls       = true
-  block_public_policy      = true
-  ignore_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
   restrict_public_buckets = true
 }
 
@@ -155,7 +212,7 @@ resource "aws_s3_bucket_public_access_block" "corpus" {
 # }
 
 # ---------- Outputs -----------------------------------------------------------
-output "ec2_public_ip"   { value = aws_eip.legal_eip.public_ip }
-output "ec2_public_dns"  { value = aws_instance.legal_app.public_dns }
+output "ec2_public_ip" { value = aws_eip.legal_eip.public_ip }
+output "ec2_public_dns" { value = aws_instance.legal_app.public_dns }
 output "s3_backup_bucket" { value = aws_s3_bucket.backups.id }
-output "ssh_command"     { value = "ssh -i ${var.key_pair_name}.pem ubuntu@${aws_eip.legal_eip.public_ip}" }
+output "ssh_command" { value = "ssh -i ${aws_key_pair.legal.key_name} ubuntu@${aws_eip.legal_eip.public_ip}" }
