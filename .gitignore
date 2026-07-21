@@ -12,6 +12,10 @@ __pycache__/
 venv/
 env/
 ENV/
+# Exception: deployment/env/ holds deploy env TEMPLATES (not a Python venv).
+# The env/ rule above would ignore it; this re-includes the dir so the
+# .env.prod.aws.example + SECRETS_CHECKLIST.md templates commit normally.
+!deployment/env/
 
 # Packaging/build artifacts
 build/

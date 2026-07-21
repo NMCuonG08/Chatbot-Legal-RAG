@@ -69,19 +69,32 @@ jobs:
     # images land in GHCR, deploy is a clean skip (not a red failure).
     if: vars.ENABLE_DEPLOY == 'true'
     steps:
-      - name: SSH deploy to EC2 (pull latest + recreate)
+      - name: SSH deploy to EC2 (assemble .env from secrets + pull + recreate)
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
+            set -e
             cd /home/ubuntu/app
+            # Assemble backend/.env from template + GitHub secrets (idempotent:
+            # re-runs overwrite secrets with latest values, keep non-secret config from template).
+            cp -f deployment/env/.env.prod.aws.example backend/.env
+            sed -i "s|^GROQ_API_KEY=.*|GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}|"           backend/.env
+            sed -i "s|^TAVILY_API_KEY=.*|TAVILY_API_KEY=${{ secrets.TAVILY_API_KEY }}|"       backend/.env
+            sed -i "s|^COHERE_API_KEY=.*|COHERE_API_KEY=${{ secrets.COHERE_API_KEY }}|"       backend/.env
+            sed -i "s|^MYSQL_PASSWORD=.*|MYSQL_PASSWORD=${{ secrets.MYSQL_PASSWORD }}|"       backend/.env
+            sed -i "s|^MYSQL_ROOT_PASSWORD=.*|MYSQL_ROOT_PASSWORD=${{ secrets.MYSQL_ROOT_PASSWORD }}|" backend/.env
+            sed -i "s|^DATABASE_URL=.*|DATABASE_URL=mysql+pymysql://legal:${{ secrets.MYSQL_PASSWORD }}@mariadb:3306/legal_db|" backend/.env
+            sed -i "s|^JWT_SECRET=.*|JWT_SECRET=${{ secrets.JWT_SECRET }}|"                   backend/.env
+            sed -i "s|^SEED_ADMIN_PASSWORD=.*|SEED_ADMIN_PASSWORD=${{ secrets.SEED_ADMIN_PASSWORD }}|" backend/.env
+            sed -i "s|^MCP_API_KEY=.*|MCP_API_KEY=${{ secrets.MCP_API_KEY }}|"                 backend/.env
+            sed -i "s|^GF_SECURITY_ADMIN_PASSWORD=.*|GF_SECURITY_ADMIN_PASSWORD=${{ secrets.GF_SECURITY_ADMIN_PASSWORD }}|" backend/.env
+            chmod 600 backend/.env
             echo "${{ secrets.GHCR_PAT }}" | docker login $REGISTRY -u ${{ github.actor }} --password-stdin
-            # Use prod compose (image-based, not build). --env-file backend/.env
-            # supplies ${MYSQL_PASSWORD} etc. for compose interpolation.
-            # --project-directory . makes ./data volumes resolve to /home/ubuntu/app/data
-            # (the dirs user_data.sh created), not deployment/data.
+            # prod compose = image-based. --env-file for ${MYSQL_PASSWORD} interpolation.
+            # --project-directory . -> ./data volumes resolve to /home/ubuntu/app/data.
             docker compose -f deployment/docker-compose.prod.yml --env-file backend/.env --project-directory . pull
             docker compose -f deployment/docker-compose.prod.yml --env-file backend/.env --project-directory . up -d --no-build
             docker image prune -f
