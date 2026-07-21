@@ -1,0 +1,63 @@
+# ============================================================================
+# Prometheus alert rules — Legal Chatbot
+# ----------------------------------------------------------------------------
+# Loaded via prometheus.yml rule_files. Mounted at /etc/prometheus/rules by
+# docker-compose.prod.yml. Labels feed Alertmanager routing (severity=critical
+# -> webhook-critical).
+# ============================================================================
+
+groups:
+  - name: legal-services
+    interval: 30s
+    rules:
+      # --- Availability ----------------------------------------------------
+      - alert: LegalBackendDown
+        expr: up{job="fastapi"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Legal backend down"
+          description: "backend (FastAPI) has been unreachable for 2m on {{ $labels.instance }}."
+
+      - alert: OtelCollectorDown
+        expr: up{job="otel-collector"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTEL collector down"
+          description: "Traces/metrics are no longer being collected."
+
+      - alert: AlertmanagerDown
+        expr: up{job="alertmanager"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Alertmanager down"
+          description: "Alerts cannot be delivered until Alertmanager recovers."
+
+      # --- Backend error rate ---------------------------------------------
+      - alert: LegalBackendHigh5xx
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m])) by (job)
+          / sum(rate(http_requests_total[5m])) by (job) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Backend 5xx error rate > 5%"
+          description: "10-min 5xx ratio is {{ $value | humanizePercentage }}."
+
+      # --- Latency ---------------------------------------------------------
+      - alert: LegalBackendHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le)) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backend p95 latency > 2s"
+          description: "p95 = {{ $value | humanizeDuration }} over the last 10m."

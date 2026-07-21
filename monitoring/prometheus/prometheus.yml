@@ -2,8 +2,29 @@ global:
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# Alert rules -> mounted at /etc/prometheus/rules by docker-compose.prod.yml.
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+# Fire alerts to the alertmanager service on legal-net.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
+  # Backend FastAPI /metrics (also covers dev host.docker.internal:8002).
   - job_name: "fastapi"
     metrics_path: "/metrics"
     static_configs:
       - targets: ["host.docker.internal:8002", "backend:8000"]
+
+  # OTEL collector self-metrics + OTLP-derived app metrics on :8888.
+  - job_name: "otel-collector"
+    static_configs:
+      - targets: ["otel-collector:8888"]
+
+  # Alertmanager self-metrics (so we can alert on AlertmanagerDown).
+  - job_name: "alertmanager"
+    static_configs:
+      - targets: ["alertmanager:9093"]

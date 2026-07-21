@@ -5,14 +5,20 @@ Tạo hạ tầng: EC2 `t3.large` + EBS gp3 + Elastic IP + Security Group (chỉ
 ## Yêu cầu trước
 1. **AWS CLI** + credentials (IAM user, KHÔNG root). Test: `aws sts get-caller-identity`.
 2. **Terraform** ≥ 1.5. Cài: https://developer.hashicorp.com/terraform/downloads
-3. **EC2 key pair** tạo sẵn trong Console (region đúng). Lưu `.pem` máy bạn, chmod 600.
+3. **SSH key** local (terraform register pubkey vào AWS, không cần Console):
+   ```bash
+   cd deployment/terraform
+   ssh-keygen -t ed25519 -f legal-prod-key -N "" -C legal-prod
+   ```
+   `legal-prod-key` (private) giữ máy — dùng SSH + GitHub secret `EC2_SSH_KEY`.
+   `legal-prod-key.pub` (public) commit, terraform đọc tại apply.
 4. **Public IP** của bạn (admin_cidr): https://ifconfig.me → `<IP>/32`.
 
 ## Chạy
 ```bash
 cd deployment/terraform
 cp terraform.tfvars.example terraform.tfvars
-nano terraform.tfvars          # fill key_pair_name, admin_cidr, s3 bucket names
+nano terraform.tfvars          # fill admin_cidr, s3 bucket names (key_pair tự tạo)
 terraform init
 terraform plan -var-file=terraform.tfvars      # preview
 terraform apply -var-file=terraform.tfvars     # nhập yes

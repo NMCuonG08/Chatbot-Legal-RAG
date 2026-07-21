@@ -202,6 +202,34 @@ resource "aws_s3_bucket_public_access_block" "corpus" {
   restrict_public_buckets = true
 }
 
+# ---------- Billing budget (email alert before cost surprises) ----------------
+# AWS emails budget_email at 80% actual spend + 100% forecast. The #1 defense
+# against "forgot a resource, got a big bill". Tune budget_limit_amount in tfvars.
+resource "aws_budgets_budget" "legal" {
+  name         = "legal-chatbot-monthly"
+  budget_type  = "COST"
+  limit_amount = var.budget_limit_amount
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+  # Adjust the start month if you apply in a later month. Format: YYYY-MM-DD_HH:MM
+  time_period_start = "2026-07-01_00:00"
+
+  notification {
+    notification_type          = "ACTUAL"
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 80
+    threshold_type             = "PERCENTAGE"
+    subscriber_email_addresses = [var.budget_email]
+  }
+  notification {
+    notification_type          = "FORECASTED"
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 100
+    threshold_type             = "PERCENTAGE"
+    subscriber_email_addresses = [var.budget_email]
+  }
+}
+
 # ---------- Route53 A record (uncomment after EIP known + hosted zone ready) --
 # resource "aws_route53_record" "app" {
 #   zone_id = var.route53_hosted_zone_id

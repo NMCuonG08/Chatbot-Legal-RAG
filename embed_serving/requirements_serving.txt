@@ -1,2 +1,21 @@
+# Embedding serving deps (CPU) — serve_model.py imports these at runtime.
+# Previous version listed only fastapi+uvicorn (unused — serve_model.py is Flask),
+# so the image crashed on import. This mirrors the actual imports.
+#
+# torch CPU wheel via PyTorch index (avoids pulling the 2GB CUDA wheel).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.1.2
+
+# Numerics + ML
+numpy>=1.24,<2.0
+scikit-learn>=1.3.0
+sentence-transformers==2.7.0
+huggingface_hub>=0.20.0
+
+# Serving (serve_model.py uses Flask's dev server with threaded=True;
+# model is loaded in main(), so gunicorn cannot be used without a code change)
+flask==3.0.3
+
+# Kept for parity with the original file (unused by serve_model.py but harmless)
 fastapi==0.115.0
 uvicorn[standard]==0.30.6

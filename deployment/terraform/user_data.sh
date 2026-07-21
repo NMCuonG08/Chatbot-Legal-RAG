@@ -32,7 +32,18 @@ git clone -b "${branch}" "${github_repo_url}" app 2>/dev/null || (cd app && git 
 chown -R ubuntu:ubuntu /home/ubuntu/app
 
 # Persistent data dirs
-mkdir -p /home/ubuntu/app/data/mariadb /home/ubuntu/app/data/qdrant /home/ubuntu/app/data/redis
+mkdir -p /home/ubuntu/app/data/mariadb /home/ubuntu/app/data/qdrant /home/ubuntu/app/data/redis \
+         /home/ubuntu/app/data/grafana /home/ubuntu/app/data/embed-models /home/ubuntu/app/data/backups
 chown -R ubuntu:ubuntu /home/ubuntu/app/data
 
-echo "Cloud-init done. SSH in, fill backend/.env, then: docker compose up -d --build" > /etc/motd
+# --- Host nginx reverse proxy (compose binds 127.0.0.1; proxy exposes 80/443)
+cp -f /home/ubuntu/app/deployment/nginx/legal.conf /etc/nginx/sites-available/legal.conf
+ln -sf /etc/nginx/sites-available/legal.conf /etc/nginx/sites-enabled/legal.conf
+rm -f /etc/nginx/sites-enabled/default
+nginx -t && systemctl enable nginx && systemctl restart nginx || echo "[cloud-init] nginx config not ready yet (compose not up) — will reload on first deploy"
+
+# --- Nightly backup cron (deployment/scripts/backup.sh -> S3 via instance role)
+chmod +x /home/ubuntu/app/deployment/scripts/backup.sh
+( crontab -l -u ubuntu 2>/dev/null; echo "17 3 * * * /home/ubuntu/app/deployment/scripts/backup.sh >> /home/ubuntu/app/data/backups/backup.log 2>&1" ) | crontab -u ubuntu -
+
+echo "Cloud-init done. First GitHub Actions deploy will: git pull -> assemble .env -> compose pull+up -> reload nginx." > /etc/motd

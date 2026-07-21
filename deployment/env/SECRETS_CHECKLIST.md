@@ -24,11 +24,13 @@
 | `TAVILY_API_KEY` | https://app.tavily.com/api-key | 1k req/tháng | default | Web search tool |
 | `COHERE_API_KEY` | https://dashboard.cohere.com/api-keys | Trial | rerank | Reranker (không có = passthrough, giảm chất lượng) |
 
-## Tier C — Tracing (optional, debug)
+## Tier C — Tracing + alerting (optional, debug)
 
 | Key | Lấy ở đâu | Free | Dùng cho |
 |---|---|---|---|
 | `LANGCHAIN_API_KEY` | https://smith.langchain.com/settings | 5k trace/tháng | LangSmith trace. Set `LANGCHAIN_TRACING_V2=true` |
+| `HF_TOKEN` | https://huggingface.co/settings/tokens | Có | BGE-M3 download (model public — token chỉ để tránh rate limit 429). Bỏ trống OK. |
+| `ALERT_WEBHOOK_URL` | Slack/Teams/Discord incoming webhook | Có | Alertmanager receiver. Bỏ trống = alert đi vào void (placeholder 127.0.0.1:9999). |
 
 ## Tier D — AWS (bắt buộc deploy EC2)
 
@@ -53,6 +55,14 @@
 }
 ```
 > Prod thật: giới hạn `Resource` = ARN cụ thể. Đây là starter.
+
+### EC2 instance role (terraform-managed, KHÔNG cần key tĩnh trên EC2)
+`main.tf` tạo `legal-chatbot-instance-role` + gắn vào EC2. Role này chỉ có
+`s3:PutObject/GetObject/DeleteObject/ListBucket` trên `S3_BACKUP_BUCKET` —
+để `deployment/scripts/backup.sh` chạy `aws s3 cp` mà không cần AWS key trên
+EC2. KHÔNG dùng key này cho CI/terraform — tách biệt hoàn toàn.
+- Backup: cron nightly 03:17 UTC (user_data.sh). Local prune 7 ngày, S3 lifecycle 30 ngày (set bucket lifecycle rule).
+- Verify role gắn: `aws ec2 describe-instances --instance-ids <i-xxx> --query 'Reservations[0].Instances[0].IamInstanceProfile'`
 
 ## Tier E — Container registry (GHCR recommend, free)
 

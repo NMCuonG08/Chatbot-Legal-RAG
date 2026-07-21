@@ -1,0 +1,56 @@
+# ============================================================================
+# Alertmanager — routes Prometheus alerts to a webhook (Slack/Teams/Discord)
+# and optionally AWS SNS.
+# ----------------------------------------------------------------------------
+# Mounted by docker-compose.prod.yml alertmanager service at
+# /etc/alertmanager/alertmanager.yml.
+#
+# Alertmanager does NOT do ${ENV} substitution in this file, so the webhook URL
+# and SNS topic ARN are templated at deploy time (see deploy.yml) or edited by
+# hand. For a quick test, point ALERT_WEBHOOK_URL at a Slack/Discord incoming
+# webhook. SNS is commented — enable by uncommenting + templating creds.
+# ============================================================================
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: webhook-default
+  group_by: ["alertname", "job", "severity"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: ["severity=critical"]
+      receiver: webhook-critical
+      group_wait: 10s
+      repeat_interval: 1h
+
+receivers:
+  - name: webhook-default
+    webhook_configs:
+      - url: "http://127.0.0.1:9999/alert"   # placeholder — template at deploy
+        send_resolved: true
+
+  - name: webhook-critical
+    webhook_configs:
+      - url: "http://127.0.0.1:9999/alert-critical"
+        send_resolved: true
+
+  # --- AWS SNS (advanced) -------------------------------------------------
+  # Uncomment + template AWS creds + topic ARN at deploy time. Requires the
+  # EC2 role or static creds to have sns:Publish on ALERT_SNS_TOPIC_ARN.
+  # - name: sns
+  #   sns_configs:
+  #     - api_url: "https://sns.ap-southeast-1.amazonaws.com"
+  #       sigv4:
+  #         region: "ap-southeast-1"
+  #         access_key: "REPLACE_AWS_ACCESS_KEY_ID"
+  #         secret_key: "REPLACE_AWS_SECRET_ACCESS_KEY"
+  #       topic_arn: "REPLACE_ALERT_SNS_TOPIC_ARN"
+  #       send_resolved: true
+
+inhibit_rules:
+  # If the instance is down, suppress any other alert from that instance.
+  - source_matchers: ["alertname=InstanceDown"]
+    target_matchers: ["alertname=~.*"]
+    equal: ["job"]

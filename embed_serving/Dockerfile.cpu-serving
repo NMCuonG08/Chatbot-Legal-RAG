@@ -18,6 +18,8 @@ RUN pip install --no-cache-dir -r requirements_serving.txt
 # Copy application files
 COPY scripts/serve_model.py .
 COPY scripts/download_model_from_spaces.py .
+COPY scripts/entrypoint.sh .
+RUN chmod +x entrypoint.sh
 
 # Create directories
 RUN mkdir -p /app/models /app/logs
@@ -32,9 +34,9 @@ ENV API_PORT=5000
 ENV DEBUG=false
 ENV MAX_BATCH_SIZE=32
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+# Health check (start-period 300s to allow first-boot 2.2GB model download)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
     CMD curl -f http://localhost:5000/health || exit 1
 
-# Start server
-CMD ["python", "serve_model.py"]
+# Start server (entrypoint downloads BGE-M3 to the model volume on first boot)
+CMD ["./entrypoint.sh"]

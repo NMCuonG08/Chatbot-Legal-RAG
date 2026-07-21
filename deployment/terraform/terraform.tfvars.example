@@ -1,11 +1,19 @@
 # Copy to terraform.tfvars and fill. NEVER commit terraform.tfvars (gitignore it).
+#
+# SSH key: terraform registers legal-prod-key.pub (already in this dir) to AWS.
+# If legal-prod-key / legal-prod-key.pub are missing, generate once:
+#   ssh-keygen -t ed25519 -f legal-prod-key -N "" -C legal-prod
+# Private key (legal-prod-key) stays here — use it for SSH + GitHub secret EC2_SSH_KEY.
 
 aws_region      = "ap-southeast-1"
 instance_type    = "t3.large"        # 8GB RAM for BGE-M3; "t3.medium" if Groq-only
 ebs_size_gb      = 50
-key_pair_name    = "legal-prod-key"  # name only; .pem stays on your machine
 admin_cidr       = "203.0.113.42/32" # YOUR public IP/32 — get from https://ifconfig.me
 s3_backup_bucket = "nmcuong-legal-backups-2026"   # globally unique
 s3_corpus_bucket = "nmcuong-legal-corpus-2026"     # globally unique
 github_repo_url  = "https://github.com/NMCuong08/Chatbot-Legal-RAG.git"
 branch           = "main"
+
+# Billing alert — AWS emails when monthly spend crosses the threshold.
+budget_email        = "you@example.com"   # YOUR email for billing alerts
+budget_limit_amount = "5"                 # USD/month ceiling (test deploy ~$1-2/day)
