@@ -78,6 +78,10 @@ jobs:
           script: |
             set -e
             cd /home/ubuntu/app
+            # Refresh repo so env templates + latest code are present (the clone
+            # from user_data at first boot may be stale). backend/.env + data/
+            # are gitignored -> pull won't conflict with runtime state.
+            git pull --ff-only origin main
             # Assemble backend/.env from template + GitHub secrets (idempotent:
             # re-runs overwrite secrets with latest values, keep non-secret config from template).
             cp -f deployment/env/.env.prod.aws.example backend/.env
