@@ -45,7 +45,7 @@ data "aws_ami" "ubuntu" {
 # ---------- Security Group: chỉ mở 80/443 public, 22 restrict IP -------------
 resource "aws_security_group" "legal_sg" {
   name        = "legal-chatbot-sg"
-  description = "Legal chatbot prod — only 80/443 public, 22 admin IP"
+  description = "Legal chatbot prod - only 80/443 public, 22 admin IP"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
