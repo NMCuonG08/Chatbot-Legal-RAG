@@ -48,23 +48,25 @@ def judge_answer(question: str, answer: str, sources: List[Dict],
     if not answer or len(answer.strip()) < _MIN_ANSWER_LEN:
         return {"score": 0.0, "rationale": "empty_answer", "verdict": "unsupported"}
 
-    # Non-RAG routes (agent_tools / web_search / general_chat) carry no
-    # source chunks, so citation groundedness is not checkable here. Mark
-    # supported by default to avoid blocking those routes — the metacognitive
-    # node still gates on stakes, and the agent route already calls
-    # verify_citation per-assertion inside ReAct.
+    # Phase 5 — agent_tools / web_search now carry source chunks (collected
+    # from retrieval-tool calls / Tavily). Only general_chat legitimately has
+    # none. An empty ``sources`` here is still short-circuited (no citation
+    # material to check) but now LOGGED so a regression on agent/web surfacing
+    # empty sources is visible instead of silently passing.
     if not sources:
+        logger.info("[VERIFY] no sources — citation groundedness skipped (general_chat or agent/web regression)")
         return {
             "score": 1.0,
-            "rationale": "non-RAG route, citation check skipped",
+            "rationale": "no_sources_citation_check_skipped",
             "verdict": "supported",
         }
 
     contexts = [s.get("content", "") for s in sources if s.get("content")]
     if not contexts:
+        logger.info("[VERIFY] sources present but no content — citation groundedness skipped")
         return {
             "score": 1.0,
-            "rationale": "sources present but no content, citation check skipped",
+            "rationale": "sources_present_no_content_citation_check_skipped",
             "verdict": "supported",
         }
 

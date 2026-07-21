@@ -4,6 +4,7 @@ Implements hybrid search combining semantic vector search + BM25 keyword search 
 """
 
 import logging
+import os
 import pickle
 import re
 from pathlib import Path
@@ -11,7 +12,6 @@ from typing import Dict, List, Optional
 
 from llama_index.core import Document
 from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core.retrievers import QueryFusionRetriever
 from llama_index.core.storage.docstore import SimpleDocumentStore
 from llama_index.retrievers.bm25 import BM25Retriever
 
@@ -20,6 +20,38 @@ from config import DEFAULT_COLLECTION_NAME
 from vectorize import search_vector
 
 logger = logging.getLogger(__name__)
+
+# Vietnamese word segmentation for BM25. Vietnamese is not whitespace-tokenized
+# in any meaningful way (compound words like "Đất đai", "thời hiệu" need
+# segmenting to match well). pyvi (ViTokenizer) is a lightweight tokenizer that
+# inserts underscores between syllables of a word, e.g. "Đất_đai" — BM25 then
+# treats each segmented word as a token. Imported lazily + guarded so the
+# module still loads if pyvi is not installed (degrades to raw-text BM25).
+_VI_TOKENIZE_ENABLED = False
+try:
+    from pyvi import ViTokenizer  # type: ignore
+    _VI_TOKENIZE_ENABLED = True
+except Exception:  # noqa: BLE001 — optional dep
+    ViTokenizer = None  # type: ignore
+
+
+def _tokenize_vi(text: str) -> str:
+    """Segment Vietnamese text for BM25 indexing/querying.
+
+    Returns the original text unchanged when pyvi is unavailable so the system
+    keeps working (with weaker BM25) instead of crashing. Logs once on first
+    real use when the tokenizer is missing.
+    """
+    if not text:
+        return ""
+    if _VI_TOKENIZE_ENABLED and ViTokenizer is not None:
+        try:
+            return ViTokenizer.tokenize(text)
+        except Exception as exc:  # noqa: BLE001 — never let tokenizer break search
+            logger.warning("pyvi tokenize failed (%s) — using raw text", exc)
+            return text
+    return text
+
 
 # Global search components
 _docstore = None
@@ -48,7 +80,7 @@ def initialize_search_index(documents: List[Dict]) -> bool:
         for i, doc in enumerate(documents):
             if not doc.get('question') and not doc.get('content'):
                 continue
-            text = f"{doc.get('question', '')} {doc.get('content', '')}"
+            text = _tokenize_vi(f"{doc.get('question', '')} {doc.get('content', '')}")
             node = TextNode(
                 text=text,
                 id_=str(doc.get('doc_id', i)),
@@ -114,8 +146,8 @@ def hybrid_search(query: str, limit: int = 10) -> List[Dict]:
             return vector_search_fallback(query, limit)
     
     try:
-        # 1. BM25 keyword search
-        bm25_results = _bm25_retriever.retrieve(query)
+        # 1. BM25 keyword search (query segmented with pyvi for Vietnamese match)
+        bm25_results = _bm25_retriever.retrieve(_tokenize_vi(query))
         logger.info(f"🔍 BM25 search returned {len(bm25_results)} results")
         
         # 2. Vector semantic search
@@ -256,9 +288,17 @@ def combine_search_results(bm25_results, vector_results, query: str) -> List[Dic
         else:
             all_docs[doc_key] = doc
             
-    # Calculate RRF Scores
-    w_vector = 1.15
-    w_bm25 = 1.0
+    # Calculate RRF Scores. Weights are configurable via env so ops can tune
+    # vector vs BM25 emphasis per deployment without a redeploy of code.
+    # Defaults preserve the prior hand-tuned values (vector slightly favored).
+    try:
+        w_vector = float(os.environ.get("RRF_W_VECTOR", "1.15"))
+    except ValueError:
+        w_vector = 1.15
+    try:
+        w_bm25 = float(os.environ.get("RRF_W_BM25", "1.0"))
+    except ValueError:
+        w_bm25 = 1.0
     hybrid_count = bm25_only_count = vector_only_count = 0
     for doc_key, doc in all_docs.items():
         rrf_score = 0.0
@@ -294,6 +334,73 @@ def combine_search_results(bm25_results, vector_results, query: str) -> List[Dic
         
     logger.info(f"✅ Combined search results: {len(all_docs)} total documents")
     return list(all_docs.values())
+
+
+def _minmax(values: List[float]) -> List[float]:
+    """Normalize a list of floats to [0, 1]. Returns zeros if all equal/empty."""
+    if not values:
+        return []
+    lo = min(values)
+    hi = max(values)
+    if hi - lo <= 1e-12:
+        return [1.0 for _ in values]
+    return [(v - lo) / (hi - lo) for v in values]
+
+
+def blend_hybrid_rerank(docs: List[Dict], alpha: Optional[float] = None) -> List[Dict]:
+    """Blend RRF ``hybrid_score`` with reranker ``relevance_score``.
+
+    ``final_score = alpha * norm(hybrid_score) + (1 - alpha) * norm(relevance_score)``
+
+    Both scores live on different scales (RRF is a small reciprocal-rank sum;
+    Cohere/BGE relevance is a probability-ish float), so each list is min-max
+    normalized to [0, 1] before blending. Re-sort by ``final_score``.
+
+    - ``alpha``: weight on the hybrid score; ``None`` reads ``RRF_BLEND_ALPHA``
+      env (default 0.6 — favor hybrid ranking, let reranker reorder ties).
+    - Docs missing ``relevance_score`` (e.g. rerank passthrough /
+      ``rerank_failed=True``) fall back to their normalized hybrid score alone,
+      so a reranker outage degrades gracefully instead of zeroing scores.
+    """
+    if alpha is None:
+        try:
+            alpha = float(os.environ.get("RRF_BLEND_ALPHA", "0.6"))
+        except ValueError:
+            alpha = 0.6
+    alpha = max(0.0, min(1.0, alpha))
+
+    if not docs:
+        return []
+
+    hybrid_scores = [float(d.get("hybrid_score", 0.0) or 0.0) for d in docs]
+    rel_scores = [
+        float(d["relevance_score"]) if d.get("relevance_score") is not None else None
+        for d in docs
+    ]
+    norm_hybrid = _minmax(hybrid_scores)
+    # Normalize only over docs that actually have a rerank score.
+    present_rel = [v for v in rel_scores if v is not None]
+    rel_lo = min(present_rel) if present_rel else 0.0
+    rel_hi = max(present_rel) if present_rel else 0.0
+    rel_span = (rel_hi - rel_lo) if (rel_hi - rel_lo) > 1e-12 else 1.0
+
+    out: List[Dict] = []
+    for i, doc in enumerate(docs):
+        d = dict(doc)
+        h = norm_hybrid[i] if i < len(norm_hybrid) else 0.0
+        r = rel_scores[i]
+        if r is None:
+            # No rerank signal (passthrough) — keep hybrid ranking only.
+            d["final_score"] = h
+            d["blended"] = False
+        else:
+            nr = (r - rel_lo) / rel_span if rel_span > 1e-12 else 1.0
+            d["final_score"] = alpha * h + (1.0 - alpha) * nr
+            d["blended"] = True
+        out.append(d)
+
+    out.sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
+    return out
 
 
 def search_engine() -> bool:
@@ -441,7 +548,7 @@ def _bg_rebuild_cache(limit: int, qdrant_count: int, cache_dir: Path, metadata_p
         for i, doc in enumerate(documents):
             if not doc.get('question') and not doc.get('content'):
                 continue
-            text = f"{doc.get('question', '')} {doc.get('content', '')}"
+            text = _tokenize_vi(f"{doc.get('question', '')} {doc.get('content', '')}")
             node = TextNode(
                 text=text,
                 id_=str(doc.get('doc_id', i)),

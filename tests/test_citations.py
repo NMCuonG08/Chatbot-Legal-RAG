@@ -259,3 +259,35 @@ def test_render_sources_drawers_html_web():
     # Should have original page view button for web source
     assert 'Xem trang gốc' in drawers_html
     assert 'href="https://vbpl.vn/168"' in drawers_html
+
+
+# ---- strip_trailing_references ----
+
+def test_strip_trailing_references_removes_llm_reference_block():
+    raw_answer = (
+        "Mọi công dân đều bình đẳng trước pháp luật [1].\n\n"
+        "**Tài liệu tham khảo:**\n"
+        "[1] Số định danh cá nhân là gì? - thuvienphapluat.vn\n\n"
+        "*Lưu ý: Thông tin mang tính chất tham khảo.*"
+    )
+    cleaned = citations.strip_trailing_references(raw_answer)
+    assert "**Tài liệu tham khảo:**" not in cleaned
+    assert "[1] Số định danh cá nhân là gì?" not in cleaned
+    assert "Mọi công dân đều bình đẳng trước pháp luật [1]." in cleaned
+    assert "*Lưu ý: Thông tin mang tính chất tham khảo.*" in cleaned
+
+
+def test_strip_trailing_references_leaves_clean_answer():
+    raw_answer = "Theo quy định tại Điều 12 Luật Căn cước [1], công dân được cấp số định danh."
+    cleaned = citations.strip_trailing_references(raw_answer)
+    assert cleaned == raw_answer
+
+
+def test_normalize_sources_uses_origin_url_or_link_if_present():
+    docs = [
+        {"content": "x", "origin_url": "https://thuvienphapluat.vn/doc1", "law_name": "Luật 1"},
+        {"content": "y", "link": "https://chinhphu.vn/doc2", "law_name": "Luật 2"},
+    ]
+    out = citations.normalize_sources(docs, kind="corpus")
+    assert out[0]["url"] == "https://thuvienphapluat.vn/doc1"
+    assert out[1]["url"] == "https://chinhphu.vn/doc2"

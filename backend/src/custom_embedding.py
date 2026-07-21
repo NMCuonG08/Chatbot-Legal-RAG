@@ -218,6 +218,44 @@ class CustomEmbeddingService:
                 
         return all_embeddings
 
+    def _ollama_cloud_batch_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Generate a batch of embeddings using Ollama Cloud API as fallback."""
+        base_url = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com").rstrip("/")
+        model = os.environ.get("OLLAMA_LLM_MODEL", "gemma4:31b")
+        api_key = os.environ.get("OLLAMA_API_KEY")
+        
+        headers = {
+            "Content-Type": "application/json"
+        }
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+            
+        endpoint = f"{base_url}/v1/embeddings"
+        logger.info(f"☁️ Generating {len(texts)} embeddings on Ollama Cloud ({endpoint}, model={model})...")
+        
+        try:
+            # Upgrade non-localhost http to https (same as brain.py logic)
+            if endpoint.startswith("http://") and "localhost" not in endpoint and "127.0.0.1" not in endpoint:
+                endpoint = "https://" + endpoint[len("http://"):]
+                
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                json={"model": model, "input": texts},
+                timeout=30
+            )
+            if response.status_code == 200:
+                data = response.json()
+                embeddings_data = data.get("data", [])
+                # Sort by index to preserve order
+                embeddings_data.sort(key=lambda x: x.get("index", 0))
+                return [emb["embedding"] for emb in embeddings_data]
+            else:
+                raise Exception(f"Ollama API returned status {response.status_code}: {response.text}")
+        except Exception as e:
+            logger.error(f"❌ Ollama Cloud embedding failed: {e}")
+            raise e
+
     def _local_batch_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Generate a batch of embeddings using local SentenceTransformer (bge-m3), fallback to sequential _local_embedding."""
         try:
@@ -261,8 +299,17 @@ class CustomEmbeddingService:
                 logger.info(f"☁️ Generating {len(texts)} embeddings on Cohere Cloud to save local machine resources...")
                 embeddings = self._cohere_batch_embeddings(texts)
                 return embeddings[0] if is_single else embeddings
-            except Exception:
-                logger.warning("⚠️ Cohere cloud embedding failed, falling back to local/Ollama methods.")
+            except Exception as e:
+                logger.warning(f"⚠️ Cohere cloud embedding failed ({e}), falling back to Ollama Cloud.")
+
+        # Try Ollama Cloud embeddings as second cloud fallback before running local models
+        ollama_base = os.environ.get("OLLAMA_BASE_URL")
+        if ollama_base and not self.service_available:
+            try:
+                embeddings = self._ollama_cloud_batch_embeddings(texts)
+                return embeddings[0] if is_single else embeddings
+            except Exception as e:
+                logger.warning(f"⚠️ Ollama Cloud embedding failed ({e}), falling back to local methods.")
 
         if USE_LOCAL_EMBEDDING_FALLBACK and not self.service_available:
             logger.warning("⚠️ Custom embedding service unavailable, using local fallback embeddings")
@@ -299,6 +346,26 @@ class CustomEmbeddingService:
 
         except Exception as e:
             logger.error(f"❌ Error getting embedding from custom service: {e}")
+            
+            # Try cloud fallbacks first
+            cohere_api_key = os.environ.get("COHERE_API_KEY")
+            if cohere_api_key:
+                try:
+                    logger.info("☁️ Falling back to Cohere Cloud embeddings after custom service failure...")
+                    embeddings = self._cohere_batch_embeddings(texts)
+                    return embeddings[0] if is_single else embeddings
+                except Exception:
+                    pass
+                    
+            ollama_base = os.environ.get("OLLAMA_BASE_URL")
+            if ollama_base:
+                try:
+                    logger.info("☁️ Falling back to Ollama Cloud embeddings after custom service failure...")
+                    embeddings = self._ollama_cloud_batch_embeddings(texts)
+                    return embeddings[0] if is_single else embeddings
+                except Exception:
+                    pass
+                    
             if USE_LOCAL_EMBEDDING_FALLBACK:
                 logger.warning("⚠️ Falling back to local embeddings after remote embedding failure")
                 self.service_available = False

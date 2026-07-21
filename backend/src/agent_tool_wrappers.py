@@ -16,9 +16,13 @@ import logging
 from llama_index.core.tools import FunctionTool
 
 import config
-from agent_tool_tracking import track_tool_call
+from agent_tool_tracking import record_agent_source, track_tool_call
 from sandbox import run_in_sandbox
-from legal_graph_tools import recall_legal_graph_tool
+from legal_graph_tools import (
+    recall_legal_graph,
+    recall_legal_graph_relations,
+    recall_legal_graph_tool,
+)
 from legal_tools import (
     calculate_contract_penalty,
     calculate_inheritance_share,
@@ -242,7 +246,8 @@ def web_search_tool(query: str, max_results: int = 5) -> str:
         Kết quả tìm kiếm với tiêu đề, link và nội dung tóm tắt
     """
     try:
-        return search_engine(query, top_k=max_results)
+        from tavily_tool import tavily_search_legal
+        return tavily_search_legal(query, max_results=max_results)
     except Exception as e:
         logger.error(f"Web search error: {e}")
         return f"Lỗi tìm kiếm: {str(e)}"
@@ -327,6 +332,16 @@ def article_lookup_tool(law_name: str, article_number: int = 0, limit: int = 5) 
     try:
         art = article_number if article_number and article_number > 0 else None
         result = lookup_article(law_name, art, limit=limit)
+        # Surface retrieved matches as verify_answer sources (closes the
+        # agent-route sources=[] gap — see agent_tool_tracking.agent_sources).
+        for m in result.get("matches", []) if isinstance(result, dict) else []:
+            record_agent_source({
+                "doc_id": m.get("doc_id"),
+                "content": m.get("content", ""),
+                "source": m.get("source", "legal_corpus"),
+                "law_name": m.get("law_name") or law_name,
+                "article_number": m.get("article_number") or art,
+            })
         return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"article_lookup_tool error: {e}")
@@ -346,6 +361,14 @@ def precedent_lookup_tool(fact_pattern: str, limit: int = 5) -> str:
     """
     try:
         result = precedent_lookup(fact_pattern, limit=limit)
+        for m in result.get("precedents", []) if isinstance(result, dict) else []:
+            record_agent_source({
+                "doc_id": m.get("doc_id"),
+                "content": m.get("content", ""),
+                "source": m.get("source", "case_law"),
+                "law_name": m.get("law_name"),
+                "article_number": m.get("article_number"),
+            })
         return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"precedent_lookup_tool error: {e}")
@@ -364,6 +387,14 @@ def cross_reference_tool(law_name: str, article_number: int, limit: int = 5) -> 
     """
     try:
         result = cross_reference(law_name, article_number, limit=limit)
+        for m in result.get("referencing_texts", []) if isinstance(result, dict) else []:
+            record_agent_source({
+                "doc_id": m.get("doc_id"),
+                "content": m.get("content", ""),
+                "source": m.get("source", "legal_corpus"),
+                "law_name": m.get("law_name") or law_name,
+                "article_number": m.get("article_number"),
+            })
         return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"cross_reference_tool error: {e}")
@@ -386,6 +417,15 @@ def verify_citation_tool(law_name: str, article_number: int, claimed_text: str) 
     """
     try:
         result = verify_citation(law_name, article_number, claimed_text)
+        best = result.get("best_match") if isinstance(result, dict) else None
+        if isinstance(best, dict) and best.get("content"):
+            record_agent_source({
+                "doc_id": best.get("doc_id"),
+                "content": best.get("content", ""),
+                "source": best.get("source", "legal_corpus"),
+                "law_name": best.get("law_name") or law_name,
+                "article_number": best.get("article_number") or article_number,
+            })
         return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"verify_citation_tool error: {e}")
@@ -717,6 +757,116 @@ recall_user_memory_func_tool = FunctionTool.from_defaults(fn=recall_user_memory_
 # Phase 3 — Neo4j legal knowledge-graph recall (multi-hop citation traversal).
 recall_legal_graph_func_tool = FunctionTool.from_defaults(fn=recall_legal_graph_tool)
 
+# Phase 4 latency — unified parallel legal search. Fans out article_lookup +
+# cross_reference + graph recall + graph cross-ref edges + precedent_lookup
+# in ONE call via ThreadPoolExecutor, merging results the agent would otherwise
+# fetch sequentially (call -> think -> call -> think -> ... = N round trips).
+# Collapses the "search -> empty -> search again" ReAct thrash into a single
+# comprehensive parallel retrieval. Agent calls this ONCE; if it returns empty
+# across ALL sub-calls, the empty-streak guard (agent_tool_tracking) stops the
+# next retry. 1 tool call replaces up to 5 sequential ones.
+@track_tool_call
+def unified_legal_search_tool(query: str, limit: int = 5) -> str:
+    """Tra cứu pháp luật TỔNG HỢP song song trong 1 lần — thay vì gọi nhiều tool tuần tự.
+
+    Dùng khi cần tra cứu kho luật nội bộ (điều luật cụ thể, dẫn chiếu, án lệ liên quan).
+    Tự parse tên luật + số điều từ query, rồi chạy song song: article_lookup +
+    cross_reference + đồ thị tri thức (Neo4j) + cạnh dẫn chiếu + án lệ. Gộp kết quả,
+    dedup. NÊN dùng thay vì gọi article_lookup_tool / cross_reference_tool /
+    recall_legal_graph_tool riêng lẻ — tiết kiệm 3-5 lượt LLM round-trip.
+
+    Args:
+        query: Câu hỏi/điều luật cần tra, ví dụ "Điều 418 Bộ luật Dân sự 2015 nói gì,
+            bị dẫn chiếu bởi điều nào?".
+        limit: Số kết quả tối đa mỗi nguồn (mặc định 5).
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from legal_metadata import extract_legal_metadata
+
+    meta = extract_legal_metadata(query)
+    law_name = meta.get("law_name") or ""
+    article_number = meta.get("article_number") or 0
+    art = article_number if article_number and article_number > 0 else None
+
+    def _article():
+        if law_name:
+            return lookup_article(law_name, art, limit=limit)
+        return {"matches": [], "note": "no law_name parsed — article_lookup skipped"}
+
+    def _xref():
+        if law_name and art:
+            return cross_reference(law_name, art, limit=limit)
+        return {"referencing_texts": [], "note": "no law+article parsed — cross_ref skipped"}
+
+    def _graph():
+        return recall_legal_graph(query, limit=limit).get("articles", [])
+
+    def _graph_rel():
+        return recall_legal_graph_relations(query, limit=limit, direction="out").get("relations", [])
+
+    def _precedent():
+        return precedent_lookup(query, limit=limit).get("precedents", [])
+
+    out: dict = {}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {
+            ex.submit(_article): "article",
+            ex.submit(_xref): "cross_reference",
+            ex.submit(_graph): "graph_articles",
+            ex.submit(_graph_rel): "graph_relations",
+            ex.submit(_precedent): "precedents",
+        }
+        for fut in as_completed(futs):
+            key = futs[fut]
+            try:
+                out[key] = fut.result()
+            except Exception as exc:  # one sub-call failing must not sink the rest
+                logger.warning("unified_legal_search sub-call %s failed: %s", key, exc)
+                out[key] = {"error": str(exc)}
+
+    # Surface article + precedent matches as verify_answer sources (mirrors the
+    # per-tool record_agent_source calls so the unified tool is not a sources gap).
+    art_out = out.get("article")
+    if isinstance(art_out, dict):
+        for m in art_out.get("matches", []):
+            if isinstance(m, dict):
+                record_agent_source({
+                    "doc_id": m.get("doc_id"),
+                    "content": m.get("content", ""),
+                    "source": m.get("source", "legal_corpus"),
+                    "law_name": m.get("law_name") or law_name,
+                    "article_number": m.get("article_number") or art,
+                })
+    for p in out.get("precedents", []) or []:
+        if isinstance(p, dict):
+            record_agent_source({
+                "doc_id": p.get("doc_id"),
+                "content": p.get("content", ""),
+                "source": p.get("source", "case_law"),
+                "law_name": p.get("law_name"),
+                "article_number": p.get("article_number"),
+            })
+
+    # Aggregate empty signal so the empty-streak guard treats a fully-empty
+    # unified call as one empty result (all 5 sources returned nothing).
+    xref_out = out.get("cross_reference")
+    xref_hits = len(xref_out.get("referencing_texts", [])) if isinstance(xref_out, dict) else 0
+    art_hits = len(art_out.get("matches", [])) if isinstance(art_out, dict) else 0
+    total_hits = (
+        art_hits + xref_hits
+        + len(out.get("graph_articles", []) or [])
+        + len(out.get("graph_relations", []) or [])
+        + len(out.get("precedents", []) or [])
+    )
+    out["law_name"] = law_name
+    out["article_number"] = article_number
+    out["total_hits"] = total_hits
+    return json.dumps(out, ensure_ascii=False, indent=2, default=str)
+
+
+unified_legal_search_func_tool = FunctionTool.from_defaults(fn=unified_legal_search_tool)
+
 # All available tools for agent
 all_tools = [
     # Legal calc tools
@@ -754,4 +904,6 @@ all_tools = [
     recall_user_memory_func_tool,
     # Phase 3 — Neo4j graph recall (multi-hop citation traversal)
     recall_legal_graph_func_tool,
+    # Phase 4 latency — unified parallel legal search (1 call replaces N sequential)
+    unified_legal_search_func_tool,
 ]

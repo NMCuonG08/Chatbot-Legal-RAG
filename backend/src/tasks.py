@@ -36,7 +36,7 @@ from agent import ai_agent_handle, clear_user_runtime_caches
 from verify_answer import judge_answer
 from metacognitive import build_escalation, ESCALATION_PREFIX
 from rlhf_store import find_similar_good
-from citations import CITATION_RULE, normalize_sources
+from citations import CITATION_RULE, normalize_sources, strip_trailing_references
 from brain import (
     detect_route,
     detect_user_intent,
@@ -91,7 +91,12 @@ from models import (
 )
 from query_rewriter import rewrite_query_to_multi_queries, rewrite_query_with_context
 from rerank import rerank_documents
-from search import hybrid_search, search_engine  # Import new hybrid search
+from search import hybrid_search, search_engine, blend_hybrid_rerank  # Import new hybrid search
+from legal_graph_tools import (
+    MULTI_HOP_KEYWORDS,
+    recall_legal_graph,
+    recall_legal_graph_relations,
+)
 from splitter import split_document
 from summarizer import summarize_text
 from tavily_tool import tavily_search
@@ -573,8 +578,13 @@ def generate_rag_answer(history, question, user_id=None):
         retrieved_docs = retrieve_with_multi_query_fallback(query_variations, top_k=4)
 
     logger.info(f"Retrieved {len(retrieved_docs)} documents before reranking")
-    ranked_docs = rerank_documents(retrieved_docs, standalone_question, top_n=5)
-    logger.info(f"Top {len(ranked_docs)} documents after reranking")
+    _rerank_n = int(os.environ.get("RRF_TOP_N", "5"))
+    ranked_docs = rerank_documents(retrieved_docs, standalone_question, top_n=_rerank_n)
+    # Blend RRF hybrid_score with rerank relevance_score (env RRF_BLEND_ALPHA,
+    # default 0.6 hybrid / 0.4 rerank). Passthrough docs (rerank_failed) keep
+    # their hybrid ranking only, so a reranker outage degrades gracefully.
+    ranked_docs = blend_hybrid_rerank(ranked_docs)
+    logger.info(f"Top {len(ranked_docs)} documents after reranking + blend")
 
     # Episodic memory retrieval (delegated to shared helper, reused by CRAG generate_node)
     episodic_context = _retrieve_episodic_context(user_id, standalone_question)
@@ -609,13 +619,14 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
         + [
             {
                 "role": "user",
-                "content": f"Tài liệu tham khảo:\n{doc_context}\n\nCâu hỏi: {question}\n\nHãy trả lời dựa trên các tài liệu pháp luật trên.",
+                "content": f"Dữ liệu được cung cấp:\n{doc_context}\n\nCâu hỏi: {question}\n\nHãy trả lời dựa trên các tài liệu pháp luật trên.",
             }
         ]
     )
 
     logger.info(f"Sending {len(openai_messages)} messages to Vietnamese LLM")
     assistant_answer = vietnamese_llm_chat_complete(openai_messages)
+    assistant_answer = strip_trailing_references(assistant_answer)
     logger.info("Bot RAG reply generated successfully")
     
     # RAG Hallucination Guardrail Check
@@ -625,6 +636,7 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
             assistant_answer = run_async(
                 guardrails_manager.verify_output_rag(assistant_answer, doc_context)
             )
+            assistant_answer = strip_trailing_references(assistant_answer)
         except Exception as e:
             logger.error(f"Error running output RAG guardrails: {e}")
 
@@ -636,11 +648,11 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
 def generate_agent_answer(history, question, user_id=None, conversation_id=None, role=None,
                           run_id=None, thread_id=None):
     logger.info("Using ReAct agent with tools")
-    answer, tool_calls = ai_agent_handle(
+    answer, tool_calls, sources = ai_agent_handle(
         question, user_id, conversation_id, history=history, role=role,
         run_id=run_id, thread_id=thread_id,
     )
-    return answer, tool_calls
+    return answer, tool_calls, sources
 
 
 def _maybe_block_on_approval(state, question, history, role, user_id, run_id):
@@ -704,8 +716,8 @@ def generate_web_search_answer(history, question):
     ``[n]`` citation popovers linking to the actual pages — not ``sources: []``
     like before.
     """
-    logger.info("Using Tavily web search for query")
-    raw = tavily_search(f"Việt Nam pháp luật: {question}", max_results=5, search_depth="advanced")
+    search_q = question if ("Việt Nam" in question or "vietnam" in question.lower()) else f"{question} Việt Nam"
+    raw = tavily_search(search_q, max_results=5, search_depth="advanced")
     results = raw.get("results", []) if isinstance(raw, dict) else []
 
     # Numbered context block so CITATION_RULE's [n] markers resolve to these
@@ -733,6 +745,7 @@ def generate_web_search_answer(history, question):
     )
 
     answer = openai_chat_complete(openai_messages)
+    answer = strip_trailing_references(answer)
     sources = normalize_sources(results, kind="web")
     return answer, sources
 
@@ -896,10 +909,45 @@ def _build_chat_graph():
         except Exception as e:
             logger.warning(f"Hybrid search failed, vector fallback: {e}")
             retrieved = retrieve_with_multi_query_fallback(query_variations, top_k=4)
+
+        # Phase 4 — for multi-hop queries (citation chains, "điều nào dẫn chiếu",
+        # "còn hiệu lực"), also pull articles + cross-reference edges from the
+        # Neo4j graph and merge them in before rerank. Graph is best-effort: a
+        # down/absent Neo4j returns [] and we proceed with vector hits only.
+        q_lower = question.lower()
+        if any(kw in q_lower for kw in MULTI_HOP_KEYWORDS):
+            try:
+                graph_hits = recall_legal_graph(question, limit=5).get("articles", [])
+                rel_out = recall_legal_graph_relations(question, limit=5, direction="out").get("relations", [])
+                rel_in = recall_legal_graph_relations(question, limit=5, direction="in").get("relations", [])
+                seen_ids = {d.get("id") or d.get("chunk_id") for d in retrieved}
+                for row in (graph_hits + rel_out + rel_in):
+                    cid = f"graph::{row.get('law','')}::{row.get('number','')}"
+                    if cid in seen_ids:
+                        continue
+                    seen_ids.add(cid)
+                    retrieved.append({
+                        "id": cid,
+                        "chunk_id": cid,
+                        "title": f"Điều {row.get('number','')} {row.get('law','')}".strip(),
+                        "content": row.get("text", ""),
+                        "law_name": row.get("law"),
+                        "article_number": row.get("number"),
+                        "effectivity_status": None,
+                        "hybrid_score": 0.0,  # graph-sourced; rerank will score it
+                        "source": "graph",
+                    })
+                logger.info(f"Retrieve node: merged {len(graph_hits)+len(rel_out)+len(rel_in)} graph hits for multi-hop query")
+            except Exception as exc:  # noqa: BLE001 — graph is additive
+                logger.warning(f"Graph multi-hop recall skipped: {exc}")
+
         # Rerank here so docs carry relevance_score for the grade node.
-        ranked = rerank_documents(retrieved, question, top_n=5)
+        _rerank_n = int(os.environ.get("RRF_TOP_N", "5"))
+        ranked = rerank_documents(retrieved, question, top_n=_rerank_n)
         # Phase 4 — RLHF rerank boost (user-scoped 👍-marked source up-weight).
         ranked = _apply_rlhf_rerank_boost(ranked, user_id, question)
+        # Blend RRF hybrid_score with (boosted) rerank relevance_score.
+        ranked = blend_hybrid_rerank(ranked)
         logger.info(f"Retrieve node: {len(ranked)} reranked docs for query: {question[:80]}")
         _trace_node_end(state, "retrieve", {"query": question[:200], "doc_count": len(ranked)})
         return {"documents": ranked}
@@ -975,7 +1023,7 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
                 {
                     "role": "user",
                     "content": (
-                        f"Tài liệu tham khảo:\n{doc_context}\n\n"
+                        f"Dữ liệu được cung cấp:\n{doc_context}\n\n"
                         f"Câu hỏi: {question}\n\nHãy trả lời dựa trên các tài liệu pháp luật trên."
                     ),
                 }
@@ -1000,6 +1048,7 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
             logger.warning("RLHF few-shot injection failed (non-blocking): %s", exc)
 
         assistant_answer = vietnamese_llm_chat_complete(openai_messages)
+        assistant_answer = strip_trailing_references(assistant_answer)
         logger.info("CRAG generate_node reply generated")
 
         # RAG groundedness guardrail + legal disclaimer (replaces old legal_rag_node behavior)
@@ -1008,6 +1057,7 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
                 assistant_answer = run_async(
                     guardrails_manager.verify_output_rag(assistant_answer, doc_context)
                 )
+                assistant_answer = strip_trailing_references(assistant_answer)
             except Exception as e:
                 logger.error(f"Error running output RAG guardrails: {e}")
             assistant_answer = guardrails_manager.add_legal_disclaimer(assistant_answer, question)
@@ -1041,7 +1091,7 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
             _trace_node_end(state, "agent_tools", {"approval_gate": True})
             return {"response": gate_resp, "sources": [], "tool_calls": []}
 
-        resp, tool_calls = generate_agent_answer(
+        resp, tool_calls, agent_sources_list = generate_agent_answer(
             history, question, user_id=user_id, conversation_id=thread_id, role=role,
             run_id=run_id, thread_id=thread_id,
         )
@@ -1057,9 +1107,12 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
             update = dict(cmd.update)
             update["standalone_question"] = question
             update["tool_calls"] = tool_calls
+            update["sources"] = agent_sources_list
             return Command(goto=cmd.goto, update=update)
 
-        return {"response": resp, "sources": [], "tool_calls": tool_calls}
+        # Phase 5 — carry retrieval-tool sources into verify_answer so the agent
+        # route is judged for citation groundedness instead of short-circuited.
+        return {"response": resp, "sources": agent_sources_list, "tool_calls": tool_calls}
 
     def web_search_node(state: ChatGraphState):
         history = state.get("history", [])
@@ -1085,8 +1138,9 @@ LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG ba
 
     # ---- PEV verify_answer (Phase F) ----
     # Judge the final answer for citation groundedness + hallucination.
-    # Only the RAG route carries real sources; agent/web/general return
-    # sources=[] and judge_answer short-circuits to "supported".
+    # RAG + agent_tools + web_search carry real sources (agent via the
+    # agent_sources contextvar; web via Tavily). Only general_chat carries
+    # sources=[] and is short-circuited (logged) by judge_answer.
     def verify_answer_node(state: ChatGraphState):
         question = state.get("standalone_question") or state.get("question", "")
         answer = state.get("response", "")

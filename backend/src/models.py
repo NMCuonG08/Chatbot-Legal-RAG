@@ -263,6 +263,17 @@ class DocumentChunk(Base):
     chunk_id = Column(String(50), nullable=False, index=True)     # UUID string or integer string
     chunk_hash = Column(String(64), nullable=False)               # MD5 hash of chunk text
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Structured legal metadata (Phase 1 upgrade). All nullable: only chunks
+    # whose text actually cites a statute/law get these. Populated at ingest
+    # from ``legal_metadata.extract_legal_metadata`` + ``legal_effectivity``.
+    law_name = Column(String(300), nullable=True, index=True)
+    article_number = Column(Integer, nullable=True, index=True)
+    clause_number = Column(Integer, nullable=True)
+    point_letter = Column(String(10), nullable=True)
+    document_number = Column(Integer, nullable=True, index=True)
+    document_year = Column(Integer, nullable=True, index=True)
+    document_type = Column(String(20), nullable=True, index=True)
+    effectivity_status = Column(String(20), nullable=True, index=True)
 
 
 class UserEpisode(Base):
@@ -642,6 +653,53 @@ def ensure_database_schema():
             except Exception as alter_err:
                 db.rollback()
                 logger.error(f"Failed to add 'sources' column: {alter_err}")
+        finally:
+            db.close()
+
+        # Phase 1 upgrade — structured legal metadata on document_chunks.
+        # create_all does not ALTER existing tables, so add each new column
+        # idempotently: probe with a SELECT, ALTER on missing-column error.
+        _new_chunk_columns = [
+            ("law_name", "VARCHAR(300)"),
+            ("article_number", "INTEGER"),
+            ("clause_number", "INTEGER"),
+            ("point_letter", "VARCHAR(10)"),
+            ("document_number", "INTEGER"),
+            ("document_year", "INTEGER"),
+            ("document_type", "VARCHAR(20)"),
+            ("effectivity_status", "VARCHAR(20)"),
+        ]
+        db = _new_db_session()
+        try:
+            for col_name, col_type in _new_chunk_columns:
+                try:
+                    db.execute(
+                        text(f"SELECT {col_name} FROM document_chunks LIMIT 1")
+                    )
+                except Exception:
+                    db.rollback()
+                    logger.info(
+                        "Adding '%s' column to 'document_chunks' table...",
+                        col_name,
+                    )
+                    try:
+                        db.execute(
+                            text(
+                                f"ALTER TABLE document_chunks ADD COLUMN {col_name} {col_type}"
+                            )
+                        )
+                        db.commit()
+                        logger.info(
+                            "Successfully added '%s' column to document_chunks.",
+                            col_name,
+                        )
+                    except Exception as alter_err:
+                        db.rollback()
+                        logger.error(
+                            "Failed to add '%s' column to document_chunks: %s",
+                            col_name,
+                            alter_err,
+                        )
         finally:
             db.close()
     except Exception as e:

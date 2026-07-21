@@ -30,6 +30,8 @@ from llama_index.core.llms.callbacks import llm_chat_callback, llm_completion_ca
 
 from retry_utils import with_retry, awith_retry
 
+import config  # AGENT_MAX_ITERATIONS, AGENT_RUN_TIMEOUT_S — ReAct latency guards
+
 # Re-export tracking symbols for back-compat (tests/eval import via `agent.*`).
 from agent_tool_tracking import (  # noqa: F401
     agent_tool_calls,
@@ -37,8 +39,11 @@ from agent_tool_tracking import (  # noqa: F401
     agent_user_id,
     agent_run_id,
     agent_thread_id,
+    agent_sources,
+    agent_empty_streak,
+    agent_prev_tool_args,
 )
-from agent_tool_wrappers import all_tools  # noqa: F401
+from citations import strip_trailing_references
 
 logger = logging.getLogger(__name__)
 
@@ -675,7 +680,7 @@ def _build_react_agent(
             llm=llm,
             memory=memory,
             verbose=True,
-            max_iterations=10,
+            max_iterations=config.AGENT_MAX_ITERATIONS,
             context=prompt,
         )
 
@@ -700,7 +705,7 @@ def ai_agent_handle(
     role: Optional[str] = None,
     run_id: Optional[str] = None,
     thread_id: Optional[str] = None,
-) -> Tuple[str, List[Dict]]:
+) -> Tuple[str, List[Dict], List[Dict]]:
     """
     Handle user question using ReAct agent with tools.
 
@@ -713,14 +718,25 @@ def ai_agent_handle(
             + rolling summary. The current question is NOT in history.
 
     Returns:
-        ``(response_text, tool_calls)`` where tool_calls is a list of
+        ``(response_text, tool_calls, sources)`` where tool_calls is a list of
         ``{tool_name, args, status, error, result}`` dicts captured during this
-        run via the ``agent_tool_calls`` contextvar.
+        run via the ``agent_tool_calls`` contextvar, and sources is the list of
+        source chunks surfaced by retrieval tools (article_lookup /
+        cross_reference / verify_citation / precedent_lookup) captured via the
+        ``agent_sources`` contextvar — handed to verify_answer so the agent
+        route no longer carries ``sources=[]`` and skips citation groundedness.
     """
     # Reset the tool-call accumulator for this run so @track_tool_call records
     # only this turn's calls. contextvars propagate into asyncio.run coroutines.
     token = agent_tool_calls.set([])
     user_token = agent_user_id.set(user_id)
+    # Reset the source accumulator so retrieval tools record only this turn's
+    # sources (see agent_tool_tracking.record_agent_source).
+    src_token = agent_sources.set([])
+    # Reset the empty-result no-retry guard state so streak/prev-args start clean
+    # (see agent_tool_tracking.should_block_repeat / mark_tool_empty).
+    streak_token = agent_empty_streak.set(0)
+    prev_args_token = agent_prev_tool_args.set({})
     # Trace identity for per-tool-call events (None outside a graph run => silent).
     rid_token = agent_run_id.set(run_id)
     tid_token = agent_thread_id.set(thread_id)
@@ -732,6 +748,7 @@ def ai_agent_handle(
             return (
                 "Xin lỗi, hệ thống AI agent chưa sẵn sàng do thiếu cấu hình GROQ_API_KEY. "
                 "Vui lòng kiểm tra biến môi trường và thử lại.",
+                [],
                 [],
             )
 
@@ -763,6 +780,7 @@ def ai_agent_handle(
             return (
                 "Xin lỗi, lỗi khi khởi tạo hệ thống AI Agent.",
                 [],
+                [],
             )
 
         logger.info(f"[AGENT] Processing question: {question}")
@@ -775,7 +793,7 @@ def ai_agent_handle(
             run_kwargs = {
                 "user_msg": question,
                 "chat_history": short_term_raw,
-                "max_iterations": 10,
+                "max_iterations": config.AGENT_MAX_ITERATIONS,
             }
 
             # Try async methods first (modern llama-index)
@@ -818,17 +836,42 @@ def ai_agent_handle(
             raise AttributeError(f"Agent {type(ai_agent)} has no execution method (run/arun/chat/achat)")
 
         try:
-            # Use asyncio.run for clean loop management in each Celery task
-            logger.info(f"[AGENT] Running agent (Type: {type(ai_agent)})")
-            result = asyncio.run(_safe_execute_agent())
+            # Use asyncio.run for clean loop management in each Celery task.
+            # Wrap in asyncio.wait_for with AGENT_RUN_TIMEOUT_S so a thrashing
+            # ReAct loop (empty-result retries + reasoning tokens) cannot lũy kế
+            # past the cap. On timeout the agent bails to a graceful fallback
+            # instead of compounding to 60-90s.
+            logger.info(
+                f"[AGENT] Running agent (Type: {type(ai_agent)}, "
+                f"max_iter={config.AGENT_MAX_ITERATIONS}, "
+                f"timeout={config.AGENT_RUN_TIMEOUT_S}s)"
+            )
+            result = asyncio.run(
+                asyncio.wait_for(_safe_execute_agent(), timeout=config.AGENT_RUN_TIMEOUT_S)
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[AGENT] Timed out after {config.AGENT_RUN_TIMEOUT_S}s — returning "
+                f"graceful fallback (empty-retry thrash capped)"
+            )
+            tool_calls = list(agent_tool_calls.get() or [])
+            sources = list(agent_sources.get() or [])
+            fallback = (
+                "Xin lỗi, quá trình tra cứu mất nhiều thời gian và chưa trả được kết quả "
+                "trong thời gian cho phép. Vui lòng đặt câu hỏi cụ thể hơn (ghi rõ tên luật, "
+                "số điều) hoặc thử lại sau."
+            )
+            return fallback, tool_calls, sources
         except Exception as e:
             if "already running" in str(e).lower():
                 logger.info("[AGENT] Loop already running, applying nest_asyncio")
                 import nest_asyncio
                 nest_asyncio.apply()
-                # Use current loop
+                # Use current loop — keep the same timeout cap on the fallback path.
                 loop = asyncio.get_event_loop()
-                result = loop.run_until_complete(_safe_execute_agent())
+                result = loop.run_until_complete(
+                    asyncio.wait_for(_safe_execute_agent(), timeout=config.AGENT_RUN_TIMEOUT_S)
+                )
             else:
                 raise e
 
@@ -852,25 +895,30 @@ def ai_agent_handle(
         else:
             res_text = str(result)
 
-        # Clean up common prefixes
+        # Clean up common prefixes and trailing reference lists
         if res_text.startswith("assistant: "):
             res_text = res_text[len("assistant: "):]
+        res_text = strip_trailing_references(res_text)
 
         logger.info(f"[AGENT] Clean response extracted (length: {len(res_text)})")
         tool_calls = list(agent_tool_calls.get() or [])
-        logger.info(f"[AGENT] Captured {len(tool_calls)} tool calls")
-        return res_text, tool_calls
+        sources = list(agent_sources.get() or [])
+        logger.info(f"[AGENT] Captured {len(tool_calls)} tool calls, {len(sources)} sources")
+        return res_text, tool_calls, sources
     except Exception as e:
         logger.error(
             f"[AGENT] Error: type={type(e).__name__} msg={e!r} "
             f"traceback={traceback.format_exc()}"
         )
-        return f"Xin lỗi, đã xảy ra lỗi khi xử lý câu hỏi ({type(e).__name__}).", []
+        return f"Xin lỗi, đã xảy ra lỗi khi xử lý câu hỏi ({type(e).__name__}).", [], []
     finally:
         agent_tool_calls.reset(token)
         agent_user_id.reset(user_token)
         agent_run_id.reset(rid_token)
         agent_thread_id.reset(tid_token)
+        agent_sources.reset(src_token)
+        agent_empty_streak.reset(streak_token)
+        agent_prev_tool_args.reset(prev_args_token)
 
 
 def get_agent_tools_summary() -> Dict:

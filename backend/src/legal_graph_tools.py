@@ -38,6 +38,16 @@ _FILLER_TAIL_RE = re.compile(
     r"thì|và|hoặc|hay|phải|nên|cần|muốn|bị|đang|sẽ|đã|chưa).*$",
     re.IGNORECASE,
 )
+# Citation/article boundary: a statute name never contains a citation verb or
+# article reference, so cut the captured name at the first one. Fixes queries
+# like "Nghị định 126/2014 dẫn chiếu điều nào?" -> "Nghị định 126/2014"
+# (without this, _LAW_RE's greedy `[^,.;?!]*` captures "Nghị định 126/2014 dẫn
+# chiếu điều nào" and the exact-statute CITES Cypher match fails).
+_LAW_BOUNDARY_RE = re.compile(
+    r"\s+(?:dẫn\s+chiếu|tham\s+chiếu|dẫn\s+chứng|bác\s+bỏ|còn\s+hiệu\s+lực|"
+    r"chuỗi\s+dẫn\s+chiếu|điều|khoản|điểm|theo|tại|về|của).*$",
+    re.IGNORECASE,
+)
 _YEAR_TAIL_RE = re.compile(r"\s+\d{4}$")
 
 # Multi-hop terms that signal the graph tool is a better fit than vector search.
@@ -59,14 +69,36 @@ RETURN a.number AS number, a.text AS text, st.name AS law
 LIMIT $limit
 """
 
+# Phase 4 cross-reference traversal. Outbound CITES/AMENDS from a source
+# article (the article the user asked about) -> the articles it references or
+# amends. ``relation`` labels the edge type so the caller can render "dẫn chiếu
+# tới" / "sửa đổi" distinctly.
+_LOOKUP_CITES_CYPHER = """
+MATCH (src:Article {number: $art, statute: $law})-[r:CITES|AMENDS]->(dst:Article)
+RETURN dst.number AS number, dst.text AS text, dst.statute AS law,
+       type(r) AS relation
+LIMIT $limit
+"""
+
+# Inbound cross-refs — "điều nào dẫn chiếu tới Điều X" / "bị sửa đổi bởi điều nào".
+_LOOKUP_CITED_BY_CYPHER = """
+MATCH (src:Article)-[r:CITES|AMENDS]->(dst:Article {number: $art, statute: $law})
+RETURN src.number AS number, src.text AS text, src.statute AS law,
+       type(r) AS relation
+LIMIT $limit
+"""
+
 
 def _parse_law(query: str) -> str:
     m = _LAW_RE.search(query or "")
     if not m:
         return ""
     name = m.group(1).strip()
-    # Strip trailing 4-digit year, then trailing filler/question words, so the
-    # parsed name is just the statute proper noun (e.g. "Bộ luật Dân sự").
+    # Cut at the first citation/article boundary (e.g. " dẫn chiếu ...") so the
+    # statute name does not absorb query intent words. Then strip trailing
+    # 4-digit year + filler/question words, leaving the proper noun (e.g.
+    # "Bộ luật Dân sự").
+    name = _LAW_BOUNDARY_RE.sub("", name)
     name = _YEAR_TAIL_RE.sub("", name)
     name = _FILLER_TAIL_RE.sub("", name).strip()
     return name
@@ -108,6 +140,44 @@ def recall_legal_graph(query: str, limit: int = 5) -> Dict[str, Any]:
         "law": law,
         "article": article,
         "articles": rows,
+    }
+
+
+def recall_legal_graph_relations(
+    query: str,
+    limit: int = 5,
+    direction: str = "out",
+) -> Dict[str, Any]:
+    """Traverse Phase 4 cross-reference edges (CITES / AMENDS) for a query.
+
+    Parses the source statute + article from the query (same regex as
+    ``recall_legal_graph``) and returns the articles connected by a
+    cross-reference edge — outbound (the article cites/amends others) or
+    inbound (others cite/amend it).
+
+    Args:
+        query:     natural-language query naming an article, e.g.
+                   "Điều 35 Bộ luật Dân sự dẫn chiếu điều nào?".
+        limit:     max related articles to return.
+        direction: ``"out"`` (outbound CITES/AMENDS) or ``"in"`` (inbound).
+
+    Returns:
+        ``{"query", "law", "article", "relations": List[dict]}`` where each
+        relation dict carries ``number``, ``text``, ``law``, ``relation``.
+        Empty when the graph is unavailable or no source article parsed.
+    """
+    law = _parse_law(query)
+    article = _parse_article(query)
+    if not law or not article:
+        return {"query": query, "law": law, "article": article, "relations": []}
+
+    cypher = _LOOKUP_CITED_BY_CYPHER if direction == "in" else _LOOKUP_CITES_CYPHER
+    rows = execute_read(cypher, law=law, art=article, limit=limit)
+    return {
+        "query": query,
+        "law": law,
+        "article": article,
+        "relations": rows,
     }
 
 

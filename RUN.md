@@ -191,6 +191,34 @@ Chi tiết đầy đủ: `EVAL_SYSTEM_SUMMARY.md`. Module map: `backend/src/eval
 
 ---
 
+## 7. Re-ingest sau Production Upgrade (Phase 1-6)
+
+Upgrade metadata + BM25 tokenizer + KG cross-ref **không train lại model** — embedding giữ nguyên (text không đổi). Chạy 1 lần sau deploy:
+
+```bash
+# 1. Backfill Qdrant payload (clause/point/document_*/effectivity) + re-MERGE Neo4j + rebuild BM25.
+#    set_payload = không re-embed. Idempotent (re-run chỉ ghi đè cùng field).
+PYTHONPATH=backend/src python scripts/reingest_metadata.py --collection llm
+
+#    Skip graph hoặc BM25 nếu chưa cần:
+#    python scripts/reingest_metadata.py --no-graph --no-bm25
+```
+
+**Verify sau re-ingest**:
+- Qdrant payload có field mới (scroll API): `clause_number`, `point_letter`, `document_number`, `document_year`, `document_type`, `effectivity_status`.
+- Neo4j edge count theo loại: `MATCH ()-[r:CITES]->() RETURN count(r)` (thay CITES bằng AMENDS/REPEALS/REPLACED_BY).
+- BM25 cache rebuild xong (log `BM25 cache rebuilt`).
+
+**Env mới** (xem `.env.example`): `RRF_W_VECTOR`, `RRF_W_BM25`, `RRF_BLEND_ALPHA`, `RRF_TOP_K`, `RRF_TOP_N`, `RERANK_TOP_N`, `RERANKER_TYPE`, `BGE_RERANK_MODEL`, `BGE_RERANK_DEVICE`.
+
+**Test**:
+```bash
+python -m pytest tests/test_legal_metadata.py tests/test_legal_effectivity.py \
+  tests/test_graph_relations.py tests/test_graph_memory.py tests/test_citations.py -q
+```
+
+---
+
 ## Lỗi thường gặp
 
 | Lỗi | Fix |

@@ -411,43 +411,17 @@ def calculate_child_support(payer_income: float, num_children: int = 1) -> Dict:
 # 6. Law version & compliance / disclaimer
 # ---------------------------------------------------------------------------
 
-LAW_VERSIONS = {
-    "blds_2015": {
-        "full_name": "Bộ luật Dân sự 2015",
-        "effective_from": "01/01/2017",
-        "replaces": "Bộ luật Dân sự 2005",
-        "amended_by": ["Luật số 67/2020/QH14 (sửa đổi một số điều liên quan đầu tư)"],
-        "key_articles": ["Điều 418 (phạt vi phạm ≤8%)", "Điều 651 (hàng thừa kế)"],
-    },
-    "luat_dat_dai_2024": {
-        "full_name": "Luật Đất đai 2024",
-        "effective_from": "01/01/2025 (theo lộ trình) / 01/08/2024 một số điều",
-        "replaces": "Luật Đất đai 2013",
-        "amended_by": [],
-        "key_articles": ["Quyền sử dụng đất", "Chuyển nhượng", "Thu hồi, bồi thường"],
-    },
-    "blld_2019": {
-        "full_name": "Bộ luật Lao động 2019",
-        "effective_from": "01/01/2021",
-        "replaces": "Bộ luật Lao động 2012",
-        "amended_by": [],
-        "key_articles": ["Điều 48 (trợ cấp thôi việc)", "Điều 107 (làm thêm giờ)", "Điều 193 (thời hiệu LĐ)"],
-    },
-    "luat_doanh_nghiep_2020": {
-        "full_name": "Luật Doanh nghiệp 2020",
-        "effective_from": "01/01/2021",
-        "replaces": "Luật Doanh nghiệp 2014",
-        "amended_by": [],
-        "key_articles": ["Điều 36 (tên doanh nghiệp)", "Điều 17 (điều kiện thành lập)"],
-    },
-    "luat_hngd_2014": {
-        "full_name": "Luật Hôn nhân và Gia đình 2014",
-        "effective_from": "01/01/2015",
-        "replaces": "Luật HNGĐ 2000",
-        "amended_by": [],
-        "key_articles": ["Điều 8 (tuổi kết hôn: nam 20, nữ 18)", "Điều 82 (cấp dưỡng)"],
-    },
-}
+# The version table lives in a dedicated data module so it can grow without
+# inflating this tools file and so ``legal_effectivity`` can resolve the
+# replaces/amended chain. Re-exported here for backward compatibility with any
+# caller that imported ``LAW_VERSIONS`` from this module.
+from legal_corpus_versions import (  # noqa: E402 - re-export
+    LAW_VERSIONS,
+    available_law_keys,
+    find_version_by_key,
+    find_version_by_name,
+)
+from legal_effectivity import classify_effectivity  # noqa: E402
 
 
 def get_law_version(law_key: str, effective_year: Optional[int] = None) -> Dict:
@@ -456,25 +430,28 @@ def get_law_version(law_key: str, effective_year: Optional[int] = None) -> Dict:
 
     Args:
         law_key: Khóa luật, ví dụ blds_2015, luat_dat_dai_2024, blld_2019.
-        effective_year: Năm tham chiếu (tùy chọn) để xác nhận luật còn hiệu lực hay đã được thay.
+        effective_year: Năm tham chiếu (tùy chọn) để xác nhận luật còn hiệu lực
+            hay đã được thay. Khi cung cấp, ``status_at_year`` được tính theo
+            năm đó thay vì hôm nay.
 
     Returns:
-        Dict thông tin phiên bản + trạng thái hiệu lực.
+        Dict thông tin phiên bản + trạng thái hiệu lực (in_force |
+        not_yet_effective | repealed | amended).
     """
     key = (law_key or "").strip().lower()
-    entry = LAW_VERSIONS.get(key)
+    entry = find_version_by_key(key)
     if not entry:
-        return {"error": "Không có trong bảng phiên bản.", "available": list(LAW_VERSIONS.keys())}
+        return {"error": "Không có trong bảng phiên bản.", "available": available_law_keys()}
 
-    status = "in_force"
+    full_name = entry.get("full_name")
     if effective_year:
-        eff = entry["effective_from"]
-        try:
-            eff_year = int(eff.split("/")[-1])
-            if effective_year < eff_year:
-                status = "not_yet_effective"
-        except (ValueError, IndexError):
-            pass
+        # Project the reference date to the end of the requested year so a
+        # statute effective mid-year is treated as in force within that year.
+        from datetime import date as _date
+        ref = _date(effective_year, 12, 31)
+        status = classify_effectivity(full_name, effective_year, as_of=ref)
+    else:
+        status = classify_effectivity(full_name)
 
     return {
         "law_key": key,

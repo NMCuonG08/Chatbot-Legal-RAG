@@ -107,8 +107,7 @@ def tavily_search_legal(query: str, max_results: int = 5) -> str:
         Formatted search results as string
     """
     try:
-        # Add Vietnamese legal context to query
-        enhanced_query = f"Việt Nam pháp luật: {query}"
+        enhanced_query = query if ("Việt Nam" in query or "vietnam" in query.lower()) else f"{query} Việt Nam"
 
         results = tavily_search(
             enhanced_query, max_results=max_results, search_depth="advanced"
@@ -123,6 +122,21 @@ def tavily_search_legal(query: str, max_results: int = 5) -> str:
         # Add AI answer if available
         if results.get("answer"):
             output += f"Tóm tắt AI:\n{results['answer']}\n\n"
+
+        # Record web search sources into agent tracking accumulator
+        try:
+            from agent_tool_tracking import record_agent_source
+            for r in results.get("results", []):
+                if isinstance(r, dict) and r.get("url"):
+                    record_agent_source({
+                        "title": r.get("title"),
+                        "url": r.get("url"),
+                        "content": r.get("content"),
+                        "kind": "web",
+                        "source": r.get("url"),
+                    })
+        except Exception as _tr_err:
+            logger.debug("record_agent_source skipped in tavily_search_legal: %s", _tr_err)
 
         # Add individual results
         output += "Chi tiết:\n"

@@ -65,7 +65,11 @@ class TestEmptyAndUnknown:
 class TestCombined:
     def test_article_and_law(self):
         result = extract_legal_metadata("Điều 48 Bộ luật Lao động 2019 về thôi việc")
-        assert result == {"law_name": "Bộ luật Lao động 2019", "article_number": 48}
+        # Phase 1 metadata enrichment also surfaces document_type + document_year.
+        assert result["law_name"] == "Bộ luật Lao động 2019"
+        assert result["article_number"] == 48
+        assert result["document_type"] == "code"
+        assert result["document_year"] == 2019
 
     def test_returns_first_article_only(self):
         # Multiple article refs — first one wins.

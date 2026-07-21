@@ -14,7 +14,31 @@ GRAPH_RECURSION_LIMIT = int(_os_loop.environ.get("GRAPH_RECURSION_LIMIT", "32"))
 # (non-retryable) and degrade gracefully. The hung invoke thread cannot be
 # killed in Python; it is abandoned and left to fail on its own — the worker
 # unblocks and returns a user-facing error.
+# Default lowered 120 -> 60s: a healthy legal chat rarely exceeds 30-40s; the
+# ReAct agent path has its own tighter AGENT_RUN_TIMEOUT_S cap below, so 60s is
+# a safety net for the whole graph (supervisor + verify + meta), not the agent.
 GRAPH_RUN_TIMEOUT_S = float(_os_loop.environ.get("GRAPH_RUN_TIMEOUT_S", "120"))
+
+# ---- Ollama Model Tiers (Fast vs Reasoning) ----
+OLLAMA_LLM_MODEL = _os_loop.environ.get("OLLAMA_LLM_MODEL", "gemma4:31b")
+OLLAMA_FAST_LLM_MODEL = _os_loop.environ.get("OLLAMA_FAST_LLM_MODEL", "qwen2.5:7b")
+
+# ---- ReAct agent latency guards (senior: bound the agent, kill empty-retry thrash) ----
+# Hard wall-clock cap on one ai_agent_handle run (seconds). The ReAct loop is the
+# dominant latency source: each round trip = 1 LLM call + reasoning tokens, and an
+# agent retrying an empty-result search tool N times compounds to 60-90s. This cap
+# wraps asyncio.run(agent) in asyncio.wait_for; on timeout the agent bails to a
+# graceful fallback instead of lũy kế further. Tighter than GRAPH_RUN_TIMEOUT_S.
+AGENT_RUN_TIMEOUT_S = float(_os_loop.environ.get("AGENT_RUN_TIMEOUT_S", "30"))
+# ReAct max tool-call round trips. 10 (llama-index default) invites thrashing on
+# empty results — legal queries need <=2 tool calls in practice. Lowered to 4:
+# enough for lookup -> verify_citation -> (one reformulation), not enough to spin.
+AGENT_MAX_ITERATIONS = int(_os_loop.environ.get("AGENT_MAX_ITERATIONS", "4"))
+# Max consecutive empty-tool results before the @track_tool_call guard forces the
+# agent to STOP retrying and synthesize a "no info found" answer. 2 = after the
+# 2nd empty, the 3rd identical call is blocked with a reformulate-or-stop sentinel.
+# Stops the "call -> empty -> think -> call same args -> empty -> think" lũy kế.
+AGENT_MAX_EMPTY_STREAK = int(_os_loop.environ.get("AGENT_MAX_EMPTY_STREAK", "2"))
 
 # ---- Pure-compute tool sandbox (defense-in-depth, OPT-IN) ----
 # When true, the @sandboxable pure-compute tools (contract_penalty, pit,

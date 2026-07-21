@@ -2,6 +2,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import requests
 
 from groq import Groq
@@ -209,7 +210,7 @@ def build_groq_provider(model: str | None = None) -> GroqProvider:
     return GroqProvider(m)
 
 
-def build_ollama_provider(model: str | None = None) -> OllamaProvider:
+def build_ollama_provider(model: str | None = None, fast: bool = False) -> OllamaProvider:
     base = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com")
     # Cloud Ollama (e.g. http://ollama.com) requires https. An http URL triggers
     # a 301 redirect that `requests` follows by converting POST->GET, which then
@@ -217,7 +218,12 @@ def build_ollama_provider(model: str | None = None) -> OllamaProvider:
     # localhost as http (local Ollama has no TLS).
     if base.startswith("http://") and "localhost" not in base and "127.0.0.1" not in base:
         base = "https://" + base[len("http://"):]
-    m = model or LLM_MODEL_CONTEXTVAR.get() or os.environ.get("OLLAMA_LLM_MODEL") or os.environ.get("OLLAMA_MODEL") or "llama3.1:latest"
+    if model:
+        m = model
+    elif fast:
+        m = os.environ.get("OLLAMA_FAST_LLM_MODEL") or "qwen2.5:7b"
+    else:
+        m = LLM_MODEL_CONTEXTVAR.get() or os.environ.get("OLLAMA_LLM_MODEL") or os.environ.get("OLLAMA_MODEL") or "gemma4:31b"
     return OllamaProvider(base, m, os.environ.get("OLLAMA_API_KEY"))
 
 
@@ -368,12 +374,24 @@ def gen_doc_prompt(docs):
     for idx, doc in enumerate(docs, start=1):
         law_name = (doc.get("law_name") or "").strip()
         article_number = doc.get("article_number")
+        clause_number = doc.get("clause_number")
+        point_letter = doc.get("point_letter")
+        document_type = doc.get("document_type") or ""
+        effectivity = doc.get("effectivity_status") or ""
         source = (doc.get("source") or "").strip() or "—"
         meta_parts = []
         if law_name:
             meta_parts.append(f"Luật: {law_name}")
         if article_number is not None:
             meta_parts.append(f"Điều: {article_number}")
+        if clause_number is not None:
+            meta_parts.append(f"Khoản: {clause_number}")
+        if point_letter:
+            meta_parts.append(f"Điểm: {point_letter}")
+        if document_type:
+            meta_parts.append(f"Loại VB: {document_type}")
+        if effectivity:
+            meta_parts.append(f"Hiệu lực: {effectivity}")
         meta_parts.append(f"Nguồn: {source}")
         meta = " | ".join(meta_parts)
         question = (doc.get("question") or "").strip()
@@ -383,7 +401,7 @@ def gen_doc_prompt(docs):
             doc_prompt += f"Câu hỏi: {question}\n"
         doc_prompt += f"Nội dung: {content}\n\n"
 
-    return "Tài liệu tham khảo:\n{}".format(doc_prompt)
+    return "Danh sách tài liệu được cung cấp:\n{}".format(doc_prompt)
 
 
 def generate_conversation_text(conversations):
@@ -501,6 +519,31 @@ def _detect_agent_tools_override(message: str) -> bool:
     return any(sig in msg for sig in _AGENT_TOOLS_OVERRIDE_SIGNALS)
 
 
+# Pure citation-lookup pattern: "Điều N <statute-type> ..." with NO calc/tool verb.
+# Forces route TOWARD legal_rag (deterministic, no-LLM retrieve_node path) so a
+# plain "Điều 418 Bộ luật Dân sự nói gì?" NEVER enters the ReAct agent loop —
+# killing the 75s lũy kế at the source. Checked AFTER _detect_agent_tools_override
+# so "Điều X luật Y còn hiệu lực không" (validity check) still goes agent_tools.
+# Narrow: only statute type + article number; free-text questions don't match.
+_LEGAL_RAG_OVERRIDE_RE = re.compile(
+    r"điều\s+\d{1,4}\s+"
+    r"(?:bộ\s+luật|luật|nghị\s+định|thông\s+tư|pháp\s+lệnh|nghị\s+quyết)",
+    re.IGNORECASE,
+)
+
+
+def _detect_legal_rag_override(message: str) -> bool:
+    """True if the message is a pure article-citation lookup (no calc verb).
+
+    Forces TOWARD legal_rag — the deterministic retrieve_node path (hybrid search
+    + graph, no ReAct LLM loop). Safe direction: legal_rag can hand off to
+    web_search/agent via the existing supervisor if retrieval comes up empty, so
+    a misrouted question is still answered. The reverse (LLM dropping a pure
+    lookup into agent_tools) costs a 60-90s ReAct thrash for nothing.
+    """
+    return bool(_LEGAL_RAG_OVERRIDE_RE.search(message or ""))
+
+
 # Route distribution counters (observability). Reset on process restart.
 # Exposed via the app /stats endpoint so ops can spot route skew (e.g. all
 # traffic falling into one route) or override firing too often.
@@ -545,6 +588,16 @@ def detect_route(history, message):
         logger.info(f"Route override -> agent_tools (deterministic tool signal) for: '{message[:60]}'")
         _record_route("agent_tools")
         return "agent_tools"
+
+    # Deterministic legal_rag override for pure citation lookups ("Điều N <luật>")
+    # — skips the LLM router (non-deterministic) + the ReAct agent loop entirely,
+    # routing straight to the no-LLM retrieve_node. Kills the 75s lũy kế at the
+    # source for the most common legal question shape. Checked AFTER agent_tools
+    # override so validity/calc queries still route to the agent.
+    if _detect_legal_rag_override(message):
+        logger.info(f"Route override -> legal_rag (deterministic citation lookup) for: '{message[:60]}'")
+        _record_route("legal_rag")
+        return "legal_rag"
 
     # Format history for better context
     history_text = ""

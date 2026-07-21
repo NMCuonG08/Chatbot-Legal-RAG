@@ -94,7 +94,7 @@ class ProviderWiringTests(unittest.TestCase):
                 self.name = "groq"
                 self.model = model
 
-            def chat(self, messages, raw=False):
+            def chat(self, messages, raw=False, **kwargs):
                 captured["model"] = self.model
                 captured["raw"] = raw
                 return "ok"

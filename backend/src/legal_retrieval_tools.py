@@ -2,10 +2,16 @@
 Retrieval-backed legal tools for the Vietnamese law chatbot agent.
 
 These tools query the Qdrant vector store (via ``hybrid_search`` / ``search_vector``)
-to fetch real legal text. They are "best-effort": the corpus payload only carries
-``question``, ``content``, ``source``, and ``content_type`` fields — there is no
-structured ``law_name`` / ``article_number`` metadata yet — so article lookup is
-semantic with an optional ``content_type`` filter, not an exact index lookup.
+to fetch real legal text. Since the Phase 1 metadata enrichment (see
+``legal_metadata.extract_legal_metadata`` + ``legal_effectivity``), the corpus
+payload carries structured fields — ``law_name``, ``article_number``,
+``clause_number``, ``point_letter``, ``document_number``, ``document_year``,
+``document_type``, ``effectivity_status`` — so ``lookup_article`` can filter
+Qdrant by exact ``law_name`` + ``article_number`` first, falling back to
+semantic ``content_type='law'`` search then hybrid when the exact fields are
+absent. Tools also surface matched chunks as agent sources (recorded via
+``agent_tool_tracking.record_agent_source``) so the agent route is judged for
+citation groundedness in ``verify_answer``.
 
 Keeping retrieval tools in a separate module from ``legal_tools.py`` avoids
 import-time coupling to ``search`` / ``brain`` / ``vectorize`` for the pure

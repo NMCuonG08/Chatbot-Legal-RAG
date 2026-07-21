@@ -14,6 +14,9 @@ langgraph-checkpoint-redis>=0.3.9
 sse-starlette>=2.1.0
 llama-index-llms-openai
 llama-index-retrievers-bm25
+# Vietnamese word segmentation for BM25 (search.py). Optional but recommended:
+# without it BM25 falls back to raw-text matching on unsegmented Vietnamese.
+pyvi
 nest_asyncio==1.6.0
 nemoguardrails
 qdrant-client==1.11.1
@@ -30,6 +33,10 @@ passlib[bcrypt]>=1.7.4
 bcrypt<4.0.0
 python-jose[cryptography]>=3.3.0
 langchain-community
+
+# ---- Web Search (Tavily) ----
+tavily-python>=0.5.0
+
 
 # ---- Tracing: LangSmith ----
 langsmith>=0.1.0

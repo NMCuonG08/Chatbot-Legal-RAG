@@ -297,4 +297,36 @@ scripts/dev.sh prod      # full boot runbook
 
 ---
 
+## 11. Production Upgrade (Phase 1-6)
+
+Bổ sung 6 trụ production-grade. Không train lại model — embedding giữ nguyên (text không đổi), chỉ re-upsert Qdrant payload + rebuild BM25 + re-MERGE Neo4j.
+
+**Metadata chuẩn hóa (Phase 1)** — `legal_metadata.extract_legal_metadata` giờ trả đủ `law_name, article_number, clause_number, point_letter, document_number, document_year, document_type`. Hiệu lực per-document: `legal_effectivity.classify_effectivity` → `in_force|not_yet_effective|repealed|amended`, dùng bảng version `legal_corpus_versions` (thay hardcoded 5 luật). SQL: `DocumentChunk` +8 cột (nullable, indexed), migration idempotent qua `ensure_database_schema`. Payload enrich tại `import_data.py:245,378` + `scripts/reingest_metadata.py` (set_payload, không re-embed).
+
+**BM25 Vietnamese tokenizer (Phase 2)** — `search.py` wrap pyvi `ViTokenizer.tokenize` cho BM25 text + query. Fallback raw-text khi pyvi thiếu. Rebuild BM25 cache sau deploy.
+
+**Reranker hardening + score blend (Phase 3)** — `rerank.py`: Cohere/BGE fail → `_passthrough` log WARNING + flag `rerank_failed=True` (không silent). `search.blend_hybrid_rerank`: `final = α*norm(hybrid) + (1-α)*norm(relevance)`, α=`RRF_BLEND_ALPHA` (default 0.6). RRF weights `RRF_W_VECTOR/RRF_W_BM25` env. Top_k/top_n sync (`RRF_TOP_K=4`, `RRF_TOP_N=5`).
+
+**KG cross-reference edges (Phase 4)** — `legal_graph_relations.extract_relations` (rule+regex) mine CITES/AMENDS/REPEALS/REPLACED_BY từ chunk text. `legal_graph_ingest.add_relations_to_graph` MERGE typed edges (Cypher 1 template per edge type — không parameterize TYPE). `legal_graph_tools.recall_legal_graph_relations` traverse outbound/inbound cross-refs. RAG `retrieve_node` (`tasks.py:890`) query graph cho multi-hop query (`MULTI_HOP_KEYWORDS`), merge hits vào documents trước rerank.
+
+**Multi-agent verify mở rộng (Phase 5)** — `agent_tool_tracking.agent_sources` contextvar + `record_agent_source`: retrieval tools (article_lookup/cross_reference/verify_citation/precedent_lookup) ghi source chunks. `ai_agent_handle` trả `(text, tool_calls, sources)`, `agent_tools_node` set `state["sources"]`. `verify_answer.judge_answer`: agent/web route giờ có sources → judge faithfulness thật; chỉ general_chat short-circuit (log rõ, không silent).
+
+**Cleanup + docs (Phase 6)** — docstring `legal_retrieval_tools.py` cập nhật (payload giờ có metadata cấu trúc). Test mới: `test_legal_effectivity`, `test_graph_relations`; `test_legal_metadata` mở rộng.
+
+| Muốn tìm | Mở |
+|---------|-----|
+| Metadata parser | `legal_metadata.py` |
+| Effectivity | `legal_effectivity.py` · `legal_corpus_versions.py` |
+| SQL metadata cols | `models.py:DocumentChunk` · `ensure_database_schema` |
+| BM25 tokenizer | `search.py:_tokenize_vi` |
+| Rerank hardening | `rerank.py:_passthrough` |
+| Score blend | `search.py:blend_hybrid_rerank` |
+| KG relations extractor | `legal_graph_relations.py` |
+| KG edge MERGE | `legal_graph_ingest.py:add_relations_to_graph` |
+| KG cross-ref traversal | `legal_graph_tools.py:recall_legal_graph_relations` |
+| Agent sources | `agent_tool_tracking.py:agent_sources` · `agent_tool_wrappers.py:record_agent_source` |
+| Re-ingest | `scripts/reingest_metadata.py` |
+
+---
+
 *File này là knowledge-graph dạng markdown (sinh bằng method Understand-Anything). Để có dashboard tương tác + JSON graph, cài plugin: `/plugin marketplace add Egonex-AI/Understand-Anything` → `/understand` (sinh `.ua/knowledge-graph.json`). File này đủ onboard mà không cần plugin.*
