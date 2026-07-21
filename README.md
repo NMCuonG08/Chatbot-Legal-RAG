@@ -13,6 +13,8 @@ An intelligent virtual assistant for looking up Vietnamese legal documents, calc
 
 The agent is **truly agentic**, not just a routed RAG: it **self-verifies** its final answer for citation groundedness (PEV gate), **knows its own limits** via metacognitive escalation to a lawyer-referral prefix on high-stakes / low-confidence cases, **recalls structured legal knowledge** through a Neo4j statute→article graph for multi-hop reasoning, and **learns from feedback** via a 👍/👎 RLHF store that injects good prior answers as few-shot examples and up-weights their source chunks at rerank time.
 
+It also carries a **CoALA / MemGPT 5-layer memory** (Working → Short → Episodic → Semantic → Procedural) that survives cross-worker restarts (Redis-backed rolling summary), extracts only user facts — never bot law text — via a delta-only episodic path, and steers the conversation with a structured `UserProfile` + per-case-type procedural workflow. Tool selection is **semantic** (query↔tool-description embedding similarity) rather than brittle keyword matching, and every arithmetic tool is guarded by **Pydantic input schemas** so a malformed arg returns a clean error instead of a crash or silent garbage.
+
 [🌟 Star](https://github.com/NMCuonG08/Chatbot-Legal-RAG/stargazers) • [🍴 Fork](https://github.com/NMCuonG08/Chatbot-Legal-RAG/fork) • [📚 Docs](docs/ARCHITECTURE.md) • [💬 Discord](https://discord.gg/legal-chatbot)
 
 </div>
@@ -23,6 +25,8 @@ The agent is **truly agentic**, not just a routed RAG: it **self-verifies** its 
 
 - [I. Overview](#i-overview)
 - [II. System Architecture](#ii-system-architecture)
+  - [Memory Architecture — CoALA / MemGPT 5-Layer](#3-memory-architecture--coala--memgpt-5-layer)
+  - [Tool-Calling Architecture](#4-tool-calling-architecture)
 - [III. Project Structure](#iii-project-structure)
 - [IV. Key Features & Capabilities](#iv-key-features--capabilities)
 - [V. Technology Stack](#v-technology-stack)
@@ -139,6 +143,71 @@ graph TD
 *   **Neo4j legal knowledge graph (structured memory):** `(:Statute {name, year})-[:HAS_ARTICLE]->(:Article {number, title})` nodes are written idempotently (MERGE) during ingestion, reusing the regex `extract_legal_metadata` extractor. The `recall_legal_graph_tool` FunctionTool traverses the graph for multi-hop queries (keyword-gated in `filter_tools_for_query` on terms like "dẫn chiếu", "án lệ", "còn hiệu lực", "điều nào"). Graph writes are best-effort additive — Neo4j down swallows + logs, never blocks vector ingest.
 *   **RLHF continual learning (learns-from-feedback):** 👍/👎 feedback → MySQL `agent_feedback` audit (always, both ratings) + Qdrant `rlhf_good_answers` pool (good-only). User-scoped via `_scope_for` + sentinel rejection (`anonymous`/`demo-session`/`""` → HTTP 400) — no cross-user leak. On later similar questions, the top good answer is injected as a system few-shot example in `generate_node` (score ≥ 0.85, same scope), and chunks whose `doc_id` backed a 👍 answer get an additive `RLHF_RERANK_BOOST=0.05` at rerank. Deterministic uuid5 point id makes re-submitting idempotent; dedup score ≥ 0.92 skips flooding.
 
+### 3. Memory Architecture — CoALA / MemGPT 5-Layer
+
+The agent memory was rebuilt from an ad-hoc OrderedDict/episodic-blob design into a proper **5-layer CoALA (Cognitive Architectures for Language Agents) / MemGPT** model. Four prior architectural flaws are closed:
+
+```mermaid
+%%{init: { 'themeVariables': { 'fontFamily': 'system-ui, -apple-system, sans-serif', 'fontSize': '12px' } } }%%
+graph LR
+    subgraph Working[Working Memory]
+        GS["`ChatGraphState slots
+        active_entities / current_intent
+        tool_budget / tool_calls_made
+        scratchpad`"]
+    end
+    subgraph Short[Short-Term]
+        RS["`memory_short_term.py
+        Redis rolling summary
+        mem:short:{u}:{c}:summary|count
+        TTL 7d, LRU32 read-through`"]
+    end
+    subgraph Episodic[Episodic]
+        EP["`UserEpisode (MySQL) + Qdrant
+        delta-only extract per turn
+        strip_legal_citations
+        dedup score_threshold=0.88`"]
+    end
+    subgraph Semantic[Semantic]
+        UP["`UserProfile (MySQL KV)
+        name / birth_year / gender
+        location / case_type / case_summary
+        idempotent non-null merge`"]
+    end
+    subgraph Procedural[Procedural]
+        PW["`procedural_memory.py
+        CASE_WORKFLOWS per case_type
+        inheritance/land/marriage/
+        business/traffic/other`"]
+    end
+    GS -->|summarize every N turns| RS
+    RS -->|recall context| GS
+    EP -->|extract structured| UP
+    UP -->|case_type -> workflow_block| GS
+    PW -->|inject scaffold| GS
+```
+
+| Layer | Store | Module | Purpose | Flaw closed |
+|-------|-------|--------|---------|-------------|
+| **Working** | LangGraph state | `tasks.py` `ChatGraphState` | Per-turn scratchpad: `active_entities`, `current_intent`, `tool_budget`/`tool_calls_made`, `scratchpad` | — |
+| **Short-Term** | Redis | `memory_short_term.py` | Cross-worker rolling summary (`mem:short:{user}:{conv}:{summary|count}`, TTL 7d, LRU32 read-through, graceful fallback) | **FLAW 1** (multi-worker drift — RAM-local OrderedDict lost on worker switch) |
+| **Episodic** | MySQL `user_episodes` + Qdrant | `tasks.py` `save_episodic_memory_task` | Delta-only extraction (O(1)/turn, never ingests assistant text), `strip_legal_citations` regex, dedup `score_threshold=0.88`, uuid5 idempotent points | **FLAW 2** (O(N²) full-history re-summarize + bot law text polluting user facts) |
+| **Semantic** | MySQL `user_profiles` | `models.py` `UserProfile` + `merge_user_profile` | Structured KV (name, birth_year, gender, location, case_type, case_summary); idempotent non-null merge | **FLAW 4** (free-text blob, no structured profile) |
+| **Procedural** | Static dict | `procedural_memory.py` | `CASE_WORKFLOWS` per case_type → `workflow_block()` injected into agent system prompt | **FLAW 4** (no per-case procedural scaffold) |
+
+*   **ReAct recall is agent-decided (MemGPT pattern):** long-term memory is no longer auto-injected into every RAG prompt. The `recall_user_memory_tool` (ReAct) is gated at threshold 0.65 so the agent calls it only when the query signals recall — closing **FLAW 3** (stale episodic facts bleeding into unrelated questions, e.g. an inheritance fact contaminating a vehicle-fee query). Auto-inject is disabled by default (`RAG_AUTO_INJECT_DISABLED=1`) and available for 1-release rollback.
+*   **Online monitoring:** Prometheus counters (`memory_metrics.py`) — `memory_short_term_hits/misses`, `episodic_extractions{result}`, `episodic_pollution`, `react_recall{hit}`, `profile_merge{field}` — with a `_NoopCounter` fallback when prometheus_client is absent. Non-invasive, mountable at `/metrics`.
+*   **Feature flags (default = NEW behavior, old available 1 release):** `MEMORY_REDIS_ENABLED`, `EPISODIC_DELTA_ENABLED`, `RAG_AUTO_INJECT_DISABLED`(default 1), `STRUCTURED_PROFILE_ENABLED`, `PROCEDURAL_WORKFLOW_ENABLED`.
+*   **Migration (zero-downtime):** `create_all` auto-creates `user_profiles`; `backend/scripts/backfill_user_profiles.py` is a one-shot, idempotent backfill (concat a user's `UserEpisode` rows → extract prompt → `merge_user_profile`; dry-run by default, `--apply` to write). Redis short-term starts empty — first turn re-summarizes from DB.
+
+### 4. Tool-Calling Architecture
+
+*   **Semantic tool router (`tool_router.py`):** tool selection embeds the query against each tool's description and keeps the top-k above a similarity threshold (`TOOL_SIM_THRESHOLD=0.30`, `TOOL_TOP_K=8`), robust to paraphrase — *"công ty cho tôi nghỉ"* matches `severance_pay_tool` even though no keyword matches. The tool-description index is built once per process (descriptions are static). Falls back to the keyword path (`filter_tools_for_query`) when the embedding service is down or the flag is off (`SEMANTIC_TOOL_ROUTER_ENABLED`), so behavior degrades gracefully with zero regression risk.
+*   **Pydantic input validation (`agent_tool_wrappers.py`):** every arithmetic tool (severance, PIT, land/vehicle fee, court fee, legal age, inheritance) declares a Pydantic `fn_schema` with `Field` constraints + Vietnamese descriptions, passed to `FunctionTool.from_defaults(fn=..., fn_schema=...)`. A `@_validated(Model)` decorator coerces + validates inputs in-process before the fn body, returning a clean Vietnamese JSON error on `ValidationError` — a malformed arg (`"5 năm"` for an `int`) no longer crashes (legal_age `str < int` TypeError) or silently computes garbage (severance `"5 VNĐ"`).
+*   **Dynamic tool filtering + RBAC:** the chosen tools are further narrowed by role (`rbac.filter_tools_by_policy`) so a guest never sees sensitive/search tools and a user never sees admin-only escalation paths. Sensitive tools (`generate_document_template`, `web_search`, `tavily`) require human approval for non-exempt roles.
+*   **Loop guards:** `MAX_HANDOFF_STEPS=5` (supervisor), `GRAPH_RECURSION_LIMIT=32`, per-run done-flags (`agent_to_rag_done`/`generate_to_web_done`) that detect when the inner ReAct agent already called web/retrieval tools and suppress duplicate supervisor handoffs, plus the `agent_empty_streak` no-retry guard that kills a cumulative 75s waste loop when a tool keeps returning empty with identical args.
+*   **30+ custom legal tools** across calculation (contract penalty, severance, overtime, PIT, land/vehicle registration fee, court fee, child support, inheritance, legal age, statute of limitations, business-name, law-version), retrieval (article/precedent lookup, cross-reference, citation verify, unified parallel search), knowledge-graph multi-hop recall, procedure wizard, jurisdiction resolver, document-template generation, Tavily web search, current time, and long-term memory recall.
+
 ---
 
 ## III. Project Structure
@@ -160,7 +229,7 @@ Chatbot-Legal-RAG/
 │   │   ├── retry_utils.py         # with_retry / awith_retry + build_transient_exceptions (lifecycle retry)
 │   │   ├── database.py           # Database connection & session orchestration
 │   │   ├── cache.py              # Redis cache integration
-│   │   ├── tasks.py              # Celery tasks + LangGraph StateGraph (CRAG loop, PEV verify, metacognitive, RLHF, handoff, trace, checkpoint)
+│   │   ├── tasks.py              # Celery tasks + LangGraph StateGraph (CRAG loop, PEV verify, metacognitive, RLHF, handoff, trace, checkpoint, working-memory slots)
 │   │   ├── trace.py              # Self-hosted trace: MySQL agent_steps/graph_runs + Redis pub/sub emit_*
 │   │   ├── verify_answer.py      # Phase 1 — PEV gate: judge final answer groundedness (claim decomp + verdict)
 │   │   ├── metacognitive.py      # Phase 2 — tiered stakes classifier + lawyer-escalation decision
@@ -169,7 +238,11 @@ Chatbot-Legal-RAG/
 │   │   ├── legal_graph_ingest.py # Phase 3 — idempotent MERGE Statute→Article during ingest
 │   │   ├── legal_graph_tools.py  # Phase 3 — recall_legal_graph multi-hop FunctionTool
 │   │   ├── rlhf_store.py         # Phase 4 — 👍/👎 Qdrant good pool + MySQL audit, user-scoped
-│   │   ├── agent_tool_wrappers.py# FunctionTool registry (incl. recall_legal_graph_func_tool)
+│   │   ├── agent_tool_wrappers.py# FunctionTool registry (30+ tools, Pydantic fn_schema on calc tools, recall_legal_graph_func_tool)
+│   │   ├── tool_router.py        # Semantic tool router — query↔tool-description embedding top-k cosine (keyword fallback)
+│   │   ├── memory_short_term.py  # Short-term memory — Redis cross-worker rolling summary (CoALA layer 2)
+│   │   ├── procedural_memory.py  # Procedural memory — CASE_WORKFLOWS per case_type → workflow_block (CoALA layer 5)
+│   │   ├── memory_metrics.py     # Prometheus counters for memory ops (no-op safe fallback)
 │   │   ├── import_data.py        # Legacy JSONL importer (incremental) + graph-ingest hook
 │   │   └── pipeline/             # Multi-source Ingestion Pipeline
 │   │       ├── orchestrator.py   # one core loop, idempotent, per-doc isolation
@@ -183,6 +256,8 @@ Chatbot-Legal-RAG/
 │   │       └── connectors/       # jsonl_qa, markdown, html, pdf + base
 │   ├── Dockerfile                # Container configuration
 │   ├── entrypoint.sh             # Container startup script
+│   ├── scripts/
+│   │   └── backfill_user_profiles.py  # One-shot idempotent backfill: UserEpisode → UserProfile (dry-run default)
 │   └── requirements.txt          # Python dependencies
 │
 ├── 🌐 frontend/                   # Web interface (Streamlit)
@@ -236,7 +311,16 @@ Chatbot-Legal-RAG/
 │   ├── test_verify_answer.py     # Phase 1 — PEV gate logic + verify recovery loop (10 tests)
 │   ├── test_metacognitive.py     # Phase 2 — stakes classifier + escalation E2E (13 tests)
 │   ├── test_graph_memory.py      # Phase 3 — Neo4j ingest/recall with fake driver (12 tests)
-│   └── test_rlhf_store.py        # Phase 4 — 👍/👎 store + few-shot + rerank boost (12 tests)
+│   ├── test_rlhf_store.py        # Phase 4 — 👍/👎 store + few-shot + rerank boost (12 tests)
+│   ├── test_short_term_memory_redis.py # CoALA layer 2 — Redis rolling summary + cross-worker consistency (8)
+│   ├── test_episodic_extraction.py     # CoALA layer 3 — delta-only extract, pollution guard (8)
+│   ├── test_rag_context_no_contamination.py # FLAW 3 — RAG prompt clean of stale episodic facts (5)
+│   ├── test_structured_profile.py      # CoALA layer 4 — UserProfile merge + procedural workflow (14)
+│   ├── test_working_memory_state.py    # CoALA layer 1 — ChatGraphState slots + tool_budget (5)
+│   ├── test_memory_eval.py             # Memory golden regression gate — FLAW1-4 + P4/P5/P6 (8)
+│   ├── test_tool_selection.py           # Keyword tool-filter fallback (retrieval-first) regression (3)
+│   ├── test_tool_router.py             # Semantic tool router — cosine/always-include/fallback (8 + 1 integration)
+│   └── test_calc_tool_validation.py     # Pydantic fn_schema validation on 6 calc tools (10)
 │
 ├── 📝 docs/                       # Documentation
 │   ├── ARCHITECTURE.md           # System architecture guide
@@ -276,12 +360,13 @@ One orchestrator loop, many connectors. Adding a data source = adding one connec
 *   **Garbage Collection:** automatically deletes orphaned vector chunks from Qdrant and metadata rows from MySQL.
 
 ### 4. Agentic Legal Calculators (ReAct Agent)
-Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing the module never requires LLM env vars/network). Memory is **per-conversation** — keyed by `(user_id, conversation_id)` in an LRU cache (cap 32), fixing a prior global-memory cross-user leak. Tool calls are captured via the `agent_tool_calls` contextvar (`@track_tool_call`) and surfaced through the graph → Celery result → async poll as an optional `tool_calls` array. The agent triggers programmatic tools, each guarded by input-range validation:
+Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing the module never requires LLM env vars/network). Memory is **per-conversation** — short-term rolling summary now lives in **Redis** (cross-worker source of truth) with an LRU cache (cap 32) read-through, fixing the prior RAM-local multi-worker drift. Tool calls are captured via the `agent_tool_calls` contextvar (`@track_tool_call`) and surfaced through the graph → Celery result → async poll as an optional `tool_calls` array. The agent triggers programmatic tools, each guarded by **Pydantic `fn_schema` input validation** (coerce + range-check + clean Vietnamese JSON error on bad args — no crash, no silent garbage) and selected per turn by the **semantic tool router**:
 *   **Contract Penalty Calculator:** penalty fees under commercial law, applying the 12% legal ceiling cap of contract value.
 *   **Inheritance Share Calculator:** splits inheritance among the first line of heirs under the Vietnamese Civil Code.
 *   **Legal Age Verifier:** checks age eligibility for signing contracts, marriage, work, and criminal liability (gender-aware: male 20 / female 18 for marriage).
 *   **Business Naming Validator:** flags business names violating legal naming guidelines.
 *   **Statute of Limitations Lookup:** time limits for civil, labor, administrative, and criminal cases.
+*   **Knowledge-driven calculators:** severance pay (Điều 48 BL LĐ 2019), overtime pay (Điều 107), PIT monthly (luỹ tiến), land & vehicle registration fee (trước bạ), court fee (NQ 326), child support.
 *   **Web tools:** Google-style search, Tavily AI search, Tavily Q&A quick-answer.
 
 ### 4b. Multi-Agent Planner & Supervisor Handoff
@@ -289,9 +374,18 @@ Powered by LlamaIndex `ReActAgent` (built **lazily** on first use so importing t
 *   **Supervisor (`supervisor.py`):** after each specialist answers, an LLM emits a `<handoff next="...|END" rationale="..."/>` decision. Prefers the LLM; on failure/unparseable output falls back to `heuristic_handoff` (the same Vietnamese keyword markers used before — `không tìm thấy` → web, `cần tra cứu` → rag/tool). `MAX_HANDOFF_STEPS=5` loop guard forces END so a handoff chain cannot loop forever.
 *   **Non-invasive:** wraps the existing CRAG RAG loop (`route → planner → specialist → supervisor → {next | metacognitive → END}`) without removing any prior node/edge.
 
-### 5. Episodic Memory
-*   **Long-Term Memory:** extracts key facts from sessions and stores them as vectors in Qdrant.
-*   **Contextual Retrieval:** dual-retrieval (laws + conversation context history) for personalized answers.
+### 5. 5-Layer CoALA Memory (Working / Short / Episodic / Semantic / Procedural)
+*   **Short-Term (`memory_short_term.py`):** Redis-backed rolling summary + count, key `mem:short:{user}:{conv}:{summary|count}`, TTL 7d, LRU32 read-through cache. The cross-worker source of truth — two uvicorn/Celery workers see the same summary (fixes FLAW 1). Graceful fallback to in-process dict when Redis is down.
+*   **Episodic (`save_episodic_memory_task`):** delta-only extraction (O(1)/turn, never re-summarizes full history, never ingests assistant text) via `prompts/episodic_extract.v1.txt` + `strip_legal_citations` regex. Stores `UserEpisode` (MySQL audit) + Qdrant vector (semantic recall), dedup `score_threshold=0.88`, uuid5 idempotent points (fixes FLAW 2).
+*   **Semantic (`models.UserProfile`):** structured KV (name, birth_year, gender, location, case_type, case_summary) merged idempotently (non-null fields only) by `merge_user_profile`. Backed up by `backend/scripts/backfill_user_profiles.py`.
+*   **Procedural (`procedural_memory.py`):** `CASE_WORKFLOWS` per case_type (inheritance/land/marriage/business/traffic/other) → `workflow_block()` scaffold injected into the agent system prompt when the user's `case_type` is known.
+*   **ReAct recall (MemGPT pattern):** the `recall_user_memory_tool` (threshold 0.65) lets the **agent decide** when to recall long-term memory, instead of auto-injecting episodic facts into every RAG prompt (FLAW 3, disabled by `RAG_AUTO_INJECT_DISABLED=1`).
+*   **Online monitoring:** Prometheus counters in `memory_metrics.py` (`memory_short_term_hits/misses`, `episodic_extractions{result}`, `episodic_pollution`, `react_recall{hit}`, `profile_merge{field}`).
+
+### 5b. Semantic Tool Router (`tool_router.py`)
+*   **Embedding-based selection:** the query is embedded against each tool's description; top-k above `TOOL_SIM_THRESHOLD=0.30` are kept. Robust to paraphrase — *"công ty cho tôi nghỉ"* matches `severance_pay_tool` with no keyword overlap. The tool-description index is built once per process.
+*   **Graceful fallback:** returns `None` when disabled or the embedding service is down → `filter_tools_for_query` falls back to the keyword path, so behavior never regresses.
+*   **Always-include contract:** `legal_disclaimer` + `current_time` + `tavily` are always attached; `recall_user_memory` is added when conversation history exists — matching the old keyword-path contract.
 
 ### 6. Multi-Layered Safety Guardrails
 *   **Input Protection:** detects jailbreaks, prompt injections, and politically sensitive queries (NVIDIA NeMo Guardrails).
@@ -375,6 +469,10 @@ The legal tools are also exposed as an **MCP** (Model Context Protocol) server, 
 *   **Graph Database:** Neo4j 5.20 (legal knowledge graph: Statute→Article multi-hop recall)
 *   **Relational Database:** PostgreSQL / MySQL (for logs, chat history, RLHF audit, and status checks)
 *   **AI Agent & Retrieval Orchestration:** LlamaIndex, LangGraph, NVIDIA NeMo Guardrails
+*   **Agent Memory:** CoALA / MemGPT 5-layer (Redis short-term + MySQL episodic/semantic + Qdrant episodic + procedural scaffold)
+*   **Tool Selection:** Semantic embedding router (query↔tool-description cosine) with keyword fallback
+*   **Input Validation:** Pydantic v2 `fn_schema` on every arithmetic tool
+*   **Monitoring:** Prometheus counters (memory + tool ops, no-op safe) at `/metrics`
 *   **Vietnamese Text Embedding:** BGE-M3 (locally hosted/served, or Cohere cloud backup)
 *   **LLM Providers:** Llama-3.1-8B-Instruct (via Groq/Ollama), OpenAI, self-hosted Legal LLM
 *   **CI/CD & Containers:** Docker, Docker Compose, GitHub Actions
@@ -522,13 +620,19 @@ python -m pytest tests/ -v
 Agentic-feature units (no live Neo4j / Qdrant / MySQL required — all use fakes/mocks):
 
 ```bash
-python -m pytest tests/test_verify_answer.py tests/test_metacognitive.py \
-                  tests/test_graph_memory.py tests/test_rlhf_store.py -v
+# Memory architecture golden gate (CoALA 5-layer, FLAW 1-4)
+python -m pytest tests/test_short_term_memory_redis.py tests/test_episodic_extraction.py \
+                  tests/test_rag_context_no_contamination.py tests/test_structured_profile.py \
+                  tests/test_working_memory_state.py tests/test_memory_eval.py -v
+
+# Tool-calling: semantic router + Pydantic validation + keyword fallback
+python -m pytest tests/test_tool_router.py tests/test_calc_tool_validation.py \
+                  tests/test_tool_selection.py -v
 ```
 
-Current suite: **273 passing** (incl. Phase 1 verify_answer 10, Phase 2 metacognitive 13, Phase 3 graph memory 12, Phase 4 RLHF 12).
+Current suite: **656 passing** (offline gate) — incl. memory rebuild (48: short-term 8, episodic 8, no-contamination 5, structured-profile 14, working-memory 5, eval gate 8), tool-calling (21: semantic router 8+1, Pydantic calc 10, keyword fallback 3), plus Phase 1 verify_answer 10, Phase 2 metacognitive 13, Phase 3 graph memory 12, Phase 4 RLHF 12, and the security/RBAC/approval/auth/checkpoint/trace/SSE suites. The `test_tool_router.py::test_real_paraphrase_matches_severance` integration test (real embedding, ~105s) is deselected by the offline gate.
 
-See [`docs/TESTING.md`](docs/TESTING.md) for full test suite coverage (including security layer, checkpointing, trace tables, CRAG flows, SSE streaming, memory leakage, PEV verify, metacognitive escalation, Neo4j graph memory, and RLHF feedback tests).
+See [`docs/TESTING.md`](docs/TESTING.md) for full test suite coverage (including security layer, checkpointing, trace tables, CRAG flows, SSE streaming, memory leakage, PEV verify, metacognitive escalation, Neo4j graph memory, RLHF feedback, CoALA 5-layer memory, and semantic tool router tests).
 
 ---
 

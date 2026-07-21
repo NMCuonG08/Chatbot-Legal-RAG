@@ -349,9 +349,36 @@ class ChatGraphState(TypedDict, total=False):
     verify_rationale: str
     verify_verdict: str               # "supported" | "partial" | "unsupported"
     retry_verify: int                 # verify -> rewrite_query recovery guard
+    # P5 — Working memory scratchpad (CoALA working layer). All optional; the
+    # graph populates current_intent/active_entities at route, tool_budget at
+    # start, and the ReAct loop decrements tool_calls_made. scratchpad is an
+    # opt-in free-text note (e.g. verify_answer can record a grounding caveat).
+    active_entities: Dict             # entities resolved this turn (e.g. {"user_name": "A"})
+    current_intent: str               # route-derived intent label (inheritance/land/...)
+    tool_budget: int                  # max tool calls allowed for this run
+    tool_calls_made: int               # tool calls executed so far (incremented in ReAct)
+    scratchpad: str                    # opt-in working note carried across nodes
 
 celery_app = get_celery_app(__name__)
 celery_app.autodiscover_tasks()
+
+
+# P5 — working-memory tool-budget helper. The ReAct loop (agent.py) calls this
+# after each tool execution so the graph state tracks tool_calls_made and can
+# short-circuit when tool_calls_made >= tool_budget. Returns the new dict to
+# merge into the LangGraph state (immutable update pattern).
+def increment_tool_calls(state: ChatGraphState, note: str = "") -> Dict:
+    made = int(state.get("tool_calls_made", 0)) + 1
+    update: Dict = {"tool_calls_made": made}
+    if note:
+        prev = state.get("scratchpad", "") or ""
+        update["scratchpad"] = (prev + "\n" + note).strip() if prev else note
+    return update
+
+
+def tool_budget_exhausted(state: ChatGraphState) -> bool:
+    """True when tool_calls_made has reached/exceeded tool_budget."""
+    return int(state.get("tool_calls_made", 0)) >= int(state.get("tool_budget", 10))
 
 
 from celery.signals import worker_process_init
@@ -490,6 +517,35 @@ def _retrieve_episodic_context(user_id: str | None, question: str) -> str:
         return ""
 
 
+# FLAW 3 fix: episodic memory is NO LONGER auto-injected into the RAG system
+# prompt. The ReAct ``recall_user_memory_tool`` (agent-decided, MemGPT pattern)
+# is the correct recall path — the agent calls it only when the query signals
+# recall. Auto-injecting every RAG turn bled stale facts into unrelated
+# questions (inheritance fact -> vehicle question). This flag defaults to the
+# NEW behavior (disabled = no inject); set ``RAG_AUTO_INJECT_DISABLED=false`` to
+# roll back to the legacy auto-inject for one release window (P7).
+_RAG_AUTO_INJECT_DISABLED = os.environ.get("RAG_AUTO_INJECT_DISABLED", "true").lower() == "true"
+
+
+def _episodic_background_block(user_id: str | None, question: str) -> str:
+    """Return the legacy episodic background block, or "" when auto-inject is off.
+
+    FLAW 3: defaults to "" (auto-inject disabled). Retained only as a rollback
+    path (``RAG_AUTO_INJECT_DISABLED=false``); the forward path relies on
+    ``recall_user_memory_tool`` instead.
+    """
+    if _RAG_AUTO_INJECT_DISABLED:
+        return ""
+    episodic_context = _retrieve_episodic_context(user_id, question)
+    if not episodic_context:
+        return ""
+    return (
+        "\n\n[Ngữ cảnh phụ — sự kiện người dùng từ các cuộc trò chuyện trước, "
+        "chỉ dùng để cá nhân hóa, KHÔNG được tóm tắt hay lặp lại trong câu trả lời]:\n"
+        f"{episodic_context}\n"
+    )
+
+
 def _apply_rlhf_rerank_boost(ranked_docs: List[Dict], user_id, question: str) -> List[Dict]:
     """Phase 4 — up-weight chunks whose ``doc_id`` backed a 👍-marked answer.
 
@@ -625,24 +681,14 @@ def generate_rag_answer(history, question, user_id=None):
     ranked_docs = blend_hybrid_rerank(ranked_docs)
     logger.info(f"Top {len(ranked_docs)} documents after reranking + blend")
 
-    # Episodic memory retrieval (delegated to shared helper, reused by CRAG generate_node)
-    episodic_context = _retrieve_episodic_context(user_id, standalone_question)
+    # FLAW 3: episodic memory is NOT auto-injected (recall is agent-decided via
+    # recall_user_memory_tool). _episodic_background_block returns "" unless
+    # RAG_AUTO_INJECT_DISABLED=false (rollback path).
+    background_block = _episodic_background_block(user_id, standalone_question)
 
     system_prompt = load_prompt("generate") + _date_context_block() + CITATION_RULE
 
     doc_context = gen_doc_prompt(ranked_docs)
-
-    # Episodic context moved INTO the system prompt as a clearly-labeled
-    # background hint (not in the user message). Putting it in the user message
-    # caused weak models to mimic it and output a summary OF the user instead
-    # of answering the new question.
-    background_block = ""
-    if episodic_context:
-        background_block = (
-            "\n\n[Ngữ cảnh phụ — sự kiện người dùng từ các cuộc trò chuyện trước, "
-            "chỉ dùng để cá nhân hóa, KHÔNG được tóm tắt hay lặp lại trong câu trả lời]:\n"
-            f"{episodic_context}\n"
-        )
 
     openai_messages = (
         [{"role": "system", "content": system_prompt + background_block}]
@@ -845,9 +891,21 @@ def _build_chat_graph():
             standalone_question = follow_up_question(history, question)
 
         _trace_node_end(state, "route", {"route": route})
+        # P5 — working memory: seed intent from route + init tool budget.
+        # active_entities starts empty (real entity extraction is a later
+        # upgrade; the slot is the contract). tool_budget caps the ReAct loop.
+        try:
+            max_tools = int(getattr(config, "AGENT_MAX_ITERATIONS", 10))
+        except Exception:
+            max_tools = 10
         return {
             "route": route,
             "standalone_question": standalone_question,
+            "current_intent": route,
+            "active_entities": {},
+            "tool_budget": max_tools,
+            "tool_calls_made": 0,
+            "scratchpad": "",
         }
 
     # ---- Phase 3: planner ----
@@ -1017,19 +1075,12 @@ def _build_chat_graph():
         graded = state.get("graded_docs", [])
         ranked_docs = [d for d in graded if d.get("relevance") == "relevant"] or list(graded)
 
-        episodic_context = _retrieve_episodic_context(user_id, question)
+        # FLAW 3: no auto-inject (agent-decided recall via recall_user_memory_tool).
+        background_block = _episodic_background_block(user_id, question)
 
         system_prompt = load_prompt("generate") + _date_context_block() + CITATION_RULE
 
         doc_context = gen_doc_prompt(ranked_docs)
-
-        background_block = ""
-        if episodic_context:
-            background_block = (
-                "\n\n[Ngữ cảnh phụ — sự kiện người dùng từ các cuộc trò chuyện trước, "
-                "chỉ dùng để cá nhân hóa, KHÔNG được tóm tắt hay lặp lại trong câu trả lời]:\n"
-                f"{episodic_context}\n"
-            )
 
         openai_messages = (
             [{"role": "system", "content": system_prompt + background_block}]
@@ -1114,15 +1165,33 @@ def _build_chat_graph():
             resp = guardrails_manager.add_legal_disclaimer(resp, question)
         _trace_node_end(state, "agent_tools", {"answer_len": len(resp), "tool_calls": len(tool_calls)})
 
+        # Deduplicate handoffs: if ReAct agent already called web/retrieval tools during this run,
+        # set done flags to prevent duplicate supervisor handoffs.
+        called_names = [tc.get("tool_name", "") for tc in (tool_calls or [])]
+        executed_web = any("tavily" in name or "web_search" in name or "google_search" in name for name in called_names)
+        executed_rag = any(name in ("article_lookup_func_tool", "precedent_lookup_func_tool", "cross_reference_func_tool", "unified_legal_search_func_tool") for name in called_names)
+
+        done_flag = "agent_to_rag_done"
+        if executed_rag:
+            state["agent_to_rag_done"] = True
+        if executed_web:
+            state["web_to_agent_done"] = True
+            state["generate_to_web_done"] = True
+
         # Phase 3: supervisor-driven handoff (LLM decision with heuristic
         # fallback). Replaces the bare _should_handoff_to_rag heuristic.
-        cmd = _supervisor_next(state, "tool", resp, "agent_to_rag_done")
+        cmd = _supervisor_next(state, "tool", resp, done_flag)
         if cmd is not None:
             # Preserve tool_calls + standalone_question for the retrieve node.
             update = dict(cmd.update)
             update["standalone_question"] = question
             update["tool_calls"] = tool_calls
             update["sources"] = agent_sources_list
+            if executed_web:
+                update["web_to_agent_done"] = True
+                update["generate_to_web_done"] = True
+            if executed_rag:
+                update["agent_to_rag_done"] = True
             return Command(goto=cmd.goto, update=update)
 
         # Phase 5 — carry retrieval-tool sources into verify_answer so the agent
@@ -1565,44 +1634,169 @@ def bot_route_answer_message(history, question):
     return run_chat_graph(history, question)
 
 
-@shared_task()
-def save_episodic_memory_task(user_id: str, conversation_id: str):
+_EPISODIC_DELTA_ENABLED = os.environ.get("EPISODIC_DELTA_ENABLED", "true").lower() == "true"
+
+# Match legal citations to strip before episodic extraction, so bot law text
+# never bleeds into user facts (FLAW 2). Patterns: "Điều 100", "Điều 100 Bộ luật...",
+# "Luật Đất đai", "theo khoản 2", "[Tài liệu 1]", "(Điều 123)".
+_LEGAL_CITATION_RE = re.compile(
+    r"(\bĐiều\s+\d+[^\n.]{0,60}?"
+    r"|\bLuật\s+[A-ZÀ-Ỹ][^\n.,;]{0,40}"
+    r"|\btheo\s+(khoản|điểm|clause)\s+\d+[^\n.,;]{0,30}"
+    r"|\[\s*Tài liệu\s*\d+\s*\]"
+    r"|\(Điều\s*\d+[^)]*\))",
+    re.IGNORECASE,
+)
+
+
+def strip_legal_citations(text: str) -> str:
+    """Remove legal citations / statute references from user text.
+
+    Prevents bot-injected law text ("Điều 100…", "Luật Đất đai…") from being
+    extracted as a personal user fact. Idempotent + safe on plain text.
     """
-    Asynchronously extract key personal facts, situation, and preferences from conversation history,
-    then save to MySQL and Qdrant.
+    if not text:
+        return ""
+    cleaned = _LEGAL_CITATION_RE.sub("", text)
+    # Collapse whitespace gaps left by removed citations.
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
+def _parse_episodic_json(raw: str) -> dict | None:
+    """Parse the episodic_extract prompt JSON. Returns None on NONE/invalid.
+
+    Tolerant of leading/trailing prose; finds the first ``{`` ... last ``}``.
+    """
+    if not raw:
+        return None
+    stripped = raw.strip()
+    if stripped.upper() == "NONE":
+        return None
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    import json
+    try:
+        data = json.loads(stripped[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+@shared_task()
+def save_episodic_memory_task(user_id: str, conversation_id: str, delta_message: dict | None = None):
+    """Extract personal facts from the LATEST user turn (event-driven, O(1)/turn).
+
+    FLAW 2 fix: previously loaded the FULL conversation history every turn and
+    re-summarized user+bot together (O(N²) cost, bot law text bled into user
+    facts). Now:
+      - Preferred path: ``delta_message={"role":"user","content":...}`` (the
+        current user turn only) — no DB read, O(1).
+      - Legacy path (delta_message=None, e.g. backfill/old callers): loads
+        history but ingests ONLY the last ``role=="user"`` message. Assistant
+        content is NEVER ingested.
+      - Legal citations stripped (``strip_legal_citations``) before extraction.
+      - New ``episodic_extract`` prompt outputs structured JSON. ``facts``
+        joined into the summary text (back-compat with save_user_episode +
+        Qdrant dedup); ``structured`` reserved for P4 UserProfile merge.
+
+    Dedup (score_threshold=0.88), uuid5 idempotency, MySQL save_user_episode,
+    and Qdrant add_vector are unchanged.
     """
     try:
         from models import get_conversation_messages, save_user_episode
         from vectorize import add_vector
-        import uuid
+        from memory_metrics import (
+            inc_episodic_extraction, inc_episodic_pollution,
+        )
 
-        messages = get_conversation_messages(conversation_id)
-        if not messages or len(messages) < 2:
-            logger.info("Not enough messages to summarize episodic memory.")
+        # Resolve the single user message to extract from.
+        user_text = ""
+        if delta_message and isinstance(delta_message, dict):
+            user_text = str(delta_message.get("content", "") or "")
+        elif _EPISODIC_DELTA_ENABLED:
+            # Legacy caller with no delta: load history, take LAST user turn only.
+            messages = get_conversation_messages(conversation_id)
+            if not messages:
+                logger.info("No messages for episodic extraction.")
+                inc_episodic_extraction("skipped_empty")
+                return "skipped_empty"
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    user_text = str(msg.get("content", "") or "")
+                    break
+            if not user_text:
+                logger.info("No user message found in history for episodic extraction.")
+                inc_episodic_extraction("skipped_empty")
+                return "skipped_empty"
+        else:
+            # Full-legacy fallback (rollback flag): original full-history path.
+            messages = get_conversation_messages(conversation_id)
+            if not messages or len(messages) < 2:
+                logger.info("Not enough messages to summarize episodic memory.")
+                inc_episodic_extraction("skipped_empty")
+                return "skipped_empty"
+            user_text = "\n".join(
+                str(m.get("content", "")) for m in messages if m.get("role") == "user"
+            )
+
+        user_text = strip_legal_citations(user_text)
+        if not user_text.strip():
+            logger.info(f"Empty user text after citation strip for user {user_id}.")
+            inc_episodic_extraction("skipped_empty")
             return "skipped_empty"
 
-        # Standard format conversation string for prompt
-        conversation_str = ""
-        for msg in messages:
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-            conversation_str += f"{role.upper()}: {content}\n"
-
-        summary_prompt = load_prompt("summarize", conversation_str=conversation_str)
+        extract_prompt = load_prompt("episodic_extract", user_message=user_text)
 
         summary_result = openai_chat_complete([
-            {"role": "system", "content": "Bạn là chuyên gia trích xuất thông tin hội thoại pháp luật."},
-            {"role": "user", "content": summary_prompt}
+            {"role": "system", "content": "Bạn là chuyên gia trích xuất thông tin cá nhân từ hội thoại pháp luật."},
+            {"role": "user", "content": extract_prompt}
         ]).strip()
 
-        if not summary_result or summary_result.upper() == "NONE":
-            logger.info(f"No meaningful episodic memories extracted for user {user_id}.")
-            return "skipped_none"
+        # Parse structured JSON. If JSON present, derive the storage summary from
+        # facts (keeps save_user_episode + Qdrant dedup/vector working). If the
+        # model returned plain NONE or unparseable text, fall back to raw.
+        parsed = _parse_episodic_json(summary_result)
+        if parsed is None:
+            if not summary_result or summary_result.upper() == "NONE":
+                logger.info(f"No personal facts extracted for user {user_id}.")
+                inc_episodic_extraction("skipped_none")
+                return "skipped_none"
+            # Unparseable non-NONE: treat raw as the fact text (defensive).
+            facts_text = summary_result
+            structured = None
+        else:
+            facts = parsed.get("facts") or []
+            if not facts:
+                logger.info(f"No personal facts extracted for user {user_id}.")
+                inc_episodic_extraction("skipped_none")
+                return "skipped_none"
+            facts_text = "\n".join(str(f) for f in facts)
+            structured = parsed.get("structured")
 
-        logger.info(f"Extracted episodic memories for user {user_id}:\n{summary_result}")
+        logger.info(f"Extracted episodic memories for user {user_id}:\n{facts_text}")
+
+        # P4 hook: merge structured fields into UserProfile when available.
+        # Guarded so P2 ships without the UserProfile table; P4 wires the import.
+        if structured and os.environ.get("STRUCTURED_PROFILE_ENABLED", "false").lower() == "true":
+            try:
+                from models import merge_user_profile  # noqa: WPS433 (P4)
+                merge_user_profile(user_id, structured)
+            except Exception as profile_err:  # pragma: no cover - P4 path
+                logger.warning(f"UserProfile merge skipped: {profile_err}")
+
+        # P6c — pollution guard: if a legal citation survived strip+extract into
+        # the stored fact text, flag it (target 0). Belt-and-suspenders: the
+        # extraction prompt forbids law text, but detect regressions empirically.
+        if _LEGAL_CITATION_RE.search(facts_text):
+            inc_episodic_pollution()
 
         # Compute embedding once; reused for dedup check and Qdrant upsert.
-        vector = get_embedding(summary_result)
+        vector = get_embedding(facts_text)
 
         # Dedup: skip if a near-identical fact is already stored for this user
         # (e.g. "sinh năm 2004" saved every turn). High threshold to only catch
@@ -1617,28 +1811,29 @@ def save_episodic_memory_task(user_id: str, conversation_id: str):
             )
             if existing:
                 logger.info(f"Episodic dedup: similar fact already stored for user {user_id}, skipping save.")
+                inc_episodic_extraction("skipped_duplicate")
                 return "skipped_duplicate"
         except Exception as dedup_err:
             logger.warning(f"Episodic dedup check failed (proceeding to save): {dedup_err}")
 
         # Save to MySQL
-        save_user_episode(user_id, summary_result)
+        save_user_episode(user_id, facts_text)
 
         # Save to Qdrant. Deterministic point id (uuid5 of user_id + summary)
         # makes the upsert idempotent: if the dedup check was skipped (e.g. a
         # transient Qdrant error) and the same fact is saved again, the
         # second write overwrites the same point instead of creating a
         # duplicate (uuid4 would create a new point every turn).
-        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{user_id}|{summary_result}"))
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{user_id}|{facts_text}"))
 
         vectors_payload = {
             point_id: {
                 "vector": vector,
                 "payload": {
                     "user_id": user_id,
-                    "summary": summary_result,
+                    "summary": facts_text,
                     "conversation_id": conversation_id,
-                    "content": summary_result  # Keep content to be compatible with search_vector payload format
+                    "content": facts_text  # Keep content to be compatible with search_vector payload format
                 }
             }
         }
@@ -1648,9 +1843,11 @@ def save_episodic_memory_task(user_id: str, conversation_id: str):
             vectors=vectors_payload
         )
         logger.info(f"Successfully saved episodic memory vector for user {user_id}")
+        inc_episodic_extraction("success")
         return "success"
     except Exception as e:
         logger.error(f"Failed in save_episodic_memory_task: {e}")
+        inc_episodic_extraction("error")
         return f"error: {str(e)}"
 
 
@@ -1850,8 +2047,12 @@ def llm_handle_message(self, bot_id, user_id, question, role=None,
     # degraded to an error — an error reply carries no real user facts.
     if not blocked_response and not graph_failed and (user_id or "").strip() not in _SHARED_USER_SENTINELS:
         try:
-            save_episodic_memory_task.delay(user_id, conversation_id)
-            logger.info("Triggered save_episodic_memory_task asynchronously")
+            save_episodic_memory_task.delay(
+                user_id,
+                conversation_id,
+                delta_message={"role": "user", "content": question},
+            )
+            logger.info("Triggered save_episodic_memory_task asynchronously (delta-only)")
         except Exception as t_err:
             logger.error(f"Failed to trigger save_episodic_memory_task: {t_err}")
 

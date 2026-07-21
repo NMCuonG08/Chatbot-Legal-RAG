@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import List, Optional
 from xml.dom import ValidationErr
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, delete
+from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, Text, delete
 from sqlalchemy.future import select
 from sqlalchemy.orm import DeclarativeBase, Session
 from sqlalchemy.sql import func
@@ -285,6 +285,30 @@ class UserEpisode(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class UserProfile(Base):
+    """Structured long-term memory (CoALA semantic layer) — KV profile per user.
+
+    Distinct from ``UserEpisode`` (audit raw facts) and the Qdrant
+    ``user_episodes`` collection (semantic recall): this is the cheap,
+    directly-addressable structured profile the agent reads via
+    ``recall_user_memory_tool``'s ``profile`` key and that
+    ``save_episodic_memory_task`` merges into from the extraction prompt's
+    ``structured`` field. Auto-created by ``ensure_database_schema`` (create_all).
+    """
+    __tablename__ = "user_profiles"
+
+    user_id = Column(String(100), primary_key=True)
+    name = Column(String(200), nullable=True)
+    birth_year = Column(Integer, nullable=True)
+    gender = Column(String(20), nullable=True)
+    location = Column(String(200), nullable=True)
+    case_type = Column(String(50), nullable=True, index=True)
+    case_summary = Column(Text, nullable=True)
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class AgentFeedback(Base):
     """RLHF user-feedback store (Phase 4). Mirror of 👍/👎 on an assistant
     message. Auto-created by ``ensure_database_schema`` (create_all). The
@@ -550,6 +574,129 @@ def get_user_episodes(user_id: str, limit: int = 20) -> list[UserEpisode]:
         ).scalars().all()
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# UserProfile accessors (CoALA structured/semantic memory).
+# All merge operations update ONLY non-null fields — a null in the incoming
+# payload NEVER overwrites an existing value (idempotent partial update).
+# ---------------------------------------------------------------------------
+
+# Whitelist of mergeable fields + their coercion. Anything outside this map is
+# ignored so a malformed extraction payload can't write arbitrary columns.
+_PROFILE_FIELDS = {
+    "name": lambda v: str(v) if v not in (None, "") else None,
+    "birth_year": lambda v: int(v) if str(v).strip().isdigit() else None,
+    "gender": lambda v: str(v) if v not in (None, "") else None,
+    "location": lambda v: str(v) if v not in (None, "") else None,
+    "case_type": lambda v: str(v) if v not in (None, "") else None,
+    "case_summary": lambda v: str(v) if v not in (None, "") else None,
+}
+
+
+def _coerce_profile_field(field: str, value):
+    try:
+        return _PROFILE_FIELDS[field](value)
+    except Exception:
+        return None
+
+
+def get_user_profile(user_id: str) -> dict | None:
+    """Return the user's structured profile as a dict, or None if absent."""
+    if not user_id:
+        return None
+    db = _new_db_session()
+    try:
+        row = db.execute(
+            select(UserProfile).where(UserProfile.user_id == user_id)
+        ).scalars().first()
+        if row is None:
+            return None
+        return {
+            "user_id": row.user_id,
+            "name": row.name,
+            "birth_year": row.birth_year,
+            "gender": row.gender,
+            "location": row.location,
+            "case_type": row.case_type,
+            "case_summary": row.case_summary,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
+    finally:
+        db.close()
+
+
+def save_user_profile(user_id: str, fields: dict, db: Session = None) -> UserProfile:
+    """Upsert a full profile row. ``fields`` keys must be in _PROFILE_FIELDS."""
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        row = db.execute(
+            select(UserProfile).where(UserProfile.user_id == user_id)
+        ).scalars().first()
+        if row is None:
+            row = UserProfile(user_id=user_id)
+            db.add(row)
+        for field in _PROFILE_FIELDS:
+            if field in fields:
+                setattr(row, field, _coerce_profile_field(field, fields[field]))
+        if session_created:
+            db.commit()
+        return row
+    finally:
+        if session_created:
+            db.close()
+
+
+def merge_user_profile(user_id: str, structured: dict, db: Session = None) -> dict | None:
+    """Merge ONLY non-null incoming fields into the user's profile.
+
+    Idempotent: a null/missing field in ``structured`` never overwrites an
+    existing stored value. Returns the post-merge profile dict (or None if
+    ``structured`` had no usable fields and no row existed).
+    """
+    if not user_id or not isinstance(structured, dict):
+        return get_user_profile(user_id)
+
+    # Build a payload containing only fields that have a non-null coerced value.
+    payload = {}
+    for field in _PROFILE_FIELDS:
+        if field in structured:
+            coerced = _coerce_profile_field(field, structured[field])
+            if coerced is not None:
+                payload[field] = coerced
+
+    if not payload:
+        # Nothing to merge; return current state unchanged.
+        return get_user_profile(user_id)
+
+    session_created = False
+    if db is None:
+        db = _new_db_session()
+        session_created = True
+    try:
+        row = db.execute(
+            select(UserProfile).where(UserProfile.user_id == user_id)
+        ).scalars().first()
+        if row is None:
+            row = UserProfile(user_id=user_id)
+            db.add(row)
+        for field, value in payload.items():
+            setattr(row, field, value)
+            # P6c — record which profile field was merged (per-field counter).
+            try:
+                from memory_metrics import inc_profile_merge
+                inc_profile_merge(field)
+            except Exception:
+                pass
+        if session_created:
+            db.commit()
+    finally:
+        if session_created:
+            db.close()
+    return get_user_profile(user_id)
 
 
 def get_doc_chunks(doc_id: str) -> list[DocumentChunk]:

@@ -14,12 +14,48 @@ real corpus or web_search before relying on a figure for a live user.
 
 import json
 import logging
+import re
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 CURRENT_YEAR = datetime.now().year
+
+
+def coerce_float(val: Any, default: float = 0.0) -> float:
+    """Safely coerce any int, float, or stringified number into a float."""
+    if isinstance(val, (int, float)):
+        return float(val)
+    if not val:
+        return default
+    s = str(val).lower().replace("vnđ", "").replace("vnd", "").replace("đ", "").strip()
+    if "." in s and "," in s:
+        if s.find(".") < s.find(","):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "." in s and s.count(".") > 1:
+        s = s.replace(".", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+    m = re.search(r"[-+]?\d*\.?\d+", s)
+    if m:
+        try:
+            return float(m.group(0))
+        except ValueError:
+            pass
+    return default
+
+
+def coerce_int(val: Any, default: int = 0) -> int:
+    """Safely coerce any int, float, or stringified number into an int."""
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    f = coerce_float(val, default=float(default))
+    return int(f)
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +79,8 @@ def calculate_severance_pay(monthly_salary: float, months_worked: int) -> Dict:
         Dict trợ cấp + căn cứ pháp lý.
     """
     try:
+        monthly_salary = coerce_float(monthly_salary, default=0.0)
+        months_worked = coerce_int(months_worked, default=0)
         if monthly_salary <= 0 or monthly_salary > 10**11:
             return {"error": "Mức lương không hợp lệ (0 - 100 tỷ VNĐ)."}
         if months_worked < 0 or months_worked > 600:

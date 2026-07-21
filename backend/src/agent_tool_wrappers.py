@@ -12,8 +12,10 @@ import functools
 import inspect
 import json
 import logging
+import os
 
 from llama_index.core.tools import FunctionTool
+from pydantic import BaseModel, Field, ValidationError
 
 import config
 from agent_tool_tracking import record_agent_source, track_tool_call
@@ -91,6 +93,83 @@ def sandboxable(tool_name: str):
     return _deco
 
 
+# ===== Pydantic input validation for calc tools (Flaw 4) =====
+# LlamaIndex FunctionTool.call() invokes the fn directly (self._fn(**kwargs))
+# with NO pydantic runtime validation — fn_schema only shapes the LLM-facing
+# JSON schema. So a bad arg ("5 năm" for float, "kết hôn" for int) either
+# crashes (legal_age: str < int -> TypeError) or silently computes garbage
+# (severance: "5 VNĐ"). @_validated runs pydantic coerce+validate in-process
+# BEFORE the fn body and returns a clean Vietnamese JSON error on failure.
+# Stacks INNERMOST (under @sandboxable): the in-process path validates; the
+# sandboxed path skips it (process isolation is the stronger guard there),
+# matching the existing sandboxable tradeoff note.
+def _validated(model_cls):
+    """Decorate a calc-tool fn with pydantic input validation.
+
+    Coerces numeric strings ("15000000" -> 15000000.0), rejects non-numeric /
+    out-of-range args with a clean JSON error (no raise, no silent garbage).
+    """
+    def _deco(fn):
+        @functools.wraps(fn)
+        def _wrapped(*args, **kwargs):
+            try:
+                bound = inspect.signature(fn).bind(*args, **kwargs)
+                bound.apply_defaults()
+                validated = model_cls(**bound.arguments)
+                coerced = validated.model_dump()
+                sig_params = inspect.signature(fn).parameters
+                clean = {k: v for k, v in coerced.items() if k in sig_params}
+                return fn(**clean)
+            except ValidationError as ve:
+                parts = []
+                for err in ve.errors():
+                    loc = ".".join(str(p) for p in err["loc"])
+                    parts.append(f"{loc}: {err['msg']}")
+                return json.dumps(
+                    {"error": "Tham số không hợp lệ — " + "; ".join(parts)},
+                    ensure_ascii=False,
+                )
+
+        return _wrapped
+    return _deco
+
+
+class SeveranceInput(BaseModel):
+    monthly_salary: float = Field(..., ge=0, le=10**12,
+                                  description="Lương bình quân 6 tháng cuối (VNĐ), ví dụ 15000000")
+    months_worked: int = Field(..., ge=0, le=600,
+                               description="Tổng số tháng làm việc, ví dụ 36")
+
+
+class PITMonthlyInput(BaseModel):
+    taxable_income: float = Field(..., ge=0,
+                                  description="Thu nhập tính thuế tháng (sau giảm trừ), VNĐ")
+
+
+class LandRegistrationFeeInput(BaseModel):
+    property_value: float = Field(..., ge=0, le=10**13,
+                                  description="Giá trị nhà/đất theo giá nhà nước (VNĐ)")
+    is_first_home: bool = Field(True, description="Lần đầu cấp sổ không")
+
+
+class CourtFeeInput(BaseModel):
+    claim_value: float = Field(..., ge=0, description="Giá trị yêu cầu (VNĐ). 0 nếu không có giá")
+    case_type: str = Field("civil_first", description="civil_first | civil_appeal | no_value")
+
+
+class LegalAgeInput(BaseModel):
+    birth_year: int = Field(..., ge=1900, le=2100, description="Năm sinh, ví dụ 2005")
+    action_type: str = Field("sign_contract",
+                             description="sign_contract | marriage | work | criminal_responsibility")
+    gender: str = Field("", description="male | female (bắt buộc khi action_type=marriage)")
+
+
+class InheritanceInput(BaseModel):
+    total_value: float = Field(..., ge=0, le=10**12,
+                               description="Tổng giá trị tài sản thừa kế (VNĐ)")
+    heirs_json: str = Field(..., description='JSON danh sách người thừa kế, ví dụ []')
+
+
 # ===== LEGAL CALCULATION TOOLS =====
 
 
@@ -124,6 +203,7 @@ def contract_penalty_calculator(
 
 @track_tool_call
 @sandboxable("legal_age_checker")
+@_validated(LegalAgeInput)
 def legal_age_checker(
     birth_year: int, action_type: str = "sign_contract", gender: str = ""
 ) -> str:
@@ -161,6 +241,7 @@ def legal_age_checker(
 
 @track_tool_call
 @sandboxable("inheritance_calculator")
+@_validated(InheritanceInput)
 def inheritance_calculator(total_value: float, heirs_json: str) -> str:
     """
     Tính phần thừa kế theo pháp luật Việt Nam (hàng thừa kế thứ nhất).
@@ -437,6 +518,7 @@ def verify_citation_tool(law_name: str, article_number: int, claimed_text: str) 
 
 @track_tool_call
 @sandboxable("severance_pay_tool")
+@_validated(SeveranceInput)
 def severance_pay_tool(monthly_salary: float, months_worked: int) -> str:
     """
     Tính trợ cấp thôi việc theo Điều 48 Bộ luật Lao động 2019.
@@ -472,6 +554,7 @@ def overtime_pay_tool(hourly_wage: float, hours: float, day_type: str = "weekday
 
 @track_tool_call
 @sandboxable("pit_monthly_tool")
+@_validated(PITMonthlyInput)
 def pit_monthly_tool(taxable_income: float) -> str:
     """
     Tính thuế TNCN lương tháng theo biểu lũy tiến (Luật Thuế TNCN + TT 111/2013).
@@ -488,6 +571,7 @@ def pit_monthly_tool(taxable_income: float) -> str:
 
 @track_tool_call
 @sandboxable("land_registration_fee_tool")
+@_validated(LandRegistrationFeeInput)
 def land_registration_fee_tool(property_value: float, is_first_home: bool = True) -> str:
     """
     Tính lệ phí trước bạ nhà đất (ND 10/2022; TT 80/2020). Mức 0,5%.
@@ -523,6 +607,7 @@ def vehicle_registration_fee_tool(vehicle_value: float, vehicle_type: str = "car
 
 @track_tool_call
 @sandboxable("court_fee_tool")
+@_validated(CourtFeeInput)
 def court_fee_tool(claim_value: float, case_type: str = "civil_first") -> str:
     """
     Tính án phí dân sự theo NQ 326/2016/UBTVQH14.
@@ -666,8 +751,8 @@ def legal_disclaimer_tool(question: str) -> str:
 
 # Legal calculation tools
 contract_penalty_tool = FunctionTool.from_defaults(fn=contract_penalty_calculator)
-legal_age_tool = FunctionTool.from_defaults(fn=legal_age_checker)
-inheritance_tool = FunctionTool.from_defaults(fn=inheritance_calculator)
+legal_age_tool = FunctionTool.from_defaults(fn=legal_age_checker, fn_schema=LegalAgeInput)
+inheritance_tool = FunctionTool.from_defaults(fn=inheritance_calculator, fn_schema=InheritanceInput)
 business_name_tool = FunctionTool.from_defaults(fn=business_name_validator)
 statute_tool = FunctionTool.from_defaults(fn=statute_lookup)
 
@@ -678,12 +763,12 @@ cross_reference_func_tool = FunctionTool.from_defaults(fn=cross_reference_tool)
 verify_citation_func_tool = FunctionTool.from_defaults(fn=verify_citation_tool)
 
 # Knowledge / data-driven legal tools
-severance_pay_func_tool = FunctionTool.from_defaults(fn=severance_pay_tool)
+severance_pay_func_tool = FunctionTool.from_defaults(fn=severance_pay_tool, fn_schema=SeveranceInput)
 overtime_pay_func_tool = FunctionTool.from_defaults(fn=overtime_pay_tool)
-pit_monthly_func_tool = FunctionTool.from_defaults(fn=pit_monthly_tool)
-land_registration_fee_func_tool = FunctionTool.from_defaults(fn=land_registration_fee_tool)
+pit_monthly_func_tool = FunctionTool.from_defaults(fn=pit_monthly_tool, fn_schema=PITMonthlyInput)
+land_registration_fee_func_tool = FunctionTool.from_defaults(fn=land_registration_fee_tool, fn_schema=LandRegistrationFeeInput)
 vehicle_registration_fee_func_tool = FunctionTool.from_defaults(fn=vehicle_registration_fee_tool)
-court_fee_func_tool = FunctionTool.from_defaults(fn=court_fee_tool)
+court_fee_func_tool = FunctionTool.from_defaults(fn=court_fee_tool, fn_schema=CourtFeeInput)
 admin_fine_lookup_func_tool = FunctionTool.from_defaults(fn=admin_fine_lookup_tool)
 child_support_func_tool = FunctionTool.from_defaults(fn=child_support_tool)
 procedure_wizard_func_tool = FunctionTool.from_defaults(fn=procedure_wizard_tool)
@@ -732,9 +817,14 @@ def recall_user_memory_tool(query: str, limit: int = 3) -> str:
             vector=query_vector,
             limit=limit,
             filters={"user_id": user_id},
-            score_threshold=0.5,
+            score_threshold=0.65,
         )
         if not episodes:
+            try:
+                from memory_metrics import inc_react_recall
+                inc_react_recall(False)
+            except Exception:
+                pass
             return json.dumps(
                 {"status": "no_match", "facts": [], "note": "Không tìm thấy fact cũ liên quan."},
                 ensure_ascii=False,
@@ -744,10 +834,29 @@ def recall_user_memory_tool(query: str, limit: int = 3) -> str:
             text = ep.get("content") or ep.get("summary") or ""
             if text:
                 facts.append({"fact": text, "score": ep.get("score")})
-        return json.dumps(
-            {"status": "ok", "facts": facts, "note": "Fact cũ liên quan — dùng làm ngữ cảnh phụ, vẫn trả lời câu hỏi hiện tại."},
-            ensure_ascii=False,
-        )
+        # P4 hook: attach structured profile so the agent gets cheap KV lookup
+        # alongside semantic recall. Guarded by STRUCTURED_PROFILE_ENABLED (P4);
+        # absent in P3 -> profile key omitted.
+        profile = None
+        try:
+            if os.environ.get("STRUCTURED_PROFILE_ENABLED", "false").lower() == "true":
+                from models import get_user_profile  # noqa: WPS433 (P4)
+                profile = get_user_profile(user_id)
+        except Exception:
+            profile = None
+        result = {
+            "status": "ok",
+            "facts": facts,
+            "note": "Fact cũ liên quan — dùng làm ngữ cảnh phụ, vẫn trả lời câu hỏi hiện tại.",
+        }
+        if profile:
+            result["profile"] = profile
+        try:
+            from memory_metrics import inc_react_recall
+            inc_react_recall(True)
+        except Exception:
+            pass
+        return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"status": "error", "facts": [], "error": str(e)}, ensure_ascii=False)
 

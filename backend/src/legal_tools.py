@@ -1,13 +1,62 @@
-"""
-Legal tools for Vietnamese law chatbot agent
-Simple, practical tools that don't require complex dependencies
-"""
-
 import logging
+import re
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+
+def coerce_float(val: Any, default: float = 0.0) -> float:
+    """Safely coerce any int, float, or stringified number into a float."""
+    if isinstance(val, (int, float)):
+        return float(val)
+    if not val:
+        return default
+    s = str(val).lower().replace("vnđ", "").replace("vnd", "").replace("đ", "").strip()
+    if "." in s and "," in s:
+        if s.find(".") < s.find(","):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "." in s and s.count(".") > 1:
+        s = s.replace(".", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+    m = re.search(r"[-+]?\d*\.?\d+", s)
+    if m:
+        try:
+            return float(m.group(0))
+        except ValueError:
+            pass
+    return default
+
+
+def coerce_int(val: Any, default: int = 0) -> int:
+    """Safely coerce any int, float, or stringified number into an int."""
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    f = coerce_float(val, default=float(default))
+    return int(f)
+
+
+class ContractPenaltyInput(BaseModel):
+    contract_value: float = Field(gt=0, description="Giá trị hợp đồng (VNĐ)")
+    penalty_rate: float = Field(ge=0, description="Tỷ lệ phạt (%/ngày)")
+    days_late: int = Field(ge=0, description="Số ngày chậm trễ")
+
+
+class LegalEntityAgeInput(BaseModel):
+    birth_year: int = Field(gt=1900, description="Năm sinh (4 chữ số)")
+    action_type: str = Field(default="sign_contract", description="Loại hành vi pháp lý")
+    gender: Optional[str] = Field(default="", description="Giới tính (male/female)")
+
+
+class InheritanceShareInput(BaseModel):
+    total_value: float = Field(gt=0, description="Tổng giá trị di sản (VNĐ)")
+    heirs: List[Dict[str, Any]] = Field(description="Danh sách người thừa kế")
 
 
 def calculate_contract_penalty(
@@ -25,6 +74,17 @@ def calculate_contract_penalty(
         Dict with penalty amount and details
     """
     try:
+        c_val = coerce_float(contract_value)
+        p_rate = coerce_float(penalty_rate)
+        d_late = coerce_int(days_late)
+
+        # Validate with Pydantic
+        inp = ContractPenaltyInput(
+            contract_value=c_val if c_val > 0 else 1.0,
+            penalty_rate=max(0.0, p_rate),
+            days_late=max(0, d_late),
+        )
+        contract_value, penalty_rate, days_late = inp.contract_value, inp.penalty_rate, inp.days_late
         # Theo Điều 418 Bộ luật Dân sự 2015: phạt vi phạm không quá 8% giá trị
         # phần nghĩa vụ hợp đồng bị vi phạm. Trần pháp định, KHÔNG phải "thông
         # lệ" 12% như bản cũ đã ghi sai.
@@ -72,6 +132,7 @@ def check_legal_entity_age(
         Dict with eligibility status and legal details
     """
     try:
+        birth_year = coerce_int(birth_year, default=2000)
         current_year = datetime.now().year
         age = current_year - birth_year
 

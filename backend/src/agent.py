@@ -44,6 +44,13 @@ from agent_tool_tracking import (  # noqa: F401
     agent_prev_tool_args,
 )
 from citations import strip_trailing_references
+from memory_short_term import (
+    clear_short_term,
+    get_rolling_summary,
+    get_summarized_count,
+    set_rolling_summary,
+    set_summarized_count,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -228,7 +235,7 @@ def _build_llm():
         return _single(groq_llm)
 
 
-def _get_agent_system_prompt(history_summary: str = "") -> str:
+def _get_agent_system_prompt(history_summary: str = "", user_id: Optional[str] = None) -> str:
     from datetime import datetime
     now = datetime.now()
     current_year = now.year
@@ -245,6 +252,19 @@ def _get_agent_system_prompt(history_summary: str = "") -> str:
             "\nDùng ngữ cảnh trên chỉ để bổ sung факт nền (năm sinh, giới tính, tình huống). "
             "Câu hỏi chính là câu mới nhất của người dùng - trả lời trực tiếp câu đó."
         )
+
+    # P4b — Procedural memory: inject the per-case-type workflow scaffold when
+    # the user's case_type is known. Cheap KV lookup (UserProfile), not a tool.
+    # Gate behind PROCEDURAL_WORKFLOW_ENABLED (default true) for rollback.
+    if os.environ.get("PROCEDURAL_WORKFLOW_ENABLED", "true").lower() == "true" and user_id:
+        try:
+            from procedural_memory import workflow_block
+            from models import get_user_profile
+            profile = get_user_profile(user_id)
+            if profile:
+                base += workflow_block(profile.get("case_type"))
+        except Exception as wf_err:
+            logger.warning(f"[AGENT] Procedural workflow block injection skipped: {wf_err}")
     return base
 
 
@@ -279,26 +299,30 @@ def get_agent_memory(user_id: Optional[str], conversation_id: Optional[str]) -> 
 
 
 def clear_user_runtime_caches(user_id: Optional[str], conversation_id: Optional[str] = None) -> int:
-    """Drop in-process memory entries for a user (and optional conversation).
+    """Drop in-process + Redis memory entries for a user (and optional conversation).
 
-    Clears the rolling-summary cache and the ChatMemoryBuffer for the given
-    (user_id, conversation_id) — or ALL conversations for that user when
-    ``conversation_id`` is None. Returns the number of cache entries removed.
+    Clears the rolling-summary/count cache (Redis-backed, centralized) and the
+    legacy ChatMemoryBuffer for the given (user_id, conversation_id) — or ALL
+    conversations for that user when ``conversation_id`` is None. Returns the
+    number of cache entries removed.
 
-    Note: only affects the process it runs in. With a separate Celery worker,
-    the worker's own copies are NOT cleared from the web process call site;
-    call this from the worker too (or restart it) for a full purge.
+    The rolling summary now lives in Redis (see ``memory_short_term``), so a
+    clear from the web process also clears what the Celery worker reads. The
+    worker's local LRU read-through cache is dropped by dispatching
+    ``clear_user_runtime_caches_task`` (runs in the worker).
     """
     removed = 0
+    # Legacy ChatMemoryBuffer (in-process only, used by the from_tools branch).
     with _memory_lock:
-        for store in (_agent_memories, _conv_summaries, _conv_summarized_counts):
-            keys_to_drop = [
-                (u, c) for (u, c) in list(store.keys())
-                if u == user_id and (conversation_id is None or c == conversation_id)
-            ]
-            for k in keys_to_drop:
-                store.pop(k, None)
-                removed += 1
+        keys_to_drop = [
+            (u, c) for (u, c) in list(_agent_memories.keys())
+            if u == user_id and (conversation_id is None or c == conversation_id)
+        ]
+        for k in keys_to_drop:
+            _agent_memories.pop(k, None)
+            removed += 1
+    # Rolling summary + count (Redis-backed, cross-worker).
+    removed += clear_short_term(user_id, conversation_id)
     logger.info(
         f"[AGENT] Cleared runtime caches for user={user_id} "
         f"conv={conversation_id} entries_removed={removed}"
@@ -309,12 +333,14 @@ def clear_user_runtime_caches(user_id: Optional[str], conversation_id: Optional[
 # Per-conversation rolling summary of chat history. Injected into the agent
 # system prompt as grounding context so the agent stays focused on the CURRENT
 # question while still knowing prior facts (birth year, gender, situation).
-# Keyed by (user_id, conversation_id) with LRU cap, mirroring _agent_memories.
-_conv_summaries: "OrderedDict[Tuple[Optional[str], Optional[str]], str]" = OrderedDict()
-_conv_summarized_counts: "OrderedDict[Tuple[Optional[str], Optional[str]], int]" = OrderedDict()
-_CONV_SUMMARY_CAP = 32
+#
+# The summary + summarized-count now live in Redis (cross-worker source of
+# truth) — see ``memory_short_term``. They used to be module-level OrderedDicts,
+# which were RAM-local to one process and caused multi-worker drift ("amnesia"
+# across turns). The ``_memory_lock`` below still guards the legacy
+# ``_agent_memories`` ChatMemoryBuffer (from_tools branch only).
 
-# Guards the three module-level OrderedDicts below: ai_agent_handle runs in a
+# Guards the legacy ``_agent_memories`` OrderedDict: ai_agent_handle runs in a
 # thread (asyncio.to_thread in the web process, or a Celery thread/gevent
 # pool) and CPython OrderedDict mutations (move_to_end/popitem/pop/__setitem__)
 # are not atomic, so concurrent runs could corrupt LRU order or lose entries.
@@ -382,7 +408,6 @@ def _summarize_chat_history(
 
     First turn (no prior history) -> ``("", [])`` (no LLM call).
     """
-    key = (user_id, conversation_id)
     # history is PRIOR turns only (current question is passed separately as
     # user_msg and not yet in DB), so no trailing-drop needed.
     prior_msgs = _history_to_chat_messages(history)
@@ -396,19 +421,17 @@ def _summarize_chat_history(
     if not old_turns:
         return "", short_term_raw
 
-    with _memory_lock:
-        already = _conv_summarized_counts.get(key, 0)
-        prev_summary = _conv_summaries.get(key, "")
+    # Rolling summary + count now live in Redis (cross-worker). Replaces the
+    # old in-process OrderedDicts that drifted across uvicorn/Celery workers.
+    already = get_summarized_count(user_id, conversation_id)
+    prev_summary = get_rolling_summary(user_id, conversation_id)
     # Periodic full re-summary from raw to correct incremental drift.
     full_resummary = len(prior_msgs) % _RESUMMARY_INTERVAL == 0
     needs_update = full_resummary or len(old_turns) > already
 
     if not needs_update:
-        # LRU touch on read so the active conversation is not evicted while
-        # cold ones occupy the tail; keeps the two stores' ordering in sync.
-        with _memory_lock:
-            _conv_summaries.move_to_end(key)
-            _conv_summarized_counts.move_to_end(key)
+        # No change -> return the cached summary verbatim. Redis is the source
+        # of truth; no in-process LRU touch needed (memory_short_term caches it).
         return prev_summary, short_term_raw
     if full_resummary:
         # Re-summarize ALL older turns from raw (drift correction).
@@ -449,18 +472,10 @@ def _summarize_chat_history(
         resp = _llm.complete(prompt)
         summary = str(getattr(resp, "text", resp) or "").strip()
         if summary:
-            with _memory_lock:
-                _conv_summaries[key] = summary
-                _conv_summaries.move_to_end(key)
-                _conv_summarized_counts[key] = len(old_turns)
-                _conv_summarized_counts.move_to_end(key)
-                if len(_conv_summaries) > _CONV_SUMMARY_CAP:
-                    ev_k, _ = _conv_summaries.popitem(last=False)
-                    _conv_summarized_counts.pop(ev_k, None)
-                # Cap the counts store symmetrically so it cannot drift past
-                # _CONV_SUMMARY_CAP (it has no independent cap otherwise).
-                if len(_conv_summarized_counts) > _CONV_SUMMARY_CAP:
-                    _conv_summarized_counts.popitem(last=False)
+            # Persist to Redis (cross-worker). LRU cap + TTL handled in
+            # memory_short_term; no manual eviction needed here.
+            set_rolling_summary(user_id, conversation_id, summary)
+            set_summarized_count(user_id, conversation_id, len(old_turns))
         return summary or prev_summary, short_term_raw
     except Exception as e:
         logger.warning(f"[AGENT] History summary failed: {e}")
@@ -479,7 +494,21 @@ def filter_tools_for_query(
     web/search/sensitive tools in the agent's prompt, and a user never sees
     admin-only escalation paths. ``role=None`` keeps legacy behavior (no
     policy filter) for the anonymous demo path.
+
+    Phase 3 — semantic tool router (``tool_router.select_tools_semantic``):
+    embed query↔tool-description top-k cosine, robust to paraphrase. Tried
+    FIRST; on ``None`` (disabled / embedding service down / empty result) it
+    falls through to the keyword path below, so behavior degrades gracefully
+    to the pre-Phase-3 contract with zero regression risk.
     """
+    try:
+        from tool_router import select_tools_semantic
+        semantic = select_tools_semantic(query, history=history)
+        if semantic:
+            return _apply_role_policy(semantic, role)
+    except Exception as exc:
+        logger.warning("[AGENT] semantic tool router failed, using keyword path: %s", exc)
+
     query_lower = query.lower()
 
     # Accumulate query and last conversation turns to find relevant keywords
@@ -499,40 +528,40 @@ def filter_tools_for_query(
     selected = []
     
     # 1. Legal calculation tools
-    if any(kw in scan_text for kw in ["phạt", "chậm trễ", "vi phạm hợp đồng"]):
+    if any(kw in scan_text for kw in ["phạt", "chậm trễ", "vi phạm", "trễ hạn", "bồi thường hợp đồng"]):
         selected.append("contract_penalty_tool")
-    if any(kw in scan_text for kw in ["tuổi", "sinh năm", "năm sinh", "kết hôn", "lao động", "hình sự"]):
+    if any(kw in scan_text for kw in ["tuổi", "sinh năm", "năm sinh", "kết hôn", "lao động", "hình sự", "bao nhiêu tuổi"]):
         selected.append("legal_age_tool")
-    if any(kw in scan_text for kw in ["thừa kế", "di sản", "chia"]):
+    if any(kw in scan_text for kw in ["thừa kế", "di sản", "chia", "tài sản cha mẹ", "để lại"]):
         selected.append("inheritance_tool")
-    if any(kw in scan_text for kw in ["doanh nghiệp", "tên", "đặt tên"]):
+    if any(kw in scan_text for kw in ["doanh nghiệp", "tên", "đặt tên", "công ty"]):
         selected.append("business_name_tool")
-    if any(kw in scan_text for kw in ["thời hiệu", "khởi kiện", "khiếu nại"]):
+    if any(kw in scan_text for kw in ["thời hiệu", "khởi kiện", "khiếu nại", "hết hạn kiện"]):
         selected.append("statute_tool")
         
     # 2. Knowledge / data-driven legal tools
-    if any(kw in scan_text for kw in ["thôi việc", "sa thải", "trợ cấp"]):
+    if any(kw in scan_text for kw in ["thôi việc", "sa thải", "trợ cấp", "bị đuổi", "đuổi việc", "cho nghỉ", "mất việc", "nghỉ việc"]):
         selected.append("severance_pay_func_tool")
-    if any(kw in scan_text for kw in ["làm thêm", "tăng ca", "ot", "giờ"]):
+    if any(kw in scan_text for kw in ["làm thêm", "tăng ca", "ot", "giờ", "lương đêm", "làm ngày lễ"]):
         selected.append("overtime_pay_func_tool")
-    if any(kw in scan_text for kw in ["thuế", "tncn", "thu nhập"]):
+    if any(kw in scan_text for kw in ["thuế", "tncn", "thu nhập", "giảm trừ"]):
         selected.append("pit_monthly_func_tool")
-    if any(kw in scan_text for kw in ["trước bạ", "đất đai", "nhà đất", "lệ phí"]):
+    if any(kw in scan_text for kw in ["trước bạ", "đất đai", "nhà đất", "lệ phí", "sang tên", "sổ đỏ"]):
         selected.append("land_registration_fee_func_tool")
         selected.append("vehicle_registration_fee_func_tool")
-    if any(kw in scan_text for kw in ["án phí", "tòa án", "lệ phí tòa"]):
+    if any(kw in scan_text for kw in ["án phí", "tòa án", "lệ phí tòa", "tiền án phí"]):
         selected.append("court_fee_func_tool")
-    if any(kw in scan_text for kw in ["phạt hành chính", "vi phạm", "giao thông"]):
+    if any(kw in scan_text for kw in ["phạt hành chính", "vi phạm", "giao thông", "nồng độ cồn", "vượt đèn đỏ"]):
         selected.append("admin_fine_lookup_func_tool")
-    if any(kw in scan_text for kw in ["cấp dưỡng", "nuôi con", "ly hôn"]):
+    if any(kw in scan_text for kw in ["cấp dưỡng", "nuôi con", "ly hôn", "chia tài sản ly hôn"]):
         selected.append("child_support_func_tool")
-    if any(kw in scan_text for kw in ["thủ tục", "quy trình", "bước"]):
+    if any(kw in scan_text for kw in ["thủ tục", "quy trình", "bước", "hướng dẫn làm"]):
         selected.append("procedure_wizard_func_tool")
-    if any(kw in scan_text for kw in ["thẩm quyền", "tòa án nào", "thụ lý"]):
+    if any(kw in scan_text for kw in ["thẩm quyền", "tòa án nào", "thụ lý", "nộp đơn ở đâu"]):
         selected.append("jurisdiction_resolver_func_tool")
-    if any(kw in scan_text for kw in ["mẫu đơn", "văn bản mẫu", "hợp đồng mẫu"]):
+    if any(kw in scan_text for kw in ["mẫu đơn", "văn bản mẫu", "hợp đồng mẫu", "mẫu hợp đồng"]):
         selected.append("generate_document_template_func_tool")
-    if any(kw in scan_text for kw in ["hiệu lực", "phiên bản", "sửa đổi", "bổ sung"]):
+    if any(kw in scan_text for kw in ["hiệu lực", "phiên bản", "sửa đổi", "bổ sung", "còn dùng không"]):
         selected.append("law_version_func_tool")
         
     # 3. Retrieval-backed legal tools (always useful for general legal questions)
@@ -573,12 +602,16 @@ def filter_tools_for_query(
         if tool_obj:
             tools_list.append(tool_obj)
 
-    # Fallback: if no specific tools matched, return a sensible default set
+    # Fallback: if no specific tools matched, return a sensible default set.
+    # Retrieval-first — most unmatched legal questions are lookup-style ("xin
+    # chào", "cho hỏi chút"), not arithmetic. The old calc trio
+    # (contract_penalty/legal_age/inheritance) was useless for a generic query
+    # and starved the agent of any retrieval capability. unified_legal_search
+    # fans out article_lookup + cross_reference + precedent in one call.
     if not tools_list or len(tools_list) <= 3:
         fallback = [
-            getattr(agent_tool_wrappers, "contract_penalty_tool"),
-            getattr(agent_tool_wrappers, "legal_age_tool"),
-            getattr(agent_tool_wrappers, "inheritance_tool"),
+            getattr(agent_tool_wrappers, "article_lookup_func_tool"),
+            getattr(agent_tool_wrappers, "unified_legal_search_func_tool"),
             getattr(agent_tool_wrappers, "legal_disclaimer_func_tool"),
             getattr(agent_tool_wrappers, "tavily_tool"),
             getattr(agent_tool_wrappers, "current_time_tool"),
@@ -620,12 +653,13 @@ def _build_react_agent(
     memory: ChatMemoryBuffer,
     tools: list,
     history_summary: str = "",
+    user_id: Optional[str] = None,
 ) -> ReActAgent | None:
     """Build ReAct agent with compatibility across llama-index versions."""
     if llm is None:
         return None
 
-    prompt = _get_agent_system_prompt(history_summary=history_summary)
+    prompt = _get_agent_system_prompt(history_summary=history_summary, user_id=user_id)
 
     # Older versions expose from_tools, newer workflow-based versions use constructor.
     if hasattr(ReActAgent, "from_tools"):
@@ -729,7 +763,7 @@ def ai_agent_handle(
         # Select tools dynamically based on current query and conversation history
         tools = filter_tools_for_query(question, history, role=role)
 
-        ai_agent = _build_react_agent(_llm, memory, tools, history_summary=history_summary)
+        ai_agent = _build_react_agent(_llm, memory, tools, history_summary=history_summary, user_id=user_id)
         if ai_agent is None:
             return (
                 "Xin lỗi, lỗi khi khởi tạo hệ thống AI Agent.",

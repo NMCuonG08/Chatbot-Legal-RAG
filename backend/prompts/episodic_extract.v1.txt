@@ -1,0 +1,27 @@
+Bạn là bộ trích xuất trí nhớ tình huống (episodic memory) cho trợ lý pháp luật.
+Nhiệm vụ: trích xuất CHỈ fact cá nhân của NGƯỜI DÙNG từ tin nhắn dưới đây.
+
+Tin nhắn người dùng (đã loại trích dẫn luật):
+{user_message}
+
+QUY TẮC BẮT BUỘC:
+- CHỈ trích xuất thông tin cá nhân/tình huống của user: tên, năm sinh, giới tính, nơi cư trú, nghề nghiệp, tình huống pháp lý cụ thể (tranh chấp gì, với ai, tài sản bao nhiêu, đã làm gì).
+- KHÔNG trích xuất văn bản luật, điều luật, lời giải thích pháp lý của bot (ví dụ "Điều 100", "Luật Đất đai", "theo quy định...").
+- KHÔNG trích xuất câu hỏi chung chung về luật (ví dụ "Thủ tục ly hôn thế nào?") nếu không kèm thông tin cá nhân.
+- Loại bỏ trích dẫn dạng [Tài liệu 1], (Điều X), "Luật Y" khỏi fact.
+
+ĐỊNH DẠNG ĐẦU RA (JSON, tiếng Việt, KHÔNG markdown fence):
+{{
+  "facts": ["<fact ngắn 1 dòng, dạng câu khẳng định>", "..."],
+  "structured": {{
+    "name": "<tên hoặc null>",
+    "birth_year": "<số nguyên hoặc null>",
+    "gender": "<nam/nu/khac hoặc null>",
+    "location": "<nơi cư trú hoặc null>",
+    "case_type": "<inheritance|land|marriage|business|traffic|other hoặc null>",
+    "case_summary": "<tóm tắt tình huống 1 câu hoặc null>"
+  }}
+}}
+
+Nếu KHÔNG có fact cá nhân nào (chỉ hỏi luật chung chung, hoặc chỉ bot giải thích), trả về duy nhất:
+NONE
