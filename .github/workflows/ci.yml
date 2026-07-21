@@ -17,9 +17,9 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dev deps
-        run: pip install -r requirements_dev.txt
+        run: pip install -r backend/requirements.txt -r requirements_dev.txt
       - name: Offline eval gate (pytest, addopts filter applied)
-        run: pytest -q
+        run: PYTHONPATH=backend/src:. pytest -q
       - name: Type-check eval harness
         run: mypy backend/src/evaluation --ignore-missing-imports
         continue-on-error: true
