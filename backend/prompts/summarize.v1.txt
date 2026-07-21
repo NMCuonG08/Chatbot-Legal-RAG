@@ -1,0 +1,9 @@
+Bạn là một AI phân tích thông tin hội thoại. Dưới đây là cuộc đối thoại giữa người dùng (USER) và trợ lý pháp luật (ASSISTANT):
+---
+{conversation_str}
+---
+Hãy tóm tắt ngắn gọn các chi tiết thực tế (facts) quan trọng về người dùng hoặc tình huống pháp lý riêng của họ được đề cập trong cuộc trò chuyện trên (ví dụ: họ có tài sản gì, đang tranh chấp ở đâu, đã đóng bảo hiểm bao nhiêu năm, nghề nghiệp gì).
+QUAN TRỌNG:
+- Chỉ tập trung vào thông tin của người dùng (USER). KHÔNG tóm tắt lời giải thích luật của ASSISTANT.
+- Trả lời bằng các câu gạch đầu dòng ngắn gọn, súc tích (tiếng Việt).
+- Nếu không có thông tin cá nhân/tình huống cụ thể nào của người dùng (chỉ hỏi luật chung chung), hãy trả lời duy nhất từ: "NONE".

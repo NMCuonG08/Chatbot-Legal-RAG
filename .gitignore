@@ -44,6 +44,17 @@ htmlcov/
 .env
 .env.*
 !.env.example
+!.env.prod.aws.example
+!.env.*.example
+
+# Terraform: never commit filled tfvars (has IPs), keep .example
+deployment/terraform/terraform.tfvars
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# Filled model registry (keep .example). Commit if no secret inside.
+backend/models.yaml
 
 # IDE/editor
 .vscode/

@@ -1,12 +1,37 @@
-FROM python:3.11-slim
+# Worker image — mirrors backend/Dockerfile (same base + deps + PYTHONPATH)
+# but runs Celery instead of uvicorn. tasks.py uses bare sibling imports
+# (from prompt_loader import, from database import) so PYTHONPATH MUST point
+# at /usr/src/app/src, same as backend — not /app.
+# Build context: ./backend
+#   docker build -f worker.Dockerfile -t legal-worker ./backend
+FROM python:3.10.12-slim-bullseye
 
-WORKDIR /app
+RUN apt update -y \
+    && apt-get install \
+        python3-dev \
+        default-libmysqlclient-dev \
+        build-essential \
+        pkg-config -y \
+    && apt-get clean
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+WORKDIR /usr/src/app
 
-COPY src /app/src
+ENV PYTHONDONTWRITEBYTECODE 1
+ENV PYTHONUNBUFFERED 1
+ENV PYTHONPATH "${PYTHONPATH}:/usr/src/app/src"
 
-ENV PYTHONPATH=/app
+RUN pip install --upgrade pip
+COPY ./requirements.txt /usr/src/app/requirements.txt
+RUN pip install -r requirements.txt
 
-CMD ["sh", "-c", "celery -A src.tasks.celery_app worker --loglevel=${CELERY_LOGLEVEL:-info} --concurrency=${CELERY_WORKER_CONCURRENCY:-2}"]
+COPY ./entrypoint.sh /usr/src/app/entrypoint.sh
+RUN chmod +x /usr/src/app/entrypoint.sh
+
+COPY . /usr/src/app/
+
+# entrypoint.sh execs "$@" when args present -> CMD below becomes the celery cmd.
+# -A tasks.celery_app matches scripts/dev.sh (celery app = backend/src/tasks/celery_app).
+# -P solo: Windows + low-traffic safe. Override loglevel/concurrency via env
+# CELERY_LOGLEVEL / CELERY_WORKER_CONCURRENCY at deploy time (compose sets these).
+ENTRYPOINT ["/usr/src/app/entrypoint.sh"]
+CMD ["celery", "-A", "tasks.celery_app", "worker", "--loglevel=info", "-P", "solo"]

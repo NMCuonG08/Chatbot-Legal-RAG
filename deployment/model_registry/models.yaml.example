@@ -1,0 +1,53 @@
+# Model & Prompt Registry — Legal Chatbot
+# ----------------------------------------------------------------------------
+# Copy to backend/models.yaml (gitignored after fill) OR commit if no secret.
+# Loaded by backend/src/model_registry.py at startup. Pinned versions logged to trace.
+# Bump version here + redeploy = controlled model/prompt promotion.
+# Rollback = revert this file + redeploy (or set PROMPT_VERSION env to old).
+
+registry_version: "2026.07.21.1"
+
+embedding:
+  name: bge-m3
+  version: "1.1.0"
+  source: BAAI/bge-m3
+  hash: ""
+  serving_url_env: CUSTOM_EMBEDDING_API_URL
+
+reranker:
+  name: bge-reranker-v2-m3
+  version: "1.0.0"
+  source: BAAI/bge-reranker-v2-m3
+  type: bge
+  device_env: BGE_RERANK_DEVICE
+
+llm:
+  provider: groq
+  model: llama-3.1-8b-instant
+  pinned_at: "2026-07-21"
+  notes: "Primary agent LLM. Fallback: OLLAMA_LLM_MODEL."
+
+judge:
+  provider: groq
+  model: llama-3.1-8b-instant
+
+prompts:
+  agent_system: "v3"
+  verify_answer: "v2"
+  planner: "v1"
+  generate: "v1"
+  web_search: "v1"
+  general_chat: "v1"
+  summarize: "v1"
+
+rag:
+  corpus_sha: ""
+  golden_set: data/golden_unified.jsonl
+  baseline_eval: eval_reports/runs/<run_id>.json
+  rrf:
+    w_vector: 1.15
+    w_bm25: 1.0
+    blend_alpha: 0.6
+    top_k: 4
+    top_n: 5
+  rerank_top_n: 3

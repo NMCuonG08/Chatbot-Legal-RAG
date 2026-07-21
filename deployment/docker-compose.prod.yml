@@ -1,0 +1,103 @@
+# ============================================================================
+# PROD docker-compose — prebuilt GHCR images + EBS persistent volumes
+# ----------------------------------------------------------------------------
+# Khác bản dev (root docker-compose.yml):
+#   - image: thay vì build: (CI đã push GHCR)
+#   - volumes mount ra host (EBS) cho mariadb/qdrant/redis → data sống qua recreate
+#   - env_file: backend/.env (KHÔNG commit, fill từ deployment/env/.env.prod.aws.example)
+#   - restart: always
+#   - KHÔNG publish port DB ra host (chỉ internal + Nginx proxy)
+# Usage: docker compose -f docker-compose.prod.yml up -d
+# Thay ghcr.io/nmcuong08 bằng path GHCR thật
+# ============================================================================
+
+x-image-base: &img
+  restart: always
+  networks: [legal-net]
+
+services:
+  redis:
+    <<: *img
+    image: redis:7-alpine
+    volumes:
+      - ./data/redis:/data
+
+  mariadb:
+    <<: *img
+    image: mariadb:11
+    environment:
+      MYSQL_DATABASE: legal_db
+      MYSQL_USER: legal
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD in .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in .env}
+    volumes:
+      - ./data/mariadb:/var/lib/mysql
+
+  qdrant:
+    <<: *img
+    image: qdrant/qdrant:v1.11.3
+    volumes:
+      - ./data/qdrant:/qdrant/storage
+
+  neo4j:
+    <<: *img
+    image: neo4j:5.20
+    environment:
+      NEO4J_AUTH: ${NEO4J_AUTH:-none}
+    volumes:
+      - ./data/neo4j:/data
+    profiles: ["graph"]   # opt-in: docker compose --profile graph up
+
+  backend:
+    <<: *img
+    image: ghcr.io/nmcuong08/legal-backend:latest
+    env_file: backend/.env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: ${DATABASE_URL}
+    depends_on: [redis, mariadb, qdrant]
+    ports:
+      - "127.0.0.1:8000:8000"   # chỉ localhost, Nginx proxy ra 443
+
+  worker:
+    <<: *img
+    image: ghcr.io/nmcuong08/legal-worker:latest
+    env_file: backend/.env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      CELERY_WORKER_CONCURRENCY: 2
+      CELERY_LOGLEVEL: info
+    depends_on: [redis, mariadb, qdrant]
+
+  frontend:
+    <<: *img
+    image: ghcr.io/nmcuong08/legal-frontend:latest
+    ports:
+      - "127.0.0.1:8501:8501"   # chỉ localhost, Nginx proxy
+    depends_on: [backend]
+
+  prometheus:
+    <<: *img
+    image: prom/prometheus:v2.45.0
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+    ports:
+      - "127.0.0.1:9090:9090"
+
+  grafana:
+    <<: *img
+    image: grafana/grafana:10.0.3
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD:?set in .env}
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./data/grafana:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"   # Nginx proxy grafana.yourdomain.com
+    depends_on: [prometheus]
+
+networks:
+  legal-net:
+    driver: bridge

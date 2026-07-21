@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars and fill. NEVER commit terraform.tfvars (gitignore it).
+
+aws_region      = "ap-southeast-1"
+instance_type    = "t3.large"        # 8GB RAM for BGE-M3; "t3.medium" if Groq-only
+ebs_size_gb      = 50
+key_pair_name    = "legal-prod-key"  # name only; .pem stays on your machine
+admin_cidr       = "203.0.113.42/32" # YOUR public IP/32 — get from https://ifconfig.me
+s3_backup_bucket = "nmcuong-legal-backups-2026"   # globally unique
+s3_corpus_bucket = "nmcuong-legal-corpus-2026"     # globally unique
+github_repo_url  = "https://github.com/NMCuong08/Chatbot-Legal-RAG.git"
+branch           = "main"

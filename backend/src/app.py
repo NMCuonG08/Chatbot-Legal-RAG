@@ -82,6 +82,14 @@ async def lifespan(app: FastAPI):
     import time
     logger.info("🚀 Starting sequential backend dependency checks...")
 
+    # LLMOps Tier 1.1: log pinned model/prompt versions at boot (best-effort,
+    # never blocks startup). models.yaml missing -> graceful empty dict.
+    try:
+        from model_registry import log_versions
+        log_versions()
+    except Exception as _e:
+        logger.warning(f"[model_registry] log_versions skipped: {_e}")
+
     # 1. Check SQL DB
     try:
         from database import engine

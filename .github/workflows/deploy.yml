@@ -1,0 +1,93 @@
+# ============================================================================
+# CI/CD: build + push images to GHCR + deploy to EC2 on git tag v*.*.*
+# ----------------------------------------------------------------------------
+# Copy to .github/workflows/deploy.yml in repo root to activate.
+# GitHub Secrets (Settings → Secrets and variables → Actions):
+#   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+#   EC2_HOST (public IP or domain), EC2_SSH_KEY (private .pem contents)
+#   GHCR_PAT (classic PAT, scope write:packages)
+# ============================================================================
+
+name: Build, Push & Deploy
+
+on:
+  push:
+    tags: ["v*.*.*"]      # deploy only on version tags
+  workflow_dispatch:       # manual trigger from Actions tab
+
+env:
+  REGISTRY: ghcr.io
+  OWNER: nmcuong08         # github username/org, lowercase
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login $REGISTRY -u ${{ github.actor }} --password-stdin
+
+      - name: Build & push backend
+        run: |
+          docker build -f backend/Dockerfile -t $REGISTRY/$OWNER/legal-backend:${{ github.sha }} -t $REGISTRY/$OWNER/legal-backend:latest ./backend
+          docker push --all-tags $REGISTRY/$OWNER/legal-backend
+
+      - name: Build & push worker
+        run: |
+          docker build -f backend/worker.Dockerfile -t $REGISTRY/$OWNER/legal-worker:${{ github.sha }} -t $REGISTRY/$OWNER/legal-worker:latest ./backend
+          docker push --all-tags $REGISTRY/$OWNER/legal-worker
+
+      - name: Build & push frontend
+        run: |
+          docker build -f frontend/Dockerfile -t $REGISTRY/$OWNER/legal-frontend:${{ github.sha }} -t $REGISTRY/$OWNER/legal-frontend:latest ./frontend
+          docker push --all-tags $REGISTRY/$OWNER/legal-frontend
+
+  eval-gate:
+    needs: build-push
+    runs-on: ubuntu-latest
+    # Offline test gate before deploy. Live eval optional (add GROQ_API_KEY + scripts/dev.sh eval).
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Install + test
+        continue-on-error: true   # advisory: tests need DB/Qdrant/Groq not in CI; don't block deploy
+        run: |
+          pip install -r requirements_dev.txt
+          PYTHONPATH=backend/src:. pytest -q
+
+  deploy:
+    needs: eval-gate
+    runs-on: ubuntu-latest
+    # Skip until you're ready to ship to EC2. Set repo variable ENABLE_DEPLOY=true
+    # (Settings → Secrets and variables → Actions → Variables) + add EC2_HOST /
+    # EC2_SSH_KEY secrets, then this job runs. Until then: build-push only,
+    # images land in GHCR, deploy is a clean skip (not a red failure).
+    if: vars.ENABLE_DEPLOY == 'true'
+    steps:
+      - name: SSH deploy to EC2 (pull latest + recreate)
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/app
+            echo "${{ secrets.GHCR_PAT }}" | docker login $REGISTRY -u ${{ github.actor }} --password-stdin
+            # Use prod compose (image-based, not build). --env-file backend/.env
+            # supplies ${MYSQL_PASSWORD} etc. for compose interpolation.
+            # --project-directory . makes ./data volumes resolve to /home/ubuntu/app/data
+            # (the dirs user_data.sh created), not deployment/data.
+            docker compose -f deployment/docker-compose.prod.yml --env-file backend/.env --project-directory . pull
+            docker compose -f deployment/docker-compose.prod.yml --env-file backend/.env --project-directory . up -d --no-build
+            docker image prune -f
+
+      - name: Rollback hint on failure
+        if: failure()
+        run: |
+          echo "DEPLOY FAILED. Prod still on previous image until successful pull+up."
+          echo "Manual rollback: ssh in, docker pull <old-sha>, docker compose up -d --no-build"

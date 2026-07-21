@@ -11,10 +11,32 @@ from copy import copy
 from pathlib import Path
 from typing import Dict, List, TypedDict
 
+# LLMOps Tier 1.2: prompts loaded from backend/prompts/<name>.<ver>.txt
+from prompt_loader import load_prompt
+
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 
 from langsmith import traceable
+
+# LangSmith tracing env sanity log (senior: confirm worker actually picked up
+# the LangSmith vars before any @traceable runs). With LANGCHAIN_TRACING_V2 off,
+# @traceable is a silent no-op -> traces never reach smith.langchain.com, which
+# reads on the web as "tracing broken". This single INFO line rules that out.
+# Defined inline because the module-level `logger` is created further below.
+_LS_TRACING = os.environ.get("LANGCHAIN_TRACING_V2", "").lower() == "true"
+_LS_API_KEY = bool(os.environ.get("LANGCHAIN_API_KEY"))
+_LS_PROJECT = os.environ.get("LANGCHAIN_PROJECT", "")
+logging.getLogger(__name__).info(
+    "[trace] LangSmith status: tracing=%s api_key=%s project=%r endpoint=%r",
+    _LS_TRACING, "set" if _LS_API_KEY else "MISSING", _LS_PROJECT,
+    os.environ.get("LANGCHAIN_ENDPOINT", "default"),
+)
+if _LS_TRACING and not _LS_API_KEY:
+    logging.getLogger(__name__).warning(
+        "[trace] LANGCHAIN_TRACING_V2=true but LANGCHAIN_API_KEY missing — "
+        "traces will NOT be sent to LangSmith."
+    )
 
 # Force sys.path to include the backend/src directory for Celery runtime worker threads
 src_path = str(Path(__file__).resolve().parent)
@@ -246,9 +268,26 @@ def _get_persistent_loop() -> asyncio.AbstractEventLoop:
 
 
 def run_async(coro):
-    """Run a coroutine on a persistent background event loop (sync caller)."""
-    loop = _get_persistent_loop()
-    return asyncio.run_coroutine_threadsafe(coro, loop).result()
+    """Run a coroutine from a sync caller, propagating the caller's contextvars.
+
+    Context propagation (senior): the caller's contextvars — including the
+    active LangSmith parent run from @traceable — MUST flow into the coro,
+    otherwise @traceable spans inside guardrails / async calls detach and
+    show as orphan top-level runs on the LangSmith web UI (the "tracing looks
+    broken" symptom).
+
+    asyncio.run() creates a fresh event loop and runs the coroutine as a task
+    that captures the CURRENT context (the caller's), so nested @traceable /
+    LLM calls inherit the correct parent run. This is correct and race-free:
+    each call gets its own loop + task context, unlike the previous
+    persistent-daemon-loop design which scheduled on a shared thread context
+    (caller context never reached the coro, and concurrent calls would race
+    on the shared thread-local contextvars). The per-call loop cost (~sub-ms)
+    is negligible: guardrails / async paths run a few times per chat, not per
+    token. It also cannot collide with a running loop because Celery tasks
+    and graph.invoke threads are synchronous (no ambient event loop).
+    """
+    return asyncio.run(coro)
 
 
 def _compensate_index_rollback(doc_id_str: str) -> None:
@@ -589,15 +628,7 @@ def generate_rag_answer(history, question, user_id=None):
     # Episodic memory retrieval (delegated to shared helper, reused by CRAG generate_node)
     episodic_context = _retrieve_episodic_context(user_id, standalone_question)
 
-    system_prompt = """Bạn là trợ lý AI chuyên về tư vấn pháp luật Việt Nam. Nhiệm vụ của bạn là:
-1. Trả lời câu hỏi dựa trên các tài liệu pháp luật được cung cấp
-2. Trích dẫn chính xác các điều khoản, khoản, điểm từ văn bản pháp luật
-3. Giải thích rõ ràng, dễ hiểu cho người không chuyên
-4. Nếu thông tin không đủ trong tài liệu, hãy nói rõ điều đó
-5. Luôn đưa ra câu trả lời có căn cứ pháp lý
-
-QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung cấp bên dưới.
-LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG bao giờ tóm tắt, nhắc lại hay mô tả lại thông tin lịch sử của người dùng; ngữ cảnh lịch sử (nếu có) chỉ là gợi ý phụ để cá nhân hóa, tuyệt đối không dùng làm nội dung chính của câu trả lời.""" + _date_context_block() + CITATION_RULE
+    system_prompt = load_prompt("generate") + _date_context_block() + CITATION_RULE
 
     doc_context = gen_doc_prompt(ranked_docs)
 
@@ -730,8 +761,7 @@ def generate_web_search_answer(history, question):
         lines.append(f"[Tài liệu {idx}]\nTiêu đề: {title}\nURL: {url}\nNội dung: {content}")
     search_context = "\n\n".join(lines) or "(không có kết quả tìm kiếm)"
 
-    system_prompt = """Bạn là trợ lý AI giúp tìm kiếm thông tin pháp luật trên internet.
-    Hãy tổng hợp và trả lời câu hỏi dựa trên kết quả tìm kiếm được cung cấp.""" + _date_context_block() + CITATION_RULE
+    system_prompt = load_prompt("web_search") + _date_context_block() + CITATION_RULE
 
     openai_messages = (
         [{"role": "system", "content": system_prompt}]
@@ -753,14 +783,7 @@ def generate_web_search_answer(history, question):
 def generate_general_answer(history, question):
     logger.info("Using general chat")
 
-    system_prompt = """Bạn là trợ lý AI thân thiện của hệ thống tư vấn pháp luật Việt Nam.
-Hãy trả lời lịch sự và hướng dẫn người dùng về các câu hỏi pháp luật bạn có thể giúp đỡ.
-
-Bạn có thể:
-- Trả lời câu hỏi về luật pháp Việt Nam
-- Tính toán phí phạt, chia thừa kế, kiểm tra tuổi pháp lý
-- Tìm kiếm thông tin pháp luật mới trên internet
-- Hướng dẫn thủ tục pháp lý""" + _date_context_block()
+    system_prompt = load_prompt("general_chat") + _date_context_block()
 
     openai_messages = (
         [{"role": "system", "content": system_prompt}]
@@ -996,15 +1019,7 @@ def _build_chat_graph():
 
         episodic_context = _retrieve_episodic_context(user_id, question)
 
-        system_prompt = """Bạn là trợ lý AI chuyên về tư vấn pháp luật Việt Nam. Nhiệm vụ của bạn là:
-1. Trả lời câu hỏi dựa trên các tài liệu pháp luật được cung cấp
-2. Trích dẫn chính xác các điều khoản, khoản, điểm từ văn bản pháp luật
-3. Giải thích rõ ràng, dễ hiểu cho người không chuyên
-4. Nếu thông tin không đủ trong tài liệu, hãy nói rõ điều đó
-5. Luôn đưa ra câu trả lời có căn cứ pháp lý
-
-QUAN TRỌNG: Chỉ sử dụng thông tin từ các tài liệu được cung cấp bên dưới.
-LUÔN trả lời trực tiếp câu hỏi MỚI của người dùng. KHÔNG bao giờ tóm tắt, nhắc lại hay mô tả lại thông tin lịch sử của người dùng; ngữ cảnh lịch sử (nếu có) chỉ là gợi ý phụ để cá nhân hóa, tuyệt đối không dùng làm nội dung chính của câu trả lời.""" + _date_context_block() + CITATION_RULE
+        system_prompt = load_prompt("generate") + _date_context_block() + CITATION_RULE
 
         doc_context = gen_doc_prompt(ranked_docs)
 
@@ -1250,7 +1265,8 @@ def get_chat_graph():
     return _build_chat_graph()
 
 
-@traceable(name="run_chat_graph", run_type="chain")
+@traceable(name="run_chat_graph", run_type="chain",
+           metadata={"component": "chat_graph"})
 def run_chat_graph(history, question, user_id=None, conversation_id=None,
                    run_id=None, role=None, variant=None, shadow=False):
     """Invoke the chat graph.
@@ -1271,6 +1287,20 @@ def run_chat_graph(history, question, user_id=None, conversation_id=None,
     except Exception:
         COST_ROUTING_ENABLED = False
         SHADOW_MODE_ENABLED = False
+
+    # Attach dynamic metadata to the current LangSmith run so the web UI can
+    # filter by user / DB run_id / route / variant. Best-effort: a trace-tool
+    # failure must never break the chat path.
+    try:
+        from langsmith.run_helpers import set_run_metadata
+        set_run_metadata(
+            user_id=user_id or "",
+            db_run_id=run_id or "",
+            conversation_id=conversation_id or "",
+            variant=variant or "",
+        )
+    except Exception:
+        pass
 
     override_model = variant
     if override_model is None and COST_ROUTING_ENABLED:
@@ -1558,16 +1588,7 @@ def save_episodic_memory_task(user_id: str, conversation_id: str):
             content = msg.get("content", "")
             conversation_str += f"{role.upper()}: {content}\n"
 
-        summary_prompt = f"""Bạn là một AI phân tích thông tin hội thoại. Dưới đây là cuộc đối thoại giữa người dùng (USER) và trợ lý pháp luật (ASSISTANT):
----
-{conversation_str}
----
-Hãy tóm tắt ngắn gọn các chi tiết thực tế (facts) quan trọng về người dùng hoặc tình huống pháp lý riêng của họ được đề cập trong cuộc trò chuyện trên (ví dụ: họ có tài sản gì, đang tranh chấp ở đâu, đã đóng bảo hiểm bao nhiêu năm, nghề nghiệp gì).
-QUAN TRỌNG:
-- Chỉ tập trung vào thông tin của người dùng (USER). KHÔNG tóm tắt lời giải thích luật của ASSISTANT.
-- Trả lời bằng các câu gạch đầu dòng ngắn gọn, súc tích (tiếng Việt).
-- Nếu không có thông tin cá nhân/tình huống cụ thể nào của người dùng (chỉ hỏi luật chung chung), hãy trả lời duy nhất từ: "NONE".
-"""
+        summary_prompt = load_prompt("summarize", conversation_str=conversation_str)
 
         summary_result = openai_chat_complete([
             {"role": "system", "content": "Bạn là chuyên gia trích xuất thông tin hội thoại pháp luật."},
