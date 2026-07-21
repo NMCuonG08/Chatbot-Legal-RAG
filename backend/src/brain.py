@@ -77,6 +77,22 @@ def get_groq_client():
 
 client = get_groq_client()
 
+# LangSmith auto-tracing of the raw Groq client (senior). The Groq SDK is
+# OpenAI-shaped (client.chat.completions.create), so wrap_openai patches that
+# method to emit a full LLM run on every call — capturing model, messages,
+# token usage, and latency that the @traceable wrapper on chat() cannot infer
+# from the returned content string. Without this, LangSmith shows the LLM
+# span but with no token/usage/latency data, which reads as "incomplete tracing".
+# Defensive: if the Groq SDK shape ever diverges from openai, skip silently
+# rather than break chat.
+if client is not None:
+    try:
+        from langsmith.wrappers import wrap_openai
+        client = wrap_openai(client)
+        logger.debug("LangSmith wrap_openai applied to Groq client")
+    except Exception as _wrap_err:
+        logger.debug(f"LangSmith wrap_openai skipped for Groq: {_wrap_err}")
+
 
 # Thin retry-wrapped binding around the Groq chat completions create call.
 # Retries only on transient errors (429 rate limits, 5xx, connection/timeout);
