@@ -79,3 +79,69 @@ def test_inheritance_rejects_nonnumeric_total():
     out = _content(atw.inheritance_tool, total_value="năm trăm triệu", heirs_json="[]")
     data = json.loads(out)
     assert "error" in data
+
+
+# ---- VN-number normalization (consolidation: accept VN format, reject garbage) ----
+
+def test_vn_dotted_thousands_accepted():
+    """'15.000.000' (VN thousands-dot) must coerce to 15000000.0 and compute."""
+    out = _content(atw.severance_pay_func_tool, monthly_salary="15.000.000", months_worked=36)
+    data = json.loads(out)
+    assert "error" not in data, f"VN-formatted number must be accepted, got: {out}"
+    assert "severance_allowance" in data or "allowance" in str(data).lower()
+
+
+def test_vn_currency_suffix_accepted():
+    out = _content(atw.severance_pay_func_tool, monthly_salary="15000000 vnđ", months_worked=36)
+    data = json.loads(out)
+    assert "error" not in data
+
+
+def test_vn_multiplier_word_rejected():
+    """'5 triệu' is ambiguous -> must be rejected (no silent extract of '5')."""
+    out = _content(atw.severance_pay_func_tool, monthly_salary="5 triệu", months_worked=36)
+    data = json.loads(out)
+    assert "error" in data, f"multiplier word must be rejected, got: {out}"
+
+
+def test_contract_penalty_rejects_nonnumeric():
+    out = _content(atw.contract_penalty_tool, contract_value="abc", penalty_rate=0.12, days_late=10)
+    data = json.loads(out)
+    assert "error" in data
+
+
+def test_contract_penalty_vn_format_accepted():
+    out = _content(atw.contract_penalty_tool, contract_value="100.000.000", penalty_rate="0,12", days_late=30)
+    data = json.loads(out)
+    assert "error" not in data, f"VN-format penalty rate must be accepted, got: {out}"
+
+
+def test_overtime_rejects_bad_hours():
+    out = _content(atw.overtime_pay_func_tool, hourly_wage=50000, hours="nhiều")
+    data = json.loads(out)
+    assert "error" in data
+
+
+def test_vehicle_fee_rejects_bad_value():
+    out = _content(atw.vehicle_registration_fee_func_tool, vehicle_value="hai tỷ", vehicle_type="car")
+    data = json.loads(out)
+    assert "error" in data
+
+
+def test_child_support_rejects_bad_income():
+    out = _content(atw.child_support_func_tool, payer_income="không có", num_children=2)
+    data = json.loads(out)
+    assert "error" in data
+
+
+def test_business_name_rejects_empty():
+    out = _content(atw.business_name_tool, business_name="")
+    data = json.loads(out)
+    assert "error" in data
+
+
+def test_statute_lookup_valid_case_type():
+    out = _content(atw.statute_tool, case_type="civil")
+    # statute_lookup returns info for valid case types; must not be a pydantic error
+    data = json.loads(out)
+    assert "error" not in data or "Tham số" not in str(data)

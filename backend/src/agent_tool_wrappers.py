@@ -13,9 +13,11 @@ import inspect
 import json
 import logging
 import os
+import re
+from typing import Annotated
 
 from llama_index.core.tools import FunctionTool
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, BeforeValidator, Field, ValidationError
 
 import config
 from agent_tool_tracking import record_agent_source, track_tool_call
@@ -134,26 +136,72 @@ def _validated(model_cls):
     return _deco
 
 
+# VN-number normalization for numeric tool inputs (consolidation of the prior
+# silent coerce_float approach). Accepts VN-formatted numbers ("15.000.000",
+# "1.500.000,25", "15000000 vnđ") and coerces to float; REJECTS anything that is
+# not a number after stripping currency suffixes — so "5 năm", "5 triệu", "hai
+# tỷ" raise a clean ValidationError instead of being silently extracted to 5.0
+# (which produced wrong legal-advice figures). The raw calc fns still keep
+# their coerce_float for the MCP direct-call path; this is the strict guard for
+# the agent (FunctionTool) path.
+_VN_NUM_RE = re.compile(r"[-+]?[\d.,]+")
+
+
+def _vn_number(value):
+    if isinstance(value, bool):
+        raise ValueError("giá trị không hợp lệ")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if value is None:
+        raise ValueError("thiếu giá trị số")
+    s = str(value).strip().lower()
+    if not s:
+        raise ValueError("thiếu giá trị số")
+    # strip currency suffixes/words
+    s = re.sub(r"(vnđ|vnd|đồng|đ)\s*", "", s).strip()
+    # allow internal spaces between digit groups ("15 000 000")
+    s = s.replace(" ", "")
+    if not _VN_NUM_RE.fullmatch(s):
+        raise ValueError(f"không phải số hợp lệ: '{value}'")
+    # disambiguate VN separators: '.' thousands, ',' decimal
+    if "." in s and "," in s:
+        if s.find(".") < s.find(","):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "." in s and s.count(".") > 1:
+        s = s.replace(".", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError as exc:  # pragma: no cover - regex already guards
+        raise ValueError(f"không phải số hợp lệ: '{value}'") from exc
+
+
+VNNumber = Annotated[float, BeforeValidator(_vn_number)]
+
+
 class SeveranceInput(BaseModel):
-    monthly_salary: float = Field(..., ge=0, le=10**12,
-                                  description="Lương bình quân 6 tháng cuối (VNĐ), ví dụ 15000000")
+    monthly_salary: VNNumber = Field(..., ge=0, le=10**12,
+                                     description="Lương bình quân 6 tháng cuối (VNĐ), ví dụ 15000000")
     months_worked: int = Field(..., ge=0, le=600,
                                description="Tổng số tháng làm việc, ví dụ 36")
 
 
 class PITMonthlyInput(BaseModel):
-    taxable_income: float = Field(..., ge=0,
-                                  description="Thu nhập tính thuế tháng (sau giảm trừ), VNĐ")
+    taxable_income: VNNumber = Field(..., ge=0,
+                                     description="Thu nhập tính thuế tháng (sau giảm trừ), VNĐ")
 
 
 class LandRegistrationFeeInput(BaseModel):
-    property_value: float = Field(..., ge=0, le=10**13,
-                                  description="Giá trị nhà/đất theo giá nhà nước (VNĐ)")
+    property_value: VNNumber = Field(..., ge=0, le=10**13,
+                                     description="Giá trị nhà/đất theo giá nhà nước (VNĐ)")
     is_first_home: bool = Field(True, description="Lần đầu cấp sổ không")
 
 
 class CourtFeeInput(BaseModel):
-    claim_value: float = Field(..., ge=0, description="Giá trị yêu cầu (VNĐ). 0 nếu không có giá")
+    claim_value: VNNumber = Field(..., ge=0, description="Giá trị yêu cầu (VNĐ). 0 nếu không có giá")
     case_type: str = Field("civil_first", description="civil_first | civil_appeal | no_value")
 
 
@@ -165,9 +213,44 @@ class LegalAgeInput(BaseModel):
 
 
 class InheritanceInput(BaseModel):
-    total_value: float = Field(..., ge=0, le=10**12,
-                               description="Tổng giá trị tài sản thừa kế (VNĐ)")
+    total_value: VNNumber = Field(..., ge=0, le=10**12,
+                                  description="Tổng giá trị tài sản thừa kế (VNĐ)")
     heirs_json: str = Field(..., description='JSON danh sách người thừa kế, ví dụ []')
+
+
+# --- remaining calc tools (consolidation: extend Pydantic to all calc tools) ---
+
+class ContractPenaltyInput(BaseModel):
+    contract_value: VNNumber = Field(..., ge=0, le=10**12,
+                                     description="Giá trị hợp đồng (VNĐ), ví dụ 100000000")
+    penalty_rate: VNNumber = Field(..., ge=0, le=1.0,
+                                    description="Tỷ lệ phạt theo hợp đồng (% mỗi ngày), ví dụ 0.1 (0.1%/ngày)")
+    days_late: int = Field(..., ge=0, le=3650, description="Số ngày chậm trễ, ví dụ 30")
+
+
+class OvertimePayInput(BaseModel):
+    hourly_wage: VNNumber = Field(..., ge=0, description="Lương giờ thường (VNĐ), ví dụ 50000")
+    hours: VNNumber = Field(..., ge=0, le=24, description="Số giờ làm thêm, ví dụ 4")
+    day_type: str = Field("weekday", description="weekday | rest_day | holiday")
+
+
+class VehicleRegistrationFeeInput(BaseModel):
+    vehicle_value: VNNumber = Field(..., ge=0, le=10**13, description="Giá trị xe (VNĐ)")
+    vehicle_type: str = Field("car", description="car | motorcycle | truck")
+    is_first_time: bool = Field(True, description="Lần đầu đăng ký không")
+
+
+class ChildSupportInput(BaseModel):
+    payer_income: VNNumber = Field(..., ge=0, description="Thu nhập tháng của bên có nghĩa vụ (VNĐ)")
+    num_children: int = Field(1, ge=1, le=20, description="Số con được cấp dưỡng")
+
+
+class BusinessNameInput(BaseModel):
+    business_name: str = Field(..., min_length=1, description='Tên doanh nghiệp, ví dụ "Công ty TNHH ABC"')
+
+
+class StatuteInput(BaseModel):
+    case_type: str = Field(..., description="civil | labor | administrative | criminal")
 
 
 # ===== LEGAL CALCULATION TOOLS =====
@@ -175,6 +258,7 @@ class InheritanceInput(BaseModel):
 
 @track_tool_call
 @sandboxable("contract_penalty_calculator")
+@_validated(ContractPenaltyInput)
 def contract_penalty_calculator(
     contract_value: float, penalty_rate: float, days_late: int
 ) -> str:
@@ -269,6 +353,7 @@ def inheritance_calculator(total_value: float, heirs_json: str) -> str:
 
 @track_tool_call
 @sandboxable("business_name_validator")
+@_validated(BusinessNameInput)
 def business_name_validator(business_name: str) -> str:
     """
     Kiểm tra tên doanh nghiệp có hợp lệ theo Luật Doanh nghiệp Việt Nam.
@@ -291,6 +376,7 @@ def business_name_validator(business_name: str) -> str:
 
 @track_tool_call
 @sandboxable("statute_lookup")
+@_validated(StatuteInput)
 def statute_lookup(case_type: str) -> str:
     """
     Tra cứu thời hiệu khởi kiện theo pháp luật Việt Nam.
@@ -536,6 +622,7 @@ def severance_pay_tool(monthly_salary: float, months_worked: int) -> str:
 
 @track_tool_call
 @sandboxable("overtime_pay_tool")
+@_validated(OvertimePayInput)
 def overtime_pay_tool(hourly_wage: float, hours: float, day_type: str = "weekday") -> str:
     """
     Tính tiền làm thêm giờ theo Điều 107 Bộ luật Lao động 2019.
@@ -589,6 +676,7 @@ def land_registration_fee_tool(property_value: float, is_first_home: bool = True
 
 @track_tool_call
 @sandboxable("vehicle_registration_fee_tool")
+@_validated(VehicleRegistrationFeeInput)
 def vehicle_registration_fee_tool(vehicle_value: float, vehicle_type: str = "car", is_first_time: bool = True) -> str:
     """
     Tính lệ phí trước bạ xe (ND 10/2022; TT 80/2020).
@@ -642,6 +730,7 @@ def admin_fine_lookup_tool(violation_type: str) -> str:
 
 @track_tool_call
 @sandboxable("child_support_tool")
+@_validated(ChildSupportInput)
 def child_support_tool(payer_income: float, num_children: int = 1) -> str:
     """
     Ước lượng mức cấp dưỡng nuôi con sau ly hôn (Đ82 Luật HNGĐ 2014).
@@ -750,11 +839,11 @@ def legal_disclaimer_tool(question: str) -> str:
 # ===== CREATE TOOLS =====
 
 # Legal calculation tools
-contract_penalty_tool = FunctionTool.from_defaults(fn=contract_penalty_calculator)
+contract_penalty_tool = FunctionTool.from_defaults(fn=contract_penalty_calculator, fn_schema=ContractPenaltyInput)
 legal_age_tool = FunctionTool.from_defaults(fn=legal_age_checker, fn_schema=LegalAgeInput)
 inheritance_tool = FunctionTool.from_defaults(fn=inheritance_calculator, fn_schema=InheritanceInput)
-business_name_tool = FunctionTool.from_defaults(fn=business_name_validator)
-statute_tool = FunctionTool.from_defaults(fn=statute_lookup)
+business_name_tool = FunctionTool.from_defaults(fn=business_name_validator, fn_schema=BusinessNameInput)
+statute_tool = FunctionTool.from_defaults(fn=statute_lookup, fn_schema=StatuteInput)
 
 # Retrieval-backed legal tools
 article_lookup_func_tool = FunctionTool.from_defaults(fn=article_lookup_tool)
@@ -764,13 +853,13 @@ verify_citation_func_tool = FunctionTool.from_defaults(fn=verify_citation_tool)
 
 # Knowledge / data-driven legal tools
 severance_pay_func_tool = FunctionTool.from_defaults(fn=severance_pay_tool, fn_schema=SeveranceInput)
-overtime_pay_func_tool = FunctionTool.from_defaults(fn=overtime_pay_tool)
+overtime_pay_func_tool = FunctionTool.from_defaults(fn=overtime_pay_tool, fn_schema=OvertimePayInput)
 pit_monthly_func_tool = FunctionTool.from_defaults(fn=pit_monthly_tool, fn_schema=PITMonthlyInput)
 land_registration_fee_func_tool = FunctionTool.from_defaults(fn=land_registration_fee_tool, fn_schema=LandRegistrationFeeInput)
-vehicle_registration_fee_func_tool = FunctionTool.from_defaults(fn=vehicle_registration_fee_tool)
+vehicle_registration_fee_func_tool = FunctionTool.from_defaults(fn=vehicle_registration_fee_tool, fn_schema=VehicleRegistrationFeeInput)
 court_fee_func_tool = FunctionTool.from_defaults(fn=court_fee_tool, fn_schema=CourtFeeInput)
 admin_fine_lookup_func_tool = FunctionTool.from_defaults(fn=admin_fine_lookup_tool)
-child_support_func_tool = FunctionTool.from_defaults(fn=child_support_tool)
+child_support_func_tool = FunctionTool.from_defaults(fn=child_support_tool, fn_schema=ChildSupportInput)
 procedure_wizard_func_tool = FunctionTool.from_defaults(fn=procedure_wizard_tool)
 jurisdiction_resolver_func_tool = FunctionTool.from_defaults(fn=jurisdiction_resolver_tool)
 generate_document_template_func_tool = FunctionTool.from_defaults(fn=generate_document_template_tool)
