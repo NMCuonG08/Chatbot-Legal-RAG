@@ -130,6 +130,7 @@ def import_qa_data(
     error_count = 0
     total_vectors_processed = 0  # Track total vectors processed
     documents_for_search = []  # Collect documents for search index
+    touched_law_names = set()  # Audit 7.2 — laws re-indexed this run, for per-law cache invalidation
 
     import hashlib
     import uuid
@@ -249,6 +250,11 @@ def import_qa_data(
                                 payload.get("law_name"),
                                 payload.get("document_year"),
                             )
+                            # Audit 7.2 — remember the law re-indexed here so its
+                            # cached answers can be invalidated after the run.
+                            _ln = payload.get("law_name")
+                            if _ln:
+                                touched_law_names.add(_ln)
                             # Phase 3 — write Statute->Article to Neo4j graph memory.
                             # Best-effort + idempotent (MERGE): no-op when graph
                             # is down/absent, never blocks vector ingest.
@@ -380,6 +386,11 @@ def import_qa_data(
                             payload.get("law_name"),
                             payload.get("document_year"),
                         )
+                        # Audit 7.2 — remember the law re-indexed here so its
+                        # cached answers can be invalidated after the run.
+                        _ln = payload.get("law_name")
+                        if _ln:
+                            touched_law_names.add(_ln)
                         # Phase 3 — write Statute->Article to Neo4j graph memory.
                         # Best-effort + idempotent (MERGE): no-op when graph is
                         # down/absent, never blocks vector ingest.
@@ -442,6 +453,21 @@ def import_qa_data(
             logger.info(f"🧹 Semantic cache wiped after reset reindex: {wiped} stale entries removed.")
         except Exception as cache_err:
             logger.warning(f"⚠️ Could not wipe semantic cache after reset: {cache_err}")
+    elif touched_law_names:
+        # Audit 7.2 — incremental re-ingest: invalidate only the cached answers
+        # grounded in the laws just re-indexed, so other laws stay warm. Full
+        # wipe on every ingest would crater hit-rate; this targets only the
+        # stale entries. Best-effort, never blocks the successful import.
+        try:
+            from semantic_cache import clear_semantic_cache_by_laws
+            wiped = clear_semantic_cache_by_laws(touched_law_names)
+            logger.info(
+                f"🧹 Per-law cache invalidation after incremental ingest: "
+                f"{wiped} entries removed for {len(touched_law_names)} law(s): "
+                f"{sorted(touched_law_names)}"
+            )
+        except Exception as cache_err:
+            logger.warning(f"⚠️ Could not per-law invalidate cache after ingest: {cache_err}")
 
     return True
 
@@ -503,16 +529,9 @@ def main():
 
     if success:
         logger.info("Import completed successfully!")
-        # Wipe the semantic cache after a successful reindex: cached answers
-        # were grounded in the OLD document set and may now be stale/wrong
-        # against the freshly indexed corpus. Best-effort — never block import
-        # on cache cleanup.
-        try:
-            from semantic_cache import clear_semantic_cache
-            wiped = clear_semantic_cache()
-            logger.info(f"Semantic cache wiped after reindex: {wiped} stale entries removed.")
-        except Exception as cache_err:
-            logger.warning(f"Could not wipe semantic cache after reindex: {cache_err}")
+        # NOTE: semantic-cache invalidation now happens inside import_qa_data
+        # (full wipe on --reset, per-law on incremental) — do NOT double-wipe
+        # here, or every incremental CLI run would crater hit-rate for all laws.
         sys.exit(0)
     else:
         logger.error("Import failed!")

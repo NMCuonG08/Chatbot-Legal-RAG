@@ -68,6 +68,22 @@ def _scope_for(user_id: Optional[str], scope: Optional[str]) -> str:
     return SCOPE_COMMON
 
 
+def _extract_law_names(sources: List[Dict]) -> List[str]:
+    """Pull a deduplicated, cleaned list of law names from retrieval sources.
+
+    Used to stamp ``law_names`` onto a cache entry so a re-ingest of one law
+    can invalidate only the cached answers grounded in that law (audit 7.2)
+    instead of wiping the whole cache. Source dicts carry ``law_name`` from
+    ``extract_legal_metadata`` (see search.py / citations.normalize_sources).
+    """
+    seen: List[str] = []
+    for src in sources or []:
+        name = (src.get("law_name") or "").strip() if isinstance(src, dict) else ""
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
 def _is_cacheable_response(response: str) -> bool:
     """True only for a real, non-empty, non-error response worth caching.
 
@@ -234,6 +250,13 @@ def set_cached_response(
         resolved_scope = _scope_for(user_id, scope)
         point_id = str(uuid.uuid4())
 
+        # Audit 7.2 — stamp the laws this answer cited so a re-ingest of one
+        # law can invalidate only the affected entries (clear_semantic_cache_by_law)
+        # instead of wiping the whole cache. Empty list when sources carry no
+        # law_name (e.g. web_search answers); those entries are only reachable
+        # by full wipe / TTL, which is fine.
+        law_names = _extract_law_names(sources)
+
         get_client().upsert(
             collection_name=CACHE_COLLECTION_NAME,
             points=[
@@ -246,6 +269,7 @@ def set_cached_response(
                         "sources": sources,
                         "cached_at": time.time(),
                         "scope": resolved_scope,
+                        "law_names": law_names,
                     },
                 )
             ],
@@ -280,6 +304,49 @@ def clear_semantic_cache() -> int:
     except Exception as e:
         logger.error(f"Failed to clear semantic cache: {e}")
         return 0
+
+
+def clear_semantic_cache_by_law(law_name: Optional[str]) -> int:
+    """Delete only cache entries whose answer cited ``law_name`` (audit 7.2).
+
+    Targeted invalidation for incremental re-ingest: when one law's chunks
+    change, stale cached answers grounded in that law are dropped while every
+    other law's cache entries stay warm. Matches on the ``law_names`` payload
+    array — Qdrant ``MatchValue`` on an array field matches when the value is
+    present in the array. Legacy points without ``law_names`` are not matched
+    (they age out via TTL or a full reset wipe).
+
+    Returns the number of points reported deleted (best-effort). ``None``/empty
+    ``law_name`` is a no-op (defensive — must never wipe the whole cache).
+    """
+    if not law_name or not str(law_name).strip():
+        return 0
+    law_name = str(law_name).strip()
+    try:
+        client = get_client()
+        deleted = client.delete(
+            collection_name=CACHE_COLLECTION_NAME,
+            points_selector=Filter(
+                must=[FieldCondition(key="law_names", match=MatchValue(value=law_name))]
+            ),
+        )
+        logger.info("🧹 Cleared semantic cache entries citing law: %s", law_name)
+        return getattr(getattr(deleted, "operation", None), "deleted_count", 0) or 0
+    except Exception as e:
+        logger.error("Failed to clear semantic cache by law %r: %s", law_name, e)
+        return 0
+
+
+def clear_semantic_cache_by_laws(law_names) -> int:
+    """Batch per-law invalidation over an iterable of law names (audit 7.2).
+
+    Called from the ingest path with the set of laws touched in an incremental
+    re-import. Sums per-law deleted counts. Unknown/empty names are skipped.
+    """
+    total = 0
+    for name in law_names or []:
+        total += clear_semantic_cache_by_law(name)
+    return total
 
 
 def maybe_wipe_legacy_cache() -> int:
