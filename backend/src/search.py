@@ -3,10 +3,12 @@ Enhanced Search Module for Vietnamese Legal Chatbot
 Implements hybrid search combining semantic vector search + BM25 keyword search using LlamaIndex
 """
 
+import hashlib
 import logging
 import os
 import pickle
 import re
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -58,6 +60,14 @@ _docstore = None
 _bm25_retriever = None
 _search_engine_initialized = False
 
+# Audit (external) Bug 2: guard the init/swap of the global _docstore /
+# _bm25_retriever against concurrent cold-start in one process (e.g. Uvicorn
+# threadpool firing two first queries at once). RLock so a public init entry
+# point that delegates to another locked init path cannot self-deadlock.
+# Celery workers are separate processes (no cross-process race), but a single
+# multi-threaded process can still race the None->retriever swap.
+_init_lock = threading.RLock()
+
 
 def initialize_search_index(documents: List[Dict]) -> bool:
     """
@@ -70,60 +80,66 @@ def initialize_search_index(documents: List[Dict]) -> bool:
         bool: True if successful, False otherwise
     """
     global _docstore, _bm25_retriever, _search_engine_initialized
-    
-    try:
-        logger.info(f"🔧 Initializing search index with {len(documents)} documents")
-        
-        # Convert documents directly to TextNode objects to bypass slow SentenceSplitter parsing
-        from llama_index.core.schema import TextNode
-        nodes = []
-        for i, doc in enumerate(documents):
-            if not doc.get('question') and not doc.get('content'):
-                continue
-            text = _tokenize_vi(f"{doc.get('question', '')} {doc.get('content', '')}")
-            node = TextNode(
-                text=text,
-                id_=str(doc.get('doc_id', i)),
-                metadata={
-                    "question": doc.get('question', ''),
-                    "source": doc.get('source', 'unknown'),
-                    "doc_id": doc.get('doc_id', i)
-                }
+
+    # Audit (external) Bug 2: hold _init_lock across the whole init so two
+    # concurrent cold-starts in one process cannot race the None->retriever
+    # swap (one reading a half-written _bm25_retriever -> NoneType.retrieve).
+    # RLock: force_initialize_if_needed -> initialize_from_vector_store can
+    # re-enter without self-deadlock.
+    with _init_lock:
+        try:
+            logger.info(f"🔧 Initializing search index with {len(documents)} documents")
+
+            # Convert documents directly to TextNode objects to bypass slow SentenceSplitter parsing
+            from llama_index.core.schema import TextNode
+            nodes = []
+            for i, doc in enumerate(documents):
+                if not doc.get('question') and not doc.get('content'):
+                    continue
+                text = _tokenize_vi(f"{doc.get('question', '')} {doc.get('content', '')}")
+                node = TextNode(
+                    text=text,
+                    id_=str(doc.get('doc_id', i)),
+                    metadata={
+                        "question": doc.get('question', ''),
+                        "source": doc.get('source', 'unknown'),
+                        "doc_id": doc.get('doc_id', i)
+                    }
+                )
+                nodes.append(node)
+
+            if not nodes:
+                logger.error("❌ No valid documents after conversion")
+                return False
+
+            logger.info(f"📄 Converted {len(nodes)} valid documents directly to TextNodes")
+
+            # Initialize docstore
+            _docstore = SimpleDocumentStore()
+            _docstore.add_documents(nodes)
+            logger.info(f"📚 Docstore initialized with {len(nodes)} nodes")
+
+            # Initialize BM25 retriever without stemmer for simplicity
+            _bm25_retriever = BM25Retriever.from_defaults(
+                docstore=_docstore,
+                similarity_top_k=5,
             )
-            nodes.append(node)
-        
-        if not nodes:
-            logger.error("❌ No valid documents after conversion")
+            logger.info("🔍 BM25 retriever initialized successfully")
+
+            _search_engine_initialized = True
+            logger.info("✅ Search index initialized successfully!")
+
+            # Verify initialization
+            stats = get_search_stats()
+            logger.info(f"📊 Search stats: {stats}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize search index: {e}")
+            logger.exception("Full error traceback:")
+            _search_engine_initialized = False
             return False
-            
-        logger.info(f"📄 Converted {len(nodes)} valid documents directly to TextNodes")
-        
-        # Initialize docstore
-        _docstore = SimpleDocumentStore()
-        _docstore.add_documents(nodes)
-        logger.info(f"📚 Docstore initialized with {len(nodes)} nodes")
-        
-        # Initialize BM25 retriever without stemmer for simplicity
-        _bm25_retriever = BM25Retriever.from_defaults(
-            docstore=_docstore,
-            similarity_top_k=5,
-        )
-        logger.info("🔍 BM25 retriever initialized successfully")
-        
-        _search_engine_initialized = True
-        logger.info("✅ Search index initialized successfully!")
-        
-        # Verify initialization
-        stats = get_search_stats()
-        logger.info(f"📊 Search stats: {stats}")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize search index: {e}")
-        logger.exception("Full error traceback:")
-        _search_engine_initialized = False
-        return False
 
 
 def hybrid_search(query: str, limit: int = 10) -> List[Dict]:
@@ -196,6 +212,30 @@ def vector_search_fallback(query: str, limit: int = 5) -> List[Dict]:
         return []
 
 
+def _content_norm_hash(content_text: str, q: str) -> str:
+    """Stable dedup key for a chunk, used when ``doc_id`` is falsy.
+
+    Audit (external) Bugs 1 + 3: BM25 text is pyvi-tokenized (compound words
+    joined with underscores, e.g. ``"Đất_đai"``) while vector-search text is
+    raw (``"Đất đai"``). A naive ``hash(content)`` produced DIFFERENT keys for
+    the same chunk -> RRF saw zero overlap -> the chunk appeared twice in the
+    context window. This normalizes away whitespace AND underscores (and case)
+    before hashing so tokenized and raw forms collapse to one key.
+
+    Uses md5 (deterministic across process restarts, unlike Python's
+    process-randomized ``hash()`` for str) and returns a hex string. This is a
+    query-time in-memory dedup key only — nothing is persisted by this hash, so
+    there is no restart cache-corruption impact; the determinism is correctness
+    hygiene + collision resistance.
+    """
+    content_text = (content_text or "").strip()
+    q = (q or "").strip()
+    if q and content_text.startswith(q):
+        content_text = content_text[len(q):].strip()
+    normalized = re.sub(r"[\s_]+", "", content_text).lower()
+    return hashlib.md5(normalized.encode("utf-8")).hexdigest()
+
+
 def combine_search_results(bm25_results, vector_results, query: str) -> List[Dict]:
     """
     Combine BM25 and vector search results using Reciprocal Rank Fusion (RRF)
@@ -210,14 +250,6 @@ def combine_search_results(bm25_results, vector_results, query: str) -> List[Dic
     """
     # RRF Constant (usually 60)
     k = 60
-    
-    # Helper to normalize content text by removing the question if it's prepended
-    def get_norm_hash(content_text: str, q: str) -> int:
-        content_text = content_text.strip()
-        q = q.strip()
-        if q and content_text.startswith(q):
-            content_text = content_text[len(q):].strip()
-        return hash(content_text)
 
     # Convert BM25 results to dict and map doc_key -> doc
     bm25_docs = {}
@@ -226,8 +258,8 @@ def combine_search_results(bm25_results, vector_results, query: str) -> List[Dic
         content = node.node.text if hasattr(node.node, 'text') else str(node.node)
         question = node.node.metadata.get("question", "")
         doc_id = node.node.metadata.get("doc_id", 0)
-        
-        content_hash = get_norm_hash(content, question)
+
+        content_hash = _content_norm_hash(content, question)
         doc_key = f"id_{doc_id}" if doc_id else f"hash_{content_hash}"
         
         logger.info(f"   BM25[Rank {rank_idx}]: Score={node.score:.3f}, Key={doc_key}, Q='{question[:50]}...'")
@@ -251,9 +283,9 @@ def combine_search_results(bm25_results, vector_results, query: str) -> List[Dic
         question = doc.get("question", "")
         doc_id = doc.get("doc_id", 0)
         
-        content_hash = get_norm_hash(content, question)
+        content_hash = _content_norm_hash(content, question)
         doc_key = f"id_{doc_id}" if doc_id else f"hash_{content_hash}"
-        
+
         logger.info(f"   Vector[Rank {rank_idx}]: Score={doc.get('similarity_score', 0):.3f}, Key={doc_key}, Q='{question[:50]}...'")
         
         vector_docs[doc_key] = {
