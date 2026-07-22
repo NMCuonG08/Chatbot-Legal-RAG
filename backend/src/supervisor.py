@@ -153,6 +153,50 @@ def heuristic_handoff(current_specialist: str, answer: str) -> str:
     return END
 
 
+def plan_fast_path(
+    current_specialist: str,
+    plan: Optional[List[Dict[str, str]]],
+    answer: str = "",
+) -> Optional[str]:
+    """Rule-based fast path (audit 2.1): deterministic next specialist from a
+    fixed planner plan, WITHOUT an LLM call.
+
+    Returns:
+    - a specialist token ("rag"/"tool"/"web"/"chat") -> advance to it,
+    - ``END`` -> the current specialist is the last planned one (plan complete),
+    - ``None`` -> no fast-path decision; caller should consult the LLM / heuristic.
+
+    ``None`` is returned when there is no plan, the current specialist is not in
+    the plan, or the answer carries a not-found / needs-lookup marker (so a
+    failing step is never blindly fast-forwarded past — the LLM/heuristic judges
+    recovery). Non-specialist plan steps (e.g. ``verify_answer``) are skipped:
+    they are graph nodes handled deterministically, not supervisor handoff
+    targets. Planner aliases ("retrieve"->rag, "agent_tools"->tool) normalize.
+    """
+    if not plan:
+        return None
+    low = (answer or "").lower()
+    if any(m in low for m in _NOT_FOUND_MARKERS) or any(m in low for m in _NEEDS_LOOKUP_MARKERS):
+        return None
+    cur = _normalize_next(current_specialist)
+    if not cur or cur == END:
+        return None
+    seq = []
+    for step in plan:
+        if not isinstance(step, dict):
+            continue
+        sp = _normalize_next(str(step.get("specialist", "")))
+        if sp and sp != END and sp not in seq:
+            seq.append(sp)
+    try:
+        idx = seq.index(cur)
+    except ValueError:
+        return None
+    if idx + 1 < len(seq):
+        return seq[idx + 1]
+    return END
+
+
 def supervisor_decide(
     question: str,
     current_specialist: str,
@@ -172,6 +216,19 @@ def supervisor_decide(
     if steps_taken >= MAX_HANDOFF_STEPS:
         logger.info(f"[SUPERVISOR] step budget exhausted ({steps_taken}) -> END")
         return {"next": END, "rationale": "giới hạn số bước đạt tối đa", "source": "guard"}
+
+    # Audit 2.1: rule-based fast path. If the planner already fixed the next
+    # specialist, advance deterministically and SKIP the LLM supervisor call
+    # (saves 1.2-2.0s per intermediate handoff). Falls through to the LLM when
+    # the fast path has no decision (no plan / current not in plan / failure
+    # marker), so recovery is still LLM-driven.
+    fast = plan_fast_path(current_specialist, plan, answer)
+    if fast is not None:
+        rationale = (
+            "kế hoạch hoàn tất" if fast == END else "chuyển giao theo kế hoạch cố định"
+        )
+        logger.info(f"[SUPERVISOR] fast-path -> {fast}")
+        return {"next": fast, "rationale": rationale, "source": "fast-path"}
 
     if llm_call is not None:
         try:
@@ -196,5 +253,6 @@ __all__ = [
     "build_supervisor_prompt",
     "parse_supervisor_decision",
     "heuristic_handoff",
+    "plan_fast_path",
     "supervisor_decide",
 ]
