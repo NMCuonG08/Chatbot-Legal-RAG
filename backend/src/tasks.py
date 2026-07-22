@@ -133,6 +133,8 @@ logger = logging.getLogger(__name__)
 import redis
 redis_client = redis.from_url(settings.redis_url)
 
+from conversation_lock import acquire_conversation_lock, release_conversation_lock
+
 # Shared placeholder user_ids: writing episodic facts or per-user cache under
 # one of these collapses every such client into a single bucket (cross-user
 # leak). Skip per-user persistence when a sentinel is in use.
@@ -1338,7 +1340,8 @@ def get_chat_graph():
 @traceable(name="run_chat_graph", run_type="chain",
            metadata={"component": "chat_graph"})
 def run_chat_graph(history, question, user_id=None, conversation_id=None,
-                   run_id=None, role=None, variant=None, shadow=False):
+                   run_id=None, role=None, variant=None, shadow=False,
+                   skip_conv_lock=False):
     """Invoke the chat graph.
 
     P6 extensions (opt-in, default off):
@@ -1385,6 +1388,7 @@ def run_chat_graph(history, question, user_id=None, conversation_id=None,
     token = None
     if override_model is not None:
         token = LLM_MODEL_CONTEXTVAR.set(override_model)
+    conv_lock = None
     try:
         graph = get_chat_graph()
         thread_id = conversation_id or (f"user:{user_id}" if user_id else "default")
@@ -1395,6 +1399,34 @@ def run_chat_graph(history, question, user_id=None, conversation_id=None,
             # GRAPH_RECURSION_LIMIT (env-tunable). Caught + degraded, NOT retried.
             "recursion_limit": GRAPH_RECURSION_LIMIT,
         }
+
+        # Audit 2.2: per-conversation Redis lock so two concurrent Celery workers
+        # fielding the same conversation_id don't overwrite each other's graph
+        # state (done-flags on the shared thread_id checkpoint). TTL > run timeout
+        # so the lock can't expire mid-run. ``unavailable`` (Redis down) proceeds
+        # best-effort; ``contended`` returns a busy response instead of clobbering.
+        if not skip_conv_lock:
+            conv_lock, lock_status = acquire_conversation_lock(
+                thread_id, redis_client, ttl_s=GRAPH_RUN_TIMEOUT_S + 30,
+            )
+            if lock_status == "contended":
+                logger.info(
+                    "[CHAT-GRAPH] conversation %s busy (lock contended) -> busy response",
+                    thread_id,
+                )
+                return {
+                    "response": "Hệ thống đang xử lý tin nhắn trước đó của bạn trong cùng phiên. Vui lòng đợi một chút rồi gửi lại.",
+                    "sources": [],
+                    "route": "busy",
+                    "reflection_count": 0,
+                    "run_id": run_id,
+                    "tool_calls": [],
+                    "verify_score": 0.0,
+                    "verify_verdict": "busy",
+                    "retry_verify": 0,
+                    "variant": variant,
+                }
+
         result = _invoke_with_deadline(
             graph,
             {
@@ -1409,6 +1441,8 @@ def run_chat_graph(history, question, user_id=None, conversation_id=None,
             timeout_s=GRAPH_RUN_TIMEOUT_S,
         )
     finally:
+        if conv_lock is not None:
+            release_conversation_lock(conv_lock)
         if token is not None:
             LLM_MODEL_CONTEXTVAR.reset(token)
 
@@ -1455,6 +1489,7 @@ def _run_shadow(history, question, user_id, conversation_id, role, run_id) -> No
             history, question, user_id=user_id,
             conversation_id=conversation_id, run_id=shadow_run_id,
             role=role, variant=None, shadow=False,
+            skip_conv_lock=True,  # primary holds the conv lock; shadow is fire-and-forget
         )
         if shadow_run_id:
             emit_step(shadow_run_id, conversation_id or "default",
