@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import List, Optional
 from xml.dom import ValidationErr
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, Text, delete
+from sqlalchemy import JSON, Boolean, Column, DateTime, Index, Integer, String, Text, delete
 from sqlalchemy.future import select
 from sqlalchemy.orm import DeclarativeBase, Session
 from sqlalchemy.sql import func
@@ -40,6 +40,16 @@ class ChatConversation(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(
         DateTime(timezone=True), onupdate=func.now(), server_default=func.now()
+    )
+
+    # Audit 6.2 — hot-path indexes. load_conversation filters by
+    # conversation_id ALONE (the per-message lookup), and list/delete paths
+    # filter by user_id ALONE. A composite (user_id, conversation_id) would NOT
+    # serve the conversation_id-only hot path (B-tree leftmost-prefix), so both
+    # columns get standalone indexes.
+    __table_args__ = (
+        Index("idx_chat_conv_conversation_id", "conversation_id"),
+        Index("idx_chat_conv_user_id", "user_id"),
     )
 
 

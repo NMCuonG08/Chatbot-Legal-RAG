@@ -31,6 +31,7 @@ from models import (
     load_agent_steps,
 )
 from cache import clear_conversation_id
+from rate_limit import check_rate_limit
 from guardrails_manager import LegalGuardrailsManager
 from security import (
     get_cors_origins,
@@ -411,12 +412,36 @@ def _client_ip(request: "Request") -> Optional[str]:
     return request.client.host if request.client else None
 
 
+async def _enforce_auth_rate_limit(action: str, request: "Request"):
+    """Audit 5.2 — throttle brute-force / registration floods: max 5 hits /
+    60s / IP / action on the public auth endpoints. Raises 429 over the limit.
+
+    Per-IP (not per-username) so an attacker cannot weaponize the counter into
+    an account-lockout DoS. Redis errors fail open inside ``check_rate_limit``,
+    so a degraded Redis does not lock out all logins.
+    """
+    ip = _client_ip(request)
+    if not ip:
+        return
+    client = aioredis.from_url(db_settings.redis_url, decode_responses=True)
+    try:
+        allowed = await check_rate_limit(client, action, ip)
+    finally:
+        await client.aclose()
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail="Quá nhiều yêu cầu. Vui lòng thử lại sau 1 phút.",
+        )
+
+
 @app.post("/auth/register")
 async def register(req: RegisterRequest, request: "Request"):
     """Register a new user. Self-registration is restricted to non-escalating
     roles: a caller may NOT self-assign admin/lawyer via this public endpoint
     — only user/guest. Existing-role seeding is done via ``seed_admin`` at
     startup or by an admin out-of-band."""
+    await _enforce_auth_rate_limit("register", request)
     if req.role in (Role.ADMIN, Role.LAWYER):
         raise HTTPException(
             status_code=403,
@@ -450,6 +475,7 @@ async def register(req: RegisterRequest, request: "Request"):
 @app.post("/auth/login")
 async def login(req: LoginRequest, request: "Request"):
     """Exchange username/password for a JWT."""
+    await _enforce_auth_rate_limit("login", request)
     if not auth_configured():
         raise HTTPException(status_code=500, detail="JWT chưa được cấu hình (JWT_SECRET).")
     user = get_user_by_username(req.username)

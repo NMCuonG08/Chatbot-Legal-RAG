@@ -66,7 +66,16 @@ CELERY_RESULT_BACKEND = settings.celery_result_backend or settings.redis_url
 SQLALCHEMY_DATABASE_URL = settings.resolve_db_url()
 
 engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, pool_pre_ping=True  # Improve connection resilience
+    SQLALCHEMY_DATABASE_URL,
+    # Audit 6.1 — explicit QueuePool sizing. Defaults (pool_size=5,
+    # max_overflow=10, no recycle) overflow under Celery + API concurrency and
+    # keep stale MySQL connections past the server's wait_timeout. pool_recycle
+    # 1800s < typical MySQL wait_timeout (28800s default, often lowered) so
+    # connections are proactively recycled; pool_pre_ping drops dead ones.
+    pool_size=20,
+    max_overflow=40,
+    pool_recycle=1800,
+    pool_pre_ping=True,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -105,6 +114,17 @@ def get_celery_app(name):
         worker_hijack_root_logger=False,
         worker_log_format="[%(asctime)s: %(levelname)s/%(processName)s] %(message)s",
         worker_task_log_format="[%(asctime)s: %(levelname)s/%(processName)s] %(message)s",
+    )
+
+    # Audit 8.1 — worker self-recycling. Celery workers load the bge-m3
+    # SentenceTransformer (PyTorch) in-process; PyTorch's caching allocator +
+    # per-task allocations grow resident memory without bound and never release
+    # to the OS. Without recycling a worker eventually OOMs the box. Recycle a
+    # worker after 100 tasks OR ~4GB resident (worker_max_memory_per_child is
+    # KiB), so a fresh worker replaces it before that happens.
+    app.conf.update(
+        worker_max_tasks_per_child=100,
+        worker_max_memory_per_child=4_000_000,
     )
 
     return app

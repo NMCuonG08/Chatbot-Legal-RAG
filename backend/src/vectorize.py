@@ -105,13 +105,21 @@ def set_qdrant_client(new_client):
 
 def create_collection(name, vector_size=1024):
     """
-    Create a collection with enhanced configuration
+    Create a collection with enhanced configuration.
+
+    HNSW config: ``m=16`` (Qdrant default graph degree). The previous ``m=0``
+    built NO HNSW graph, so every search degraded to a brute-force O(N) scan
+    over disk-resident vectors — catastrophic at corpus scale. ``on_disk=True``
+    keeps the graph payload on disk for memory-constrained deploys.
+    ``indexing_threshold=20000`` lets small upload segments stay unindexed
+    (fast ingest) while large/merged segments get a real HNSW index — the
+    previous ``999999`` sentinel disabled indexing forever.
     """
     return client.create_collection(
         collection_name=name,
         vectors_config=VectorParams(size=vector_size, distance=Distance.DOT, on_disk=True),
-        hnsw_config=HnswConfigDiff(m=0, on_disk=True),
-        optimizers_config=OptimizersConfigDiff(indexing_threshold=999999),
+        hnsw_config=HnswConfigDiff(m=16, on_disk=True),
+        optimizers_config=OptimizersConfigDiff(indexing_threshold=20000),
     )
 
 
@@ -124,8 +132,8 @@ def wipe_collection(name, vector_size=1024):
         client.create_collection(
             collection_name=name,
             vectors_config=VectorParams(size=vector_size, distance=Distance.DOT, on_disk=True),
-            hnsw_config=HnswConfigDiff(m=0, on_disk=True),
-            optimizers_config=OptimizersConfigDiff(indexing_threshold=999999),
+            hnsw_config=HnswConfigDiff(m=16, on_disk=True),
+            optimizers_config=OptimizersConfigDiff(indexing_threshold=20000),
         )
         logger.info(f"Wiped collection: {name}")
         return True
