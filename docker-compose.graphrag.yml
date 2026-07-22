@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  # Isolated Qdrant instance for GraphRAG pipeline (Port 6335 to avoid conflict with main Qdrant 6333)
+  qdrant-graphrag:
+    image: qdrant/qdrant:v1.11.3
+    container_name: qdrant_graphrag_isolated
+    ports:
+      - "6335:6333"
+      - "6336:6334"
+    volumes:
+      - qdrant_graphrag_data:/qdrant/storage
+
+  # Isolated Neo4j instance for GraphRAG pipeline (Port 7688 Bolt / 7475 Web UI to avoid conflict with main Neo4j 7687/7474)
+  neo4j-graphrag:
+    image: neo4j:5.20
+    container_name: neo4j_graphrag_isolated
+    environment:
+      NEO4J_AUTH: none
+    ports:
+      - "7475:7474"   # Isolated Browser UI: http://localhost:7475
+      - "7688:7687"   # Isolated Bolt Protocol: bolt://localhost:7688
+    volumes:
+      - neo4j_graphrag_data:/data
+
+volumes:
+  qdrant_graphrag_data:
+  neo4j_graphrag_data:

@@ -118,7 +118,7 @@ def handle_app():
     
     celery_cmd = [get_bin("celery"), "-A", "tasks.celery_app", "worker", "--loglevel=info", "-P", "solo"]
     uvicorn_cmd = [get_bin("uvicorn"), "app:app", "--host", "0.0.0.0", "--port", "8002"]
-    streamlit_cmd = [get_bin("streamlit"), "run", "chat_interface.py", "--server.port", "8501"]
+    frontend_cmd = ["cmd.exe", "/c", "npm", "run", "dev"] if os.name == "nt" else ["npm", "run", "dev"]
     
     processes = []
     try:
@@ -140,19 +140,19 @@ def handle_app():
         )
         processes.append(p_api)
         
-        # Start Streamlit
+        # Start React/Vite Frontend
         p_ui = subprocess.Popen(
-            streamlit_cmd, 
+            frontend_cmd, 
             cwd="frontend",
             stdout=sys.stdout, 
             stderr=sys.stderr
         )
         processes.append(p_ui)
         
-        print("\nUI:      http://localhost:8501")
-        print("API:     http://localhost:8002/docs")
-        print("Health:  http://localhost:8002/health")
-        print("Grafana:  http://localhost:3000 (Monitoring)\n")
+        print("\nUI (React/Vite): http://localhost:8501")
+        print("API:             http://localhost:8002/docs")
+        print("Health:          http://localhost:8002/health")
+        print("Grafana:         http://localhost:3000 (Monitoring)\n")
         
         # Wait for all processes to complete/interrupt
         while True:

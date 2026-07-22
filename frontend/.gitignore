@@ -1,0 +1,24 @@
+# Node dependencies
+node_modules/
+.pnpm-store/
+
+# Vite / Build outputs
+dist/
+dist-ssr/
+*.local
+.vite/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
