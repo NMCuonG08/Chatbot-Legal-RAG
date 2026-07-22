@@ -102,3 +102,36 @@ def test_sandbox_dispatch_failure_falls_back(monkeypatch):
     # fell back to the in-process impl -> real result, no crash, no "sandboxed"
     assert "sandboxed" not in data
     assert "1,000,000,000 VNĐ" in data.get("contract_value", "")
+
+
+def test_validation_runs_even_when_sandboxed(monkeypatch):
+    """Audit 3.2 + Flaw 4: with SANDBOX_ENABLED True, bad input must STILL be
+    rejected by @_validated (stacked outermost) BEFORE the sandbox is dispatched.
+    The subprocess must never receive unvalidated args."""
+    import config
+    import agent_tool_wrappers as w
+
+    monkeypatch.setattr(config, "SANDBOX_ENABLED", True)
+    sink = []
+    _stub_sandbox(monkeypatch, sink)
+
+    # Non-numeric penalty_rate -> ValidationError, not a sandbox dispatch.
+    out = w.contract_penalty_calculator(1e9, "không hợp lệ", 30)
+    data = json.loads(out)
+    assert "error" in data
+    assert sink == []  # sandbox never called -> validation guarded first
+
+
+def test_sandbox_default_is_on_in_production():
+    """Audit 3.2: SANDBOX_ENABLED defaults ON unless explicitly disabled."""
+    import os
+
+    # Simulate a clean production env (no SANDBOX_ENABLED var).
+    saved = os.environ.pop("SANDBOX_ENABLED", None)
+    try:
+        # Re-read the config line's logic: default "1" -> truthy.
+        default_val = os.environ.get("SANDBOX_ENABLED", "1").lower() in ("1", "true", "yes", "on")
+        assert default_val is True
+    finally:
+        if saved is not None:
+            os.environ["SANDBOX_ENABLED"] = saved

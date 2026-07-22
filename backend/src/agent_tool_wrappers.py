@@ -74,10 +74,9 @@ def sandboxable(tool_name: str):
     env + hard timeout in a throwaway child) instead of running the impl
     in-process. Read at call time so the flag can be flipped without redeploy.
 
-    The wrapper's own input-validation guardrails are SKIPPED when sandboxed —
-    the sandbox worker calls the raw impl directly. Acceptable trade: process
-    isolation is the stronger guard for a pure-compute fn, and the flag is off
-    by default so validation still runs in the normal path.
+    The wrapper's input-validation guardrails run BEFORE this decorator
+    (``@_validated`` is stacked outermost), so even when sandboxed the validated
+    args are what the subprocess receives — validation is never bypassed.
     """
     def _deco(fn):
         @functools.wraps(fn)
@@ -103,9 +102,11 @@ def sandboxable(tool_name: str):
 # crashes (legal_age: str < int -> TypeError) or silently computes garbage
 # (severance: "5 VNĐ"). @_validated runs pydantic coerce+validate in-process
 # BEFORE the fn body and returns a clean Vietnamese JSON error on failure.
-# Stacks INNERMOST (under @sandboxable): the in-process path validates; the
-# sandboxed path skips it (process isolation is the stronger guard there),
-# matching the existing sandboxable tradeoff note.
+# Stacks OUTERMOST (over @sandboxable): validation ALWAYS runs in-process,
+# then the validated/coerced args are handed to @sandboxable — so even when
+# SANDBOX_ENABLED is on and the impl runs in a subprocess, input validation
+# is never bypassed (audit 3.2 enabled the sandbox by default; this ordering
+# preserves the Flaw 4 validation guard in that path).
 def _validated(model_cls):
     """Decorate a calc-tool fn with pydantic input validation.
 
@@ -258,8 +259,8 @@ class StatuteInput(BaseModel):
 
 
 @track_tool_call
-@sandboxable("contract_penalty_calculator")
 @_validated(ContractPenaltyInput)
+@sandboxable("contract_penalty_calculator")
 def contract_penalty_calculator(
     contract_value: float, penalty_rate: float, days_late: int
 ) -> str:
@@ -287,8 +288,8 @@ def contract_penalty_calculator(
 
 
 @track_tool_call
-@sandboxable("legal_age_checker")
 @_validated(LegalAgeInput)
+@sandboxable("legal_age_checker")
 def legal_age_checker(
     birth_year: int, action_type: str = "sign_contract", gender: str = ""
 ) -> str:
@@ -325,8 +326,8 @@ def legal_age_checker(
 
 
 @track_tool_call
-@sandboxable("inheritance_calculator")
 @_validated(InheritanceInput)
+@sandboxable("inheritance_calculator")
 def inheritance_calculator(total_value: float, heirs_json: str) -> str:
     """
     Tính phần thừa kế theo pháp luật Việt Nam (hàng thừa kế thứ nhất).
@@ -353,8 +354,8 @@ def inheritance_calculator(total_value: float, heirs_json: str) -> str:
 
 
 @track_tool_call
-@sandboxable("business_name_validator")
 @_validated(BusinessNameInput)
+@sandboxable("business_name_validator")
 def business_name_validator(business_name: str) -> str:
     """
     Kiểm tra tên doanh nghiệp có hợp lệ theo Luật Doanh nghiệp Việt Nam.
@@ -376,8 +377,8 @@ def business_name_validator(business_name: str) -> str:
 
 
 @track_tool_call
-@sandboxable("statute_lookup")
 @_validated(StatuteInput)
+@sandboxable("statute_lookup")
 def statute_lookup(case_type: str) -> str:
     """
     Tra cứu thời hiệu khởi kiện theo pháp luật Việt Nam.
@@ -606,8 +607,8 @@ def verify_citation_tool(law_name: str, article_number: int, claimed_text: str) 
 
 
 @track_tool_call
-@sandboxable("severance_pay_tool")
 @_validated(SeveranceInput)
+@sandboxable("severance_pay_tool")
 def severance_pay_tool(monthly_salary: float, months_worked: int) -> str:
     """
     Tính trợ cấp thôi việc theo Điều 48 Bộ luật Lao động 2019.
@@ -624,8 +625,8 @@ def severance_pay_tool(monthly_salary: float, months_worked: int) -> str:
 
 
 @track_tool_call
-@sandboxable("overtime_pay_tool")
 @_validated(OvertimePayInput)
+@sandboxable("overtime_pay_tool")
 def overtime_pay_tool(hourly_wage: float, hours: float, day_type: str = "weekday") -> str:
     """
     Tính tiền làm thêm giờ theo Điều 107 Bộ luật Lao động 2019.
@@ -643,8 +644,8 @@ def overtime_pay_tool(hourly_wage: float, hours: float, day_type: str = "weekday
 
 
 @track_tool_call
-@sandboxable("pit_monthly_tool")
 @_validated(PITMonthlyInput)
+@sandboxable("pit_monthly_tool")
 def pit_monthly_tool(taxable_income: float) -> str:
     """
     Tính thuế TNCN lương tháng theo biểu lũy tiến (Luật Thuế TNCN + TT 111/2013).
@@ -660,8 +661,8 @@ def pit_monthly_tool(taxable_income: float) -> str:
 
 
 @track_tool_call
-@sandboxable("land_registration_fee_tool")
 @_validated(LandRegistrationFeeInput)
+@sandboxable("land_registration_fee_tool")
 def land_registration_fee_tool(property_value: float, is_first_home: bool = True) -> str:
     """
     Tính lệ phí trước bạ nhà đất (ND 10/2022; TT 80/2020). Mức 0,5%.
@@ -678,8 +679,8 @@ def land_registration_fee_tool(property_value: float, is_first_home: bool = True
 
 
 @track_tool_call
-@sandboxable("vehicle_registration_fee_tool")
 @_validated(VehicleRegistrationFeeInput)
+@sandboxable("vehicle_registration_fee_tool")
 def vehicle_registration_fee_tool(vehicle_value: float, vehicle_type: str = "car", is_first_time: bool = True) -> str:
     """
     Tính lệ phí trước bạ xe (ND 10/2022; TT 80/2020).
@@ -697,8 +698,8 @@ def vehicle_registration_fee_tool(vehicle_value: float, vehicle_type: str = "car
 
 
 @track_tool_call
-@sandboxable("court_fee_tool")
 @_validated(CourtFeeInput)
+@sandboxable("court_fee_tool")
 def court_fee_tool(claim_value: float, case_type: str = "civil_first") -> str:
     """
     Tính án phí dân sự theo NQ 326/2016/UBTVQH14.
@@ -732,8 +733,8 @@ def admin_fine_lookup_tool(violation_type: str) -> str:
 
 
 @track_tool_call
-@sandboxable("child_support_tool")
 @_validated(ChildSupportInput)
+@sandboxable("child_support_tool")
 def child_support_tool(payer_income: float, num_children: int = 1) -> str:
     """
     Ước lượng mức cấp dưỡng nuôi con sau ly hôn (Đ82 Luật HNGĐ 2014).

@@ -60,3 +60,17 @@ def jwt_secret(monkeypatch):
     monkeypatch.setenv("JWT_EXP_MIN", "60")
     monkeypatch.delenv("ALLOW_UNSAFE_AUTH", raising=False)
     yield "test-secret-not-for-prod"
+
+
+# Audit 3.2: SANDBOX_ENABLED defaults ON in production so calc tools run in a
+# subprocess. The unit suite must not spawn subprocesses (slow + platform-
+# fragile), so force it off here. Tests that exercise the sandbox path
+# (test_sandboxable) monkeypatch config.SANDBOX_ENABLED=True explicitly, which
+# overrides this autouse value (same function-scoped monkeypatch instance).
+@pytest.fixture(autouse=True)
+def _sandbox_off_in_tests(monkeypatch):
+    try:
+        import config
+        monkeypatch.setattr(config, "SANDBOX_ENABLED", False)
+    except Exception:
+        pass

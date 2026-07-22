@@ -43,11 +43,13 @@ AGENT_MAX_EMPTY_STREAK = int(_os_loop.environ.get("AGENT_MAX_EMPTY_STREAK", "2")
 # ---- Pure-compute tool sandbox (defense-in-depth, OPT-IN) ----
 # When true, the @sandboxable pure-compute tools (contract_penalty, pit,
 # legal_age, ...) execute in a throwaway subprocess with a scrubbed env + hard
-# timeout via sandbox.run_in_sandbox, instead of in-process. Default OFF: the
-# tools are pure functions with their own input-validation guardrails, so
-# process isolation is a defense-in-depth option, not a default. Reads at call
-# time so ops can flip it without a redeploy (and tests can monkeypatch).
-SANDBOX_ENABLED = _os_loop.environ.get("SANDBOX_ENABLED", "").lower() in ("1", "true", "yes", "on")
+# timeout via sandbox.run_in_sandbox, instead of in-process. Audit 3.2: default
+# ON so a bug in a complex calc (e.g. runaway inheritance loop) cannot wedge the
+# agent/worker process. Input validation still runs first (@_validated is stacked
+# outermost), so isolation does not bypass the Flaw 4 guard. Set SANDBOX_ENABLED=0
+# to disable. Reads at call time so ops can flip it without a redeploy (and tests
+# can monkeypatch / the conftest fixture forces it off for the unit suite).
+SANDBOX_ENABLED = _os_loop.environ.get("SANDBOX_ENABLED", "1").lower() in ("1", "true", "yes", "on")
 
 # ---- Self-Corrective RAG (CRAG) tuning constants ----
 # Max retrieval-rewrite loop iterations before forcing a web_search fallback.
