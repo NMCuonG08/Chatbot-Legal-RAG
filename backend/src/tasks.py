@@ -54,7 +54,7 @@ except ImportError:  # pragma: no cover - optional dependency
     RedisSaver = None  # type: ignore
     _REDIS_SAVER_AVAILABLE = False
 
-from agent import ai_agent_handle, clear_user_runtime_caches
+from agent import ai_agent_handle, clear_user_runtime_caches, filter_tools_for_query
 from verify_answer import judge_answer
 from metacognitive import build_escalation, ESCALATION_PREFIX
 from rlhf_store import find_similar_good
@@ -67,6 +67,7 @@ from brain import (
     openai_chat_complete,
     vietnamese_llm_chat_complete,
 )
+import config
 from config import (
     DEFAULT_COLLECTION_NAME,
     DOC_GRADE_THRESHOLD,
@@ -749,7 +750,7 @@ def _maybe_block_on_approval(state, question, history, role, user_id, run_id):
     if not role:
         return None
     try:
-        from rbac import SENSITIVE_TOOLS, Principal, Role, _tool_name
+        from rbac import Principal, _tool_name
         from approval import evaluate_tool_gate, await_approval_response
 
         principal = Principal(user_id=user_id or "", username="", role=role)

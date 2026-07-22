@@ -50,10 +50,13 @@ def test_falsy_ids_are_noops(fake_redis):
 
 def test_ttl_is_set_on_write(fake_redis):
     mst.set_rolling_summary("u1", "c1", "s")
-    # TTL must be positive (7-day default). fakeredis honors `ex`.
-    assert fake_redis.ttl("mem:short:u1:c1:summary") > 0
+    # H13: summary + count share one hash key; TTL must be positive (7-day default).
+    assert fake_redis.ttl("mem:short:u1:c1") > 0
+    assert fake_redis.hget("mem:short:u1:c1", "summary") == "s"
     mst.set_summarized_count("u1", "c1", 3)
-    assert fake_redis.ttl("mem:short:u1:c1:count") > 0
+    assert fake_redis.hget("mem:short:u1:c1", "count") == "3"
+    # Single shared TTL — no drift between summary and count fields.
+    assert fake_redis.ttl("mem:short:u1:c1") > 0
 
 
 def test_clear_short_term_removes_keys(fake_redis):
@@ -96,6 +99,71 @@ def test_cross_worker_consistency():
     mst._summary_cache.clear()
     assert mst.get_rolling_summary("u1", "c1") == "FACTS:\n- nam, 1990, Ha Noi"
     assert mst.get_summarized_count("u1", "c1") == 4
+
+
+def test_negative_cache_not_stale_cross_worker():
+    """C2 regression: a worker that cached a miss ('') must still see a later
+    write from another worker. Before the fix, ``_summary_cache`` cached ``''``
+    with no TTL / no cross-worker invalidation, so worker B stayed "amnesiac"
+    until LRU eviction. Simulates separate process memories by swapping the
+    module-level cache dict per worker.
+    """
+    server = fakeredis.FakeServer()
+    worker_a = fakeredis.FakeStrictRedis(server=server, decode_responses=True)
+    worker_b = fakeredis.FakeStrictRedis(server=server, decode_responses=True)
+
+    # Worker B reads first -> Redis empty -> under the bug, caches "" .
+    mst._REDIS_ENABLED = True
+    mst._redis_client = worker_b
+    mst._summary_cache = type(mst._summary_cache)()
+    assert mst.get_rolling_summary("u1", "c1") == ""  # miss
+    b_cache = mst._summary_cache  # snapshot B's process-local cache
+
+    # Worker A writes with its OWN fresh cache (separate process memory).
+    mst._summary_cache = type(b_cache)()
+    mst._redis_client = worker_a
+    mst.set_rolling_summary("u1", "c1", "FACTS:\n- nam, 1990")
+
+    # Back to B's cache (unchanged since the miss) + B's client. Must see write.
+    mst._summary_cache = b_cache
+    mst._redis_client = worker_b
+    assert mst.get_rolling_summary("u1", "c1") == "FACTS:\n- nam, 1990"
+
+
+def test_handle_invalidation_drops_matching_cache():
+    """H12: _handle_invalidation purges local LRU entries for a user/conv."""
+    mst._summary_cache = type(mst._summary_cache)()
+    mst._summary_cache[("u1", "c1")] = "s1"
+    mst._summary_cache[("u1", "c2")] = "s2"
+    mst._summary_cache[("u2", "c1")] = "s3"
+
+    # Targeted: only u1/c1.
+    assert mst._handle_invalidation("u1|c1") == 1
+    assert ("u1", "c1") not in mst._summary_cache
+    assert ("u1", "c2") in mst._summary_cache
+
+    # Wildcard: all of u1.
+    assert mst._handle_invalidation("u1|*") == 1
+    assert ("u1", "c2") not in mst._summary_cache
+    assert ("u2", "c1") in mst._summary_cache  # other user untouched
+
+
+def test_clear_short_term_publishes_invalidation(fake_redis, monkeypatch):
+    """H12: clear_short_term fanouts a pub/sub notice so other workers invalidate."""
+    published = []
+    orig_publish = fake_redis.publish
+
+    def _spy(channel, payload):
+        published.append((channel, payload))
+        return orig_publish(channel, payload)
+
+    monkeypatch.setattr(fake_redis, "publish", _spy)
+    mst.set_rolling_summary("u1", "c1", "s")  # populate so clear has work
+
+    mst.clear_short_term("u1", "c1")
+
+    assert any(ch == mst._INVALIDATE_CHANNEL and payload == "u1|c1"
+               for ch, payload in published)
 
 
 # ---------------------------------------------------------------------------

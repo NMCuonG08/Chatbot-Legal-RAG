@@ -793,7 +793,7 @@ def ai_agent_handle(
                 except Exception:
                     # Fallback: positional call (user_msg, chat_history)
                     try:
-                        result = await ai_agent.arun(question, chat_history)
+                        result = await ai_agent.arun(question, short_term_raw)
                     except Exception:
                         result = await ai_agent.arun(question)
 
@@ -811,7 +811,7 @@ def ai_agent_handle(
                     result = ai_agent.run(**run_kwargs)
                 except Exception:
                     try:
-                        result = ai_agent.run(question, chat_history)
+                        result = ai_agent.run(question, short_term_raw)
                     except Exception:
                         result = ai_agent.run(question)
                 if inspect.isawaitable(result) or hasattr(result, "__await__"):
@@ -911,8 +911,9 @@ def ai_agent_handle(
 
 def get_agent_tools_summary() -> Dict:
     """Get summary of available agent tools"""
+    import agent_tool_wrappers as _atw
     return {
-        "total_tools": len(all_tools),
+        "total_tools": len(_atw.all_tools),
         "legal_calc_tools": [
             "contract_penalty_calculator - Tính phạt hợp đồng",
             "legal_age_checker - Kiểm tra tuổi pháp lý",

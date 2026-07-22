@@ -14,7 +14,8 @@ services:
       MYSQL_PASSWORD: legal
       MYSQL_ROOT_PASSWORD: root
     ports:
-      - "3306:3306"
+      - "3307:3306"
+
 
   qdrant:
     image: qdrant/qdrant:v1.11.3

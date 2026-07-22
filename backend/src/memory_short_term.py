@@ -78,6 +78,8 @@ def _get_redis_client():
                 _redis_client = redis.from_url(settings.redis_url, decode_responses=True)
                 _redis_client.ping()  # fail fast if broker down
                 logger.info(f"[SHORT-TERM] Redis client ready: {settings.redis_url}")
+                # H12: start the cross-worker cache-invalidation subscriber once.
+                _start_invalidate_listener(_redis_client)
             except Exception as exc:  # pragma: no cover - depends on env
                 logger.warning(f"[SHORT-TERM] Redis unavailable, falling back to in-process: {exc}")
                 _redis_client = None
@@ -135,11 +137,91 @@ def _cache_invalidate(key) -> None:
 
 
 # ---------------------------------------------------------------------------
+# H12 — cross-worker LRU invalidation via Redis pub/sub.
+# ``clear_short_term`` runs in one process; without fanout the other N-1
+# workers keep stale positive summaries in their local LRU until eviction.
+# Each worker subscribes to ``_INVALIDATE_CHANNEL`` and drops matching
+# ``_summary_cache`` entries on receipt. ``set_rolling_summary`` already
+# updates only the local cache, so only explicit clears need fanout.
+# ---------------------------------------------------------------------------
+
+_INVALIDATE_CHANNEL = f"{_KEY_PREFIX}:invalidate"
+_listener_started = False
+_listener_lock = threading.Lock()
+
+
+def _handle_invalidation(payload: str) -> int:
+    """Drop local ``_summary_cache`` entries matching ``user_id|conv_id``.
+
+    ``conv_id`` of ``"*"`` (or empty) means all conversations for the user.
+    Pure + synchronous so it is unit-testable without a live subscriber thread.
+    Returns the number of cache entries removed.
+    """
+    if not payload:
+        return 0
+    parts = payload.split("|", 1)
+    user_id = parts[0]
+    conv_id = parts[1] if len(parts) > 1 else "*"
+    if not user_id:
+        return 0
+    removed = 0
+    with _cache_lock:
+        for k in list(_summary_cache.keys()):
+            if k[0] == user_id and (conv_id == "*" or k[1] == conv_id):
+                _summary_cache.pop(k, None)
+                removed += 1
+    return removed
+
+
+def _publish_invalidation(client, user_id: str, conv_id: Optional[str]) -> None:
+    """Broadcast a cache-invalidation notice to all workers on the Redis broker."""
+    try:
+        client.publish(_INVALIDATE_CHANNEL, f"{user_id}|{conv_id or '*'}")
+    except Exception as exc:  # pragma: no cover - best-effort fanout
+        logger.warning(f"[SHORT-TERM] invalidate publish failed: {exc}")
+
+
+def _start_invalidate_listener(client) -> None:
+    """Start one daemon subscriber thread per process (idempotent)."""
+    global _listener_started
+    with _listener_lock:
+        if _listener_started:
+            return
+        _listener_started = True
+
+    def _run():
+        try:
+            pubsub = client.pubsub(ignore_subscribe_messages=True)
+            pubsub.subscribe(_INVALIDATE_CHANNEL)
+            for message in pubsub.listen():
+                if message.get("type") == "message":
+                    _handle_invalidation(message.get("data") or "")
+        except Exception as exc:  # pragma: no cover - daemon; never kill the process
+            logger.warning(f"[SHORT-TERM] invalidate listener stopped: {exc}")
+            with _listener_lock:
+                _listener_started = False
+
+    t = threading.Thread(target=_run, name="mst-invalidate-listener", daemon=True)
+    t.start()
+
+
+# ---------------------------------------------------------------------------
 # Key helpers
 # ---------------------------------------------------------------------------
 
 def _key(user_id: Optional[str], conv_id: Optional[str], suffix: str) -> str:
     return f"{_KEY_PREFIX}:{user_id}:{conv_id}:{suffix}"
+
+
+def _hash_key(user_id: Optional[str], conv_id: Optional[str]) -> str:
+    """H13: single Redis hash holding both ``summary`` and ``count`` fields.
+
+    Replaces the old two-key layout (``:summary`` + ``:count``) so the pair is
+    written/expired atomically as one key — no TTL drift between fields, no
+    cross-field desync from concurrent writers. Old suffixed keys auto-expire
+    (7d TTL) and are ignored by new code; no migration needed.
+    """
+    return f"{_KEY_PREFIX}:{user_id}:{conv_id}"
 
 
 def _norm(user_id: Optional[str], conv_id: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -167,9 +249,14 @@ def get_rolling_summary(user_id: Optional[str], conv_id: Optional[str]) -> str:
     client = _get_redis_client()
     if client is not None:
         try:
-            val = client.get(_key(u, c, "summary")) or ""
-            _cache_put((u, c), val)
+            val = client.hget(_hash_key(u, c), "summary") or ""
+            # C2: never cache a miss (""). A cached "" with no TTL / no
+            # cross-worker invalidation makes this worker amnesiac until LRU
+            # eviction — it never re-consults Redis after another worker
+            # writes a real summary. Cache only positive summaries; misses
+            # always re-hit Redis (cheap, and Redis is the source of truth).
             if val:
+                _cache_put((u, c), val)
                 inc_short_term_hit()
             else:
                 inc_short_term_miss()
@@ -193,7 +280,9 @@ def set_rolling_summary(user_id: Optional[str], conv_id: Optional[str], summary:
     client = _get_redis_client()
     if client is not None:
         try:
-            client.set(_key(u, c, "summary"), summary, ex=_TTL_SECONDS)
+            hk = _hash_key(u, c)
+            client.hset(hk, "summary", summary)
+            client.expire(hk, _TTL_SECONDS)
             return
         except Exception as exc:  # pragma: no cover
             logger.warning(f"[SHORT-TERM] Redis set summary failed: {exc}")
@@ -211,7 +300,7 @@ def get_summarized_count(user_id: Optional[str], conv_id: Optional[str]) -> int:
     client = _get_redis_client()
     if client is not None:
         try:
-            raw = client.get(_key(u, c, "count"))
+            raw = client.hget(_hash_key(u, c), "count")
             return int(raw) if raw is not None else 0
         except Exception as exc:  # pragma: no cover
             logger.warning(f"[SHORT-TERM] Redis get count failed: {exc}")
@@ -226,7 +315,9 @@ def set_summarized_count(user_id: Optional[str], conv_id: Optional[str], count: 
     client = _get_redis_client()
     if client is not None:
         try:
-            client.set(_key(u, c, "count"), int(count), ex=_TTL_SECONDS)
+            hk = _hash_key(u, c)
+            client.hset(hk, "count", int(count))
+            client.expire(hk, _TTL_SECONDS)
             return
         except Exception as exc:  # pragma: no cover
             logger.warning(f"[SHORT-TERM] Redis set count failed: {exc}")
@@ -267,7 +358,8 @@ def clear_short_term(user_id: Optional[str], conv_id: Optional[str] = None) -> i
     if client is not None:
         try:
             if c:
-                client.delete(_key(u, c, "summary"), _key(u, c, "count"))
+                # H13: single hash key (also drop legacy suffixed keys if present).
+                client.delete(_hash_key(u, c), _key(u, c, "summary"), _key(u, c, "count"))
             else:
                 # No conv_id: scan all mem:short:{u}:* and delete.
                 pattern = f"{_KEY_PREFIX}:{u}:*"
@@ -276,5 +368,7 @@ def clear_short_term(user_id: Optional[str], conv_id: Optional[str] = None) -> i
                     client.delete(*keys)
         except Exception as exc:  # pragma: no cover
             logger.warning(f"[SHORT-TERM] Redis clear failed: {exc}")
+        # H12: fan out so other workers drop their stale local LRU entries.
+        _publish_invalidation(client, u, c)
     logger.info(f"[SHORT-TERM] Cleared user={u} conv={c or '*'} entries_removed={removed}")
     return removed

@@ -23,6 +23,7 @@ def tasks_module(monkeypatch):
         if name == "agent":
             mod.ai_agent_handle = lambda *a, **k: None
             mod.clear_user_runtime_caches = lambda *a, **k: None
+            mod.filter_tools_for_query = lambda *a, **k: []
         if name == "verify_answer":
             mod.judge_answer = lambda *a, **k: None
         if name == "metacognitive":
