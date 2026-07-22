@@ -45,7 +45,11 @@ _MIN_N_FOR_GATE = 10
 class GatePolicy:
     """Thresholds that turn a diff into a merge decision."""
     min_success_rate: float = 0.8
-    min_faithfulness: float = 0.7
+    # Audit 4.1: raised 0.7 -> 0.80 to match the golden-set quality gate floor
+    # (evaluation.quality_gate.DEFAULT_FLOOR). The regression gate already
+    # blocks *relative* regressions; this raises the *absolute* floor so a
+    # candidate cannot pass by merely failing to regress vs. a bad baseline.
+    min_faithfulness: float = 0.80
     max_regression_rel: float = -0.05  # >5% relative drop = regression
     alpha: float = 0.05
     min_n: int = _MIN_N_FOR_GATE

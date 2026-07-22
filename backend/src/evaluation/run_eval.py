@@ -275,6 +275,20 @@ def main() -> int:
         help="Path to a baseline run JSON to diff against (regression report).",
     )
     parser.add_argument(
+        "--quality-gate",
+        action="store_true",
+        help="Audit 4.1: apply the golden-set absolute quality gate to this "
+             "run's generation_summary and exit 1 when the mean faithfulness "
+             "OR answer_relevance is below --quality-floor (blocking PR gate).",
+    )
+    parser.add_argument(
+        "--quality-floor",
+        type=float,
+        default=0.80,
+        help="Absolute floor for --quality-gate (default 0.80). "
+             "INCONCLUSIVE (missing summary / too few samples) does NOT fail.",
+    )
+    parser.add_argument(
         "--agent-a",
         type=str,
         default=None,
@@ -660,8 +674,31 @@ def main() -> int:
         for reason in report.gate_reasons:
             print(f"  - {reason}")
 
+    # Audit 4.1 — golden-set absolute quality gate (blocking PR floor).
+    # Applied to THIS run's generation_summary. FAIL exits 1 so the CI
+    # quality-gate workflow fails the build; INCONCLUSIVE (missing summary or
+    # too few samples) does NOT fail — it means the gate could not decide.
+    exit_code = 0
+    if args.quality_gate:
+        from evaluation.quality_gate import QualityGatePolicy, apply_quality_gate
+        qres = apply_quality_gate(
+            payload.get("generation_summary"),
+            QualityGatePolicy(floor=args.quality_floor),
+        )
+        logger.info("Quality gate: %s (floor=%.2f)", qres.gate, qres.floor)
+        print(f"\nQuality gate: {qres.gate} (floor={qres.floor})")
+        if qres.faithfulness_mean is not None:
+            print(f"  faithfulness_mean      = {qres.faithfulness_mean:.3f}")
+        if qres.answer_relevance_mean is not None:
+            print(f"  answer_relevance_mean  = {qres.answer_relevance_mean:.3f}")
+        print(f"  n_queries              = {qres.n_queries}")
+        for reason in qres.reasons:
+            print(f"  - {reason}")
+        if qres.gate == "FAIL":
+            exit_code = 1
+
     print("\n" + report_md)
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":
