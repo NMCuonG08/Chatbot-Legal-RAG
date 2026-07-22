@@ -18,6 +18,7 @@ interface SidebarProps {
   onNewChat: () => void;
   history: any[];
   onSelectHistoryItem: (item: any) => void;
+  onDeleteSingleHistory?: (conversationId: string) => void;
   onWipeHistory: () => void;
   selectedVariant: string;
   onSelectVariant: (variant: string) => void;
@@ -34,6 +35,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onNewChat,
   history,
   onSelectHistoryItem,
+  onDeleteSingleHistory,
   onWipeHistory,
   selectedVariant,
   onSelectVariant,
@@ -148,22 +150,38 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 const itemId = item.id || item.conversation_id;
                 const isSelected = Boolean(selectedHistoryId && selectedHistoryId === itemId);
                 return (
-                  <li key={item.id || item.conversation_id || idx}>
-                    <button
+                  <li key={itemId || idx}>
+                    <div
                       onClick={() => onSelectHistoryItem(item)}
-                      className={`w-full flex items-start gap-2 py-1.5 px-2 text-left text-[13px] transition-all group rounded-swiss border-l-2 ${
+                      className={`w-full flex items-center justify-between py-1.5 px-2 text-left text-[13px] transition-all group rounded-swiss border-l-2 cursor-pointer ${
                         isSelected
                           ? 'bg-paper-tint text-vn-600 font-semibold border-vn-500'
                           : 'border-transparent text-ink/80 hover:bg-paper-tint hover:text-ink'
                       }`}
                     >
-                      <span className={`font-mono text-[10px] pt-0.5 tabular-nums shrink-0 ${isSelected ? 'text-vn-600 font-bold' : 'text-faint'}`}>
-                        {pad2(idx + 1)}
-                      </span>
-                      <span className="truncate">
-                        {item.question || item.content || item.message?.question || `Hội thoại ${idx + 1}`}
-                      </span>
-                    </button>
+                      <div className="flex items-center gap-2 min-w-0 pr-2">
+                        <span className={`font-mono text-[10px] tabular-nums shrink-0 ${isSelected ? 'text-vn-600 font-bold' : 'text-faint'}`}>
+                          {pad2(idx + 1)}
+                        </span>
+                        <span className="truncate">
+                          {item.question || item.content || item.message?.question || `Hội thoại ${idx + 1}`}
+                        </span>
+                      </div>
+                      
+                      {onDeleteSingleHistory && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onDeleteSingleHistory(itemId);
+                          }}
+                          title="Xóa cuộc trò chuyện này"
+                          className="opacity-0 group-hover:opacity-100 p-1 text-faint hover:text-red-500 hover:bg-paper rounded transition-all shrink-0"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </li>
                 );
               })}

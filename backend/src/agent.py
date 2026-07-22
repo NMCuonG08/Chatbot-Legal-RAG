@@ -844,11 +844,18 @@ def ai_agent_handle(
             )
             tool_calls = list(agent_tool_calls.get() or [])
             sources = list(agent_sources.get() or [])
-            fallback = (
-                "Xin lỗi, quá trình tra cứu mất nhiều thời gian và chưa trả được kết quả "
-                "trong thời gian cho phép. Vui lòng đặt câu hỏi cụ thể hơn (ghi rõ tên luật, "
-                "số điều) hoặc thử lại sau."
-            )
+            if sources:
+                doc_titles = ", ".join(set(s.get("document_title") or s.get("title") or "" for s in sources if s and (s.get("document_title") or s.get("title"))))
+                fallback = (
+                    f"Quá trình phân tích đa bước mất nhiều thời gian hơn dự kiến. Dựa trên các tài liệu đã tra cứu "
+                    f"({doc_titles or 'văn bản pháp luật'}), hệ thống đã tổng hợp các trích dẫn tương ứng bên dưới. "
+                    f"Bạn có thể xem chi tiết ở bảng nguồn trích dẫn."
+                )
+            else:
+                fallback = (
+                    "Hệ thống đã mất hơn 2 phút xử lý cho câu hỏi phức tạp này nhưng chưa hoàn tất toàn bộ các bước. "
+                    "Vui lòng đặt câu hỏi cụ thể hơn hoặc thử lại sau."
+                )
             return fallback, tool_calls, sources
         except Exception as e:
             if "already running" in str(e).lower():

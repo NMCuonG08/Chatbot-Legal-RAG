@@ -13,6 +13,7 @@ import {
   subscribeTraceStream,
   fetchUserHistoryApi,
   deleteUserHistoryApi,
+  deleteSingleHistoryApi,
   pollTaskResultApi,
 } from './services/api';
 
@@ -127,6 +128,16 @@ const AppContent: React.FC = () => {
       setSelectedHistoryId(null);
       setMessages([]);
       setHistory([]);
+    }
+  };
+
+  const handleDeleteSingleHistory = async (conversationId: string) => {
+    const success = await deleteSingleHistoryApi(activeUserId, conversationId);
+    if (success) {
+      setHistory((prev) => prev.filter((item) => (item.conversation_id || item.id) !== conversationId));
+      if (selectedHistoryId === conversationId) {
+        handleNewChat();
+      }
     }
   };
 
@@ -309,6 +320,7 @@ const AppContent: React.FC = () => {
         onNewChat={handleNewChat}
         history={history}
         onSelectHistoryItem={handleSelectHistoryItem}
+        onDeleteSingleHistory={handleDeleteSingleHistory}
         onWipeHistory={handleWipeHistory}
         selectedVariant={selectedVariant}
         onSelectVariant={setSelectedVariant}

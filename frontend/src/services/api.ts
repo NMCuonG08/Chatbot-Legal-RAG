@@ -206,6 +206,21 @@ export async function deleteUserHistoryApi(userId: string): Promise<boolean> {
   return res.ok;
 }
 
+export async function deleteSingleHistoryApi(userId: string, conversationId: string): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `${API_BASE}/history/${encodeURIComponent(userId)}/${encodeURIComponent(conversationId)}`,
+      {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+      }
+    );
+    return res.ok;
+  } catch (e) {
+    return false;
+  }
+}
+
 export async function sendFeedbackApi(data: {
   userId: string;
   conversationId?: string;

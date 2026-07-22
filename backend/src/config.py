@@ -17,7 +17,7 @@ GRAPH_RECURSION_LIMIT = int(_os_loop.environ.get("GRAPH_RECURSION_LIMIT", "32"))
 # Default lowered 120 -> 60s: a healthy legal chat rarely exceeds 30-40s; the
 # ReAct agent path has its own tighter AGENT_RUN_TIMEOUT_S cap below, so 60s is
 # a safety net for the whole graph (supervisor + verify + meta), not the agent.
-GRAPH_RUN_TIMEOUT_S = float(_os_loop.environ.get("GRAPH_RUN_TIMEOUT_S", "120"))
+GRAPH_RUN_TIMEOUT_S = float(_os_loop.environ.get("GRAPH_RUN_TIMEOUT_S", "180"))
 
 # ---- Ollama Model Tiers (Fast vs Reasoning) ----
 OLLAMA_LLM_MODEL = _os_loop.environ.get("OLLAMA_LLM_MODEL", "gemma4:31b")
@@ -29,7 +29,7 @@ OLLAMA_FAST_LLM_MODEL = _os_loop.environ.get("OLLAMA_FAST_LLM_MODEL", "qwen2.5:7
 # agent retrying an empty-result search tool N times compounds to 60-90s. This cap
 # wraps asyncio.run(agent) in asyncio.wait_for; on timeout the agent bails to a
 # graceful fallback instead of lũy kế further. Tighter than GRAPH_RUN_TIMEOUT_S.
-AGENT_RUN_TIMEOUT_S = float(_os_loop.environ.get("AGENT_RUN_TIMEOUT_S", "30"))
+AGENT_RUN_TIMEOUT_S = float(_os_loop.environ.get("AGENT_RUN_TIMEOUT_S", "120"))
 # ReAct max tool-call round trips. 10 (llama-index default) invites thrashing on
 # empty results — legal queries need <=2 tool calls in practice. Lowered to 4:
 # enough for lookup -> verify_citation -> (one reformulation), not enough to spin.
