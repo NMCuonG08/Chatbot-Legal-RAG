@@ -8,28 +8,36 @@ export default {
   theme: {
     extend: {
       colors: {
-        legal: {
-          50: '#f0f7ff',
-          100: '#e0effe',
-          200: '#bae0fd',
-          300: '#7cc8fc',
-          400: '#36abf7',
-          500: '#0c8ee9',
-          600: '#0270c7',
-          700: '#0359a1',
-          800: '#074c84',
-          900: '#0c406e',
-          950: '#082849',
+        // Theme-aware tokens via CSS variables (see index.css :root / .dark)
+        ink: 'rgb(var(--c-ink) / <alpha-value>)',
+        paper: 'rgb(var(--c-paper) / <alpha-value>)',
+        'paper-dim': 'rgb(var(--c-paper-dim) / <alpha-value>)',
+        'paper-tint': 'rgb(var(--c-paper-tint) / <alpha-value>)',
+        rule: 'rgb(var(--c-rule) / <alpha-value>)',
+        muted: 'rgb(var(--c-muted) / <alpha-value>)',
+        faint: 'rgb(var(--c-faint) / <alpha-value>)',
+        // VN red accent — same in both themes
+        vn: {
+          50: '#FFF1F3',
+          100: '#FFE0E5',
+          400: '#E84A60',
+          500: '#D7263D',
+          600: '#B91C3A',
+          700: '#9B1233',
+          900: '#4A0815',
         },
-        slate: {
-          850: '#151e2e',
-          950: '#0b0f17',
-        }
       },
       fontFamily: {
         sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
-        mono: ['"JetBrains Mono"', 'ui-monospace', 'monospace'],
-        serif: ['Merriweather', 'Georgia', 'serif'],
+        mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+        serif: ['Source Serif 4', 'Georgia', 'serif'],
+      },
+      borderRadius: {
+        'swiss': '2px',
+      },
+      letterSpacing: {
+        'label': '0.16em',
+        'display': '-0.02em',
       },
       animation: {
         'fade-in': 'fadeIn 0.25s ease-out forwards',

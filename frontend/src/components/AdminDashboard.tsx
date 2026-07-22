@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { ApprovalRequest, AuditEntry } from '../types';
 import { fetchApprovalsApi, decideApprovalApi, fetchAuditLogsApi, fetchStatsApi } from '../services/api';
-import { Shield, CheckCircle, XCircle, Clock, FileText, RefreshCw, BarChart2 } from 'lucide-react';
+import { Shield, Check, X, Clock, FileText, RefreshCw, BarChart2 } from 'lucide-react';
+
+const pad2 = (n: number) => String(n).padStart(2, '0');
 
 export const AdminDashboard: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'approvals' | 'audit' | 'stats'>('approvals');
@@ -39,101 +41,93 @@ export const AdminDashboard: React.FC = () => {
     loadData();
   };
 
+  const tabs: { key: typeof activeTab; label: string; icon: React.ReactNode; count?: number }[] = [
+    { key: 'approvals', label: 'Phê duyệt', icon: <Clock className="w-4 h-4" />, count: approvals.length },
+    { key: 'audit', label: 'Audit Trail', icon: <FileText className="w-4 h-4" /> },
+    { key: 'stats', label: 'Cache & Router', icon: <BarChart2 className="w-4 h-4" /> },
+  ];
+
   return (
-    <div className="max-w-6xl mx-auto p-4 md:p-8 space-y-6">
+    <div className="max-w-6xl mx-auto p-5 md:p-8">
       {/* Header */}
-      <div className="flex items-center justify-between border-b border-slate-800 pb-4">
-        <div className="flex items-center gap-3">
-          <div className="w-12 h-12 rounded-2xl bg-legal-600/20 border border-legal-500/30 flex items-center justify-center text-legal-400">
-            <Shield className="w-6 h-6" />
+      <div className="flex items-end justify-between border-b border-ink pb-4">
+        <div>
+          <div className="flex items-center gap-2 mb-2">
+            <Shield className="w-3.5 h-3.5 text-vn-500" />
+            <span className="label-mono text-vn-600">Admin · Security</span>
           </div>
-          <div>
-            <h2 className="text-2xl font-bold text-white tracking-tight">Trung Tâm Quản Trị Admin & Security</h2>
-            <p className="text-xs text-slate-400">Phê duyệt Tool Approvals, Kiểm tra Audit Logs & Thống kê hệ thống</p>
-          </div>
+          <h2 className="text-2xl font-semibold tracking-display text-ink">Trung tâm Quản trị</h2>
+          <p className="text-xs text-muted mt-1">
+            Phê duyệt tool · Audit logs · Thống kê cache & router
+          </p>
         </div>
 
-        <button
-          onClick={loadData}
-          disabled={isLoading}
-          className="p-2.5 rounded-xl glass-panel hover:bg-slate-800 text-slate-300 transition flex items-center gap-2 text-xs font-medium"
-        >
-          <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin' : ''}`} />
+        <button onClick={loadData} disabled={isLoading} className="btn-outline !py-2 !px-3 !text-xs">
+          <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
           Làm mới
         </button>
       </div>
 
       {/* Tabs */}
-      <div className="flex gap-2 border-b border-slate-800">
-        <button
-          onClick={() => setActiveTab('approvals')}
-          className={`pb-3 px-4 font-semibold text-sm transition border-b-2 flex items-center gap-2 ${
-            activeTab === 'approvals'
-              ? 'border-legal-500 text-legal-400'
-              : 'border-transparent text-slate-400 hover:text-white'
-          }`}
-        >
-          <Clock className="w-4 h-4" />
-          Tool Approvals Phê Duyệt ({approvals.length})
-        </button>
-        <button
-          onClick={() => setActiveTab('audit')}
-          className={`pb-3 px-4 font-semibold text-sm transition border-b-2 flex items-center gap-2 ${
-            activeTab === 'audit'
-              ? 'border-legal-500 text-legal-400'
-              : 'border-transparent text-slate-400 hover:text-white'
-          }`}
-        >
-          <FileText className="w-4 h-4" />
-          Nhật Ký Hệ Thống (Audit Trail)
-        </button>
-        <button
-          onClick={() => setActiveTab('stats')}
-          className={`pb-3 px-4 font-semibold text-sm transition border-b-2 flex items-center gap-2 ${
-            activeTab === 'stats'
-              ? 'border-legal-500 text-legal-400'
-              : 'border-transparent text-slate-400 hover:text-white'
-          }`}
-        >
-          <BarChart2 className="w-4 h-4" />
-          Thống Kê Cache & Router
-        </button>
-      </div>
+      <nav className="flex gap-0 border-b border-rule mt-6">
+        {tabs.map((t, i) => (
+          <button
+            key={t.key}
+            onClick={() => setActiveTab(t.key)}
+            className={`inline-flex items-center gap-2 py-3 px-4 text-sm font-medium transition-colors border-b-2 -mb-px ${
+              activeTab === t.key
+                ? 'border-vn-500 text-ink'
+                : 'border-transparent text-faint hover:text-ink'
+            }`}
+          >
+            <span className="font-mono text-[10px] text-faint tabular-nums">{pad2(i + 1)}</span>
+            {t.icon}
+            {t.label}
+            {t.count !== undefined && (
+              <span className="font-mono text-[10px] text-muted">({t.count})</span>
+            )}
+          </button>
+        ))}
+      </nav>
 
-      {/* Content */}
+      {/* Approvals */}
       {activeTab === 'approvals' && (
-        <div className="space-y-4">
+        <div className="mt-6 space-y-3">
           {approvals.length === 0 ? (
-            <div className="glass-panel p-8 rounded-2xl text-center text-slate-400 text-sm">
-              Không có yêu cầu phê duyệt công cụ nào đang chờ.
+            <div className="border border-rule p-10 text-center text-muted text-sm">
+              Không có yêu cầu phê duyệt nào đang chờ.
             </div>
           ) : (
-            approvals.map((app) => (
-              <div key={app.id} className="glass-panel p-5 rounded-2xl border border-slate-800 flex items-center justify-between">
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="font-bold text-white text-base">{app.tool_name}</span>
-                    <span className="px-2 py-0.5 rounded text-[10px] font-mono uppercase bg-amber-500/20 text-amber-300 border border-amber-500/30">
+            approvals.map((app, idx) => (
+              <div
+                key={app.id}
+                className="border border-rule rounded-swiss p-5 flex items-start justify-between gap-4"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-3 mb-2">
+                    <span className="font-mono text-[10px] text-faint tabular-nums">{pad2(idx + 1)}</span>
+                    <span className="font-semibold text-ink text-base">{app.tool_name}</span>
+                    <span className="font-mono text-[10px] uppercase tracking-label px-2 py-0.5 bg-vn-50 text-vn-700 border border-vn-100 rounded-swiss">
                       {app.status}
                     </span>
                   </div>
-                  <pre className="mt-2 p-3 rounded-lg bg-slate-900 font-mono text-xs text-slate-300 overflow-x-auto max-w-xl">
+                  <pre className="p-3 bg-ink text-paper font-mono text-xs overflow-x-auto rounded-swiss">
                     {JSON.stringify(app.arguments, null, 2)}
                   </pre>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-col gap-2 shrink-0">
                   <button
                     onClick={() => handleDecide(app.id, 'approved')}
-                    className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-semibold text-xs flex items-center gap-1.5 shadow-md shadow-emerald-600/20 transition"
+                    className="btn-ink !py-2 !px-3 !text-xs"
                   >
-                    <CheckCircle className="w-4 h-4" />
+                    <Check className="w-3.5 h-3.5" />
                     Chấp thuận
                   </button>
                   <button
                     onClick={() => handleDecide(app.id, 'rejected')}
-                    className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-semibold text-xs flex items-center gap-1.5 shadow-md shadow-rose-600/20 transition"
+                    className="btn-outline !py-2 !px-3 !text-xs hover:!border-vn-600 hover:!text-vn-600"
                   >
-                    <XCircle className="w-4 h-4" />
+                    <X className="w-3.5 h-3.5" />
                     Từ chối
                   </button>
                 </div>
@@ -143,38 +137,38 @@ export const AdminDashboard: React.FC = () => {
         </div>
       )}
 
+      {/* Audit */}
       {activeTab === 'audit' && (
-        <div className="glass-panel rounded-2xl overflow-hidden border border-slate-800">
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs text-slate-300">
-              <thead className="bg-slate-900/80 text-slate-400 uppercase font-semibold text-[10px]">
-                <tr>
-                  <th className="p-3">Thời gian</th>
-                  <th className="p-3">User ID</th>
-                  <th className="p-3">Hành động</th>
-                  <th className="p-3">Tài nguyên</th>
-                  <th className="p-3">IP Address</th>
+        <div className="mt-6 border border-rule rounded-swiss overflow-hidden overflow-x-auto">
+          <table className="w-full text-left text-xs">
+            <thead className="bg-paper-dim text-muted uppercase font-mono text-[10px] tracking-label">
+              <tr>
+                <th className="p-3 border-b border-rule">Thời gian</th>
+                <th className="p-3 border-b border-rule">User ID</th>
+                <th className="p-3 border-b border-rule">Hành động</th>
+                <th className="p-3 border-b border-rule">Tài nguyên</th>
+                <th className="p-3 border-b border-rule">IP</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-rule">
+              {auditLogs.map((log) => (
+                <tr key={log.id} className="hover:bg-paper-dim transition-colors">
+                  <td className="p-3 font-mono text-[11px] text-muted">{log.timestamp}</td>
+                  <td className="p-3 font-medium text-ink">{log.user_id || 'anonymous'}</td>
+                  <td className="p-3 font-mono text-vn-600">{log.action}</td>
+                  <td className="p-3 text-muted">{log.resource}</td>
+                  <td className="p-3 font-mono text-faint">{log.ip || '—'}</td>
                 </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800">
-                {auditLogs.map((log) => (
-                  <tr key={log.id} className="hover:bg-slate-900/40">
-                    <td className="p-3 font-mono text-[11px] text-slate-400">{log.timestamp}</td>
-                    <td className="p-3 font-medium text-slate-200">{log.user_id || 'anonymous'}</td>
-                    <td className="p-3 font-semibold text-legal-400">{log.action}</td>
-                    <td className="p-3 text-slate-400">{log.resource}</td>
-                    <td className="p-3 font-mono text-slate-500">{log.ip || '-'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
 
+      {/* Stats */}
       {activeTab === 'stats' && (
-        <div className="glass-panel p-6 rounded-2xl border border-slate-800">
-          <pre className="p-4 rounded-xl bg-slate-900 font-mono text-xs text-slate-300 overflow-x-auto">
+        <div className="mt-6 border border-rule rounded-swiss p-5">
+          <pre className="p-4 bg-ink text-paper font-mono text-xs overflow-x-auto rounded-swiss">
             {JSON.stringify(stats, null, 2)}
           </pre>
         </div>

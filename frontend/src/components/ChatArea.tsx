@@ -3,20 +3,19 @@ import { ChatMessage } from '../types';
 import { ReasoningTrace } from './ReasoningTrace';
 import { CitationDrawer } from './CitationDrawer';
 import { sendFeedbackApi } from '../services/api';
+import { useAuth } from '../context/AuthContext';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeKatex from 'rehype-katex';
 import {
-  Scale,
-  Send,
-  User as UserIcon,
+  ArrowUp,
   Copy,
   Check,
   ThumbsUp,
   ThumbsDown,
-  BookOpen,
-  FileText,
-  Briefcase,
+  CornerDownLeft,
+  Lock,
+  LogIn,
 } from 'lucide-react';
 
 interface ChatAreaProps {
@@ -24,9 +23,48 @@ interface ChatAreaProps {
   onSendMessage: (text: string) => void;
   isLoading: boolean;
   userId: string;
+  isAuthenticated: boolean;
 }
 
-export const ChatArea: React.FC<ChatAreaProps> = ({ messages, onSendMessage, isLoading, userId }) => {
+const samplePrompts: { idx: string; title: string; subtitle: string; prompt: string }[] = [
+  {
+    idx: '01',
+    title: 'Chuyển nhượng quyền sử dụng đất',
+    subtitle: 'Theo Luật Đất đai 2024',
+    prompt:
+      'Cho tôi biết điều kiện để chuyển nhượng quyền sử dụng đất theo quy định của Luật Đất đai 2024?',
+  },
+  {
+    idx: '02',
+    title: 'Thời giờ làm việc & làm thêm giờ',
+    subtitle: 'Bộ luật Lao động 2019',
+    prompt:
+      'Quy định về thời giờ làm việc bình thường và giới hạn làm thêm giờ theo Bộ luật Lao động 2019?',
+  },
+  {
+    idx: '03',
+    title: 'Thành lập doanh nghiệp tư nhân',
+    subtitle: 'Hồ sơ & thủ tục theo Luật Doanh nghiệp',
+    prompt:
+      'Hồ sơ và thủ tục thành lập doanh nghiệp tư nhân theo quy định của Luật Doanh nghiệp bao gồm những gì?',
+  },
+  {
+    idx: '04',
+    title: 'Án lệ tranh chấp hợp đồng',
+    subtitle: 'Mua bán tài sản · phương thức giải quyết',
+    prompt:
+      'Hãy tóm tắt các án lệ liên quan đến tranh chấp hợp đồng mua bán tài sản và phương thức giải quyết?',
+  },
+];
+
+export const ChatArea: React.FC<ChatAreaProps> = ({
+  messages,
+  onSendMessage,
+  isLoading,
+  userId,
+  isAuthenticated,
+}) => {
+  const { setShowAuthModal } = useAuth();
   const [inputText, setInputText] = useState<string>('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -37,7 +75,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({ messages, onSendMessage, isL
 
   const handleSubmit = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!inputText.trim() || isLoading) return;
+    if (!inputText.trim() || isLoading || !isAuthenticated) return;
     onSendMessage(inputText.trim());
     setInputText('');
   };
@@ -67,122 +105,109 @@ export const ChatArea: React.FC<ChatAreaProps> = ({ messages, onSendMessage, isL
     });
   };
 
-  const samplePrompts = [
-    {
-      icon: <FileText className="w-5 h-5 text-legal-400" />,
-      title: 'Điều kiện chuyển nhượng đất',
-      subtitle: 'Theo quy định mới nhất của Luật Đất đai 2024?',
-      prompt: 'Cho tôi biết điều kiện để chuyển nhượng quyền sử dụng đất theo quy định của Luật Đất đai 2024?',
-    },
-    {
-      icon: <Briefcase className="w-5 h-5 text-sky-400" />,
-      title: 'Thời giờ làm việc & làm thêm',
-      subtitle: 'Bộ luật Lao động quy định như thế nào?',
-      prompt: 'Quy định về thời giờ làm việc bình thường và giới hạn làm thêm giờ theo Bộ luật Lao động 2019?',
-    },
-    {
-      icon: <Scale className="w-5 h-5 text-amber-400" />,
-      title: 'Đăng ký doanh nghiệp tư nhân',
-      subtitle: 'Hồ sơ & thủ tục theo Luật Doanh nghiệp',
-      prompt: 'Hồ sơ và thủ tục thành lập doanh nghiệp tư nhân theo quy định của Luật Doanh nghiệp bao gồm những gì?',
-    },
-    {
-      icon: <BookOpen className="w-5 h-5 text-emerald-400" />,
-      title: 'Tra cứu Án lệ tranh chấp',
-      subtitle: 'Tranh chấp hợp đồng mua bán tài sản',
-      prompt: 'Hãy tóm tắt các án lệ liên quan đến tranh chấp hợp đồng mua bán tài sản và phương thức giải quyết?',
-    },
-  ];
-
   return (
-    <div className="flex-1 flex flex-col h-full overflow-hidden bg-slate-950 relative">
-      {/* Scrollable Messages Container */}
-      <div className="flex-1 overflow-y-auto px-4 py-6 md:px-8 space-y-6">
+    <div className="flex-1 flex flex-col h-full overflow-hidden bg-paper relative">
+      <div className="flex-1 overflow-y-auto">
         {messages.length === 0 ? (
-          /* Empty Welcome Hero */
-          <div className="max-w-3xl mx-auto py-12 text-center space-y-8 animate-fade-in">
-            <div className="inline-flex items-center justify-center w-20 h-20 rounded-3xl bg-gradient-to-tr from-legal-600 via-legal-500 to-sky-400 p-0.5 shadow-2xl shadow-legal-500/30">
-              <div className="w-full h-full bg-slate-950 rounded-[22px] flex items-center justify-center">
-                <Scale className="w-10 h-10 text-legal-400" />
-              </div>
+          <div className="max-w-3xl mx-auto px-6 py-16 md:py-24 animate-fade-in">
+            <div className="flex items-center gap-3 mb-6">
+              <span className="h-px w-10 bg-vn-500" />
+              <span className="label-mono text-vn-600">Trợ lý AI · Vietnamese Legal RAG</span>
             </div>
 
-            <div>
-              <h2 className="text-3xl font-extrabold text-white tracking-tight sm:text-4xl">
-                Trợ Lý AI Pháp Luật Việt Nam
-              </h2>
-              <p className="mt-3 text-base text-slate-400 max-w-xl mx-auto leading-relaxed">
-                Hệ thống tra cứu, tư vấn văn bản quy phạm pháp luật & án lệ thông minh với đồ thị tri thức RAG Agentic
-              </p>
-            </div>
+            <h2 className="text-4xl md:text-5xl font-semibold tracking-display leading-[1.05] text-ink">
+              Đặt câu hỏi pháp luật,
+              <br />
+              <span className="text-vn-600">nhận câu trả lời có trích dẫn.</span>
+            </h2>
 
-            {/* Quick Prompt Cards Grid */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 max-w-2xl mx-auto pt-4 text-left">
-              {samplePrompts.map((p, idx) => (
-                <button
-                  key={idx}
-                  onClick={() => onSendMessage(p.prompt)}
-                  className="p-4 rounded-2xl glass-panel glass-panel-hover text-left group border border-slate-800/80 hover:border-legal-500/40 transition duration-200"
-                >
-                  <div className="flex items-center gap-3 mb-2">
-                    <div className="p-2 rounded-xl bg-slate-900 border border-slate-800 group-hover:scale-105 transition">
-                      {p.icon}
-                    </div>
-                    <span className="font-semibold text-slate-200 text-sm group-hover:text-white">
-                      {p.title}
-                    </span>
+            {isAuthenticated ? (
+              <>
+                <p className="mt-5 text-base text-muted max-w-xl leading-relaxed">
+                  Tra cứu văn bản quy phạm pháp luật & án lệ qua đồ thị tri thức RAG Agentic —
+                  mỗi câu trả lời đi kèm điều luật và nguồn trích dẫn.
+                </p>
+
+                <div className="mt-10 border-t border-rule">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 divide-y sm:divide-y-0 sm:divide-x divide-rule border-b border-rule">
+                    {samplePrompts.map((p) => (
+                      <button
+                        key={p.idx}
+                        onClick={() => onSendMessage(p.prompt)}
+                        className="group flex gap-4 px-1 py-5 text-left hover:bg-paper-dim transition-colors sm:px-5"
+                      >
+                        <span className="font-mono text-xs text-vn-500 pt-1 tabular-nums shrink-0">
+                          {p.idx}
+                        </span>
+                        <div className="min-w-0">
+                          <p className="font-medium text-sm text-ink group-hover:text-vn-700 transition-colors">
+                            {p.title}
+                          </p>
+                          <p className="mt-1 text-xs text-muted leading-snug">{p.subtitle}</p>
+                        </div>
+                      </button>
+                    ))}
                   </div>
-                  <p className="text-xs text-slate-400 leading-snug">{p.subtitle}</p>
+                </div>
+              </>
+            ) : (
+              /* Auth gate — empty state */
+              <div className="mt-8 border-l-2 border-vn-500 pl-5 py-2 max-w-xl">
+                <p className="text-base text-ink leading-relaxed">
+                  Vui lòng đăng nhập để bắt đầu trò chuyện. Chế độ khách chỉ xem, không gửi câu hỏi.
+                </p>
+                <button
+                  onClick={() => setShowAuthModal(true)}
+                  className="btn-ink mt-4"
+                >
+                  <LogIn className="w-4 h-4" />
+                  Đăng nhập để trò chuyện
                 </button>
-              ))}
-            </div>
+              </div>
+            )}
           </div>
         ) : (
-          /* Messages List */
-          messages.map((msg) => (
-            <div key={msg.id} className="max-w-3xl mx-auto space-y-3">
-              {msg.role === 'user' ? (
-                /* User Message Bubble */
-                <div className="flex items-start justify-end gap-3">
-                  <div className="p-4 rounded-2xl bg-legal-600 text-white shadow-lg shadow-legal-600/20 max-w-[85%] text-sm leading-relaxed">
-                    {msg.content}
-                  </div>
-                  <div className="w-9 h-9 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center text-slate-300 font-bold text-xs shrink-0">
-                    <UserIcon className="w-5 h-5" />
+          <div className="max-w-3xl mx-auto px-4 md:px-8 py-8 space-y-10">
+            {messages.map((msg) =>
+              msg.role === 'user' ? (
+                <div key={msg.id} className="flex justify-end animate-slide-up">
+                  <div className="max-w-[80%]">
+                    <div className="label-mono mb-1.5 text-right">Bạn</div>
+                    <div className="bg-ink text-paper px-4 py-3 rounded-swiss text-sm leading-relaxed">
+                      {msg.content}
+                    </div>
                   </div>
                 </div>
               ) : (
-                /* Assistant Message Bubble */
-                <div className="flex items-start gap-3">
-                  <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-legal-600 to-legal-400 flex items-center justify-center text-white shadow-md shadow-legal-500/20 shrink-0 mt-1">
-                    <Scale className="w-5 h-5" />
+                <div key={msg.id} className="animate-slide-up">
+                  <div className="label-mono mb-1.5 flex items-center gap-2">
+                    <span className="w-1.5 h-1.5 bg-vn-500 rounded-full" />
+                    Trợ lý Pháp Luật
                   </div>
 
-                  <div className="flex-1 glass-panel p-5 rounded-2xl border border-slate-800/90 text-slate-200 text-sm leading-relaxed space-y-3 max-w-[90%]">
-                    {/* Reasoning Trace Accordion */}
+                  <div className="border-l-2 border-vn-500 pl-5 space-y-4">
                     <ReasoningTrace traceSteps={msg.traceSteps} isStreaming={msg.isStreaming} />
 
-                    {/* Content Markdown */}
-                    <div className="prose prose-invert prose-slate max-w-none prose-p:leading-relaxed prose-headings:text-legal-300 prose-a:text-legal-400">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeKatex]}>
-                        {msg.content}
-                      </ReactMarkdown>
-                    </div>
+                    {msg.content && (
+                      <div className="prose-swiss max-w-none">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeKatex]}>
+                          {msg.content}
+                        </ReactMarkdown>
+                      </div>
+                    )}
 
-                    {/* Citations Drawer */}
                     <CitationDrawer sources={msg.sources} />
 
-                    {/* Bottom Message Action Bar */}
-                    <div className="flex items-center justify-between pt-3 border-t border-slate-800/60 text-xs text-slate-400">
+                    <div className="flex items-center justify-between pt-3 border-t border-rule text-xs text-muted">
                       <div className="flex items-center gap-2">
                         {msg.route && (
-                          <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-900 text-legal-400 border border-slate-800">
-                            Route: {msg.route}
+                          <span className="font-mono text-[10px] uppercase tracking-label px-2 py-0.5 border border-rule text-ink">
+                            Route · {msg.route}
                           </span>
                         )}
                         {msg.cached && (
-                          <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-800 flex items-center gap-1">
-                            ⚡ Semantic Cache HIT
+                          <span className="font-mono text-[10px] uppercase tracking-label px-2 py-0.5 bg-vn-50 text-vn-700 border border-vn-100">
+                            Cache HIT
                           </span>
                         )}
                       </div>
@@ -190,16 +215,22 @@ export const ChatArea: React.FC<ChatAreaProps> = ({ messages, onSendMessage, isL
                       <div className="flex items-center gap-1">
                         <button
                           onClick={() => handleCopy(msg.id, msg.content)}
-                          title="Sao chép câu trả lời"
-                          className="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white transition"
+                          title="Sao chép"
+                          className="p-1.5 text-faint hover:text-ink hover:bg-paper-tint rounded-swiss transition-colors"
                         >
-                          {copiedId === msg.id ? <Check className="w-4 h-4 text-emerald-400" /> : <Copy className="w-4 h-4" />}
+                          {copiedId === msg.id ? (
+                            <Check className="w-4 h-4 text-vn-600" />
+                          ) : (
+                            <Copy className="w-4 h-4" />
+                          )}
                         </button>
                         <button
                           onClick={() => handleRating(msg, 'good')}
-                          title="Câu trả lời tốt"
-                          className={`p-1.5 rounded-lg hover:bg-slate-800 transition ${
-                            msg.rating === 'good' ? 'text-emerald-400 bg-slate-800' : 'text-slate-400'
+                          title="Tốt"
+                          className={`p-1.5 rounded-swiss transition-colors ${
+                            msg.rating === 'good'
+                              ? 'text-vn-600 bg-vn-50'
+                              : 'text-faint hover:text-ink hover:bg-paper-tint'
                           }`}
                         >
                           <ThumbsUp className="w-4 h-4" />
@@ -207,8 +238,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({ messages, onSendMessage, isL
                         <button
                           onClick={() => handleRating(msg, 'bad')}
                           title="Chưa chính xác"
-                          className={`p-1.5 rounded-lg hover:bg-slate-800 transition ${
-                            msg.rating === 'bad' ? 'text-rose-400 bg-slate-800' : 'text-slate-400'
+                          className={`p-1.5 rounded-swiss transition-colors ${
+                            msg.rating === 'bad'
+                              ? 'text-vn-600 bg-vn-50'
+                              : 'text-faint hover:text-ink hover:bg-paper-tint'
                           }`}
                         >
                           <ThumbsDown className="w-4 h-4" />
@@ -217,41 +250,62 @@ export const ChatArea: React.FC<ChatAreaProps> = ({ messages, onSendMessage, isL
                     </div>
                   </div>
                 </div>
-              )}
-            </div>
-          ))
+              )
+            )}
+            <div ref={messagesEndRef} />
+          </div>
         )}
-        <div ref={messagesEndRef} />
       </div>
 
-      {/* Floating Bottom Input Area */}
-      <div className="p-4 md:px-8 border-t border-slate-800/80 bg-slate-950/90 backdrop-blur-md">
-        <form onSubmit={handleSubmit} className="max-w-3xl mx-auto relative">
-          <textarea
-            value={inputText}
-            onChange={(e) => setInputText(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Nhập câu hỏi pháp lý hoặc tra cứu điều luật tại đây... (Enter để gửi)"
-            rows={2}
-            className="w-full pl-4 pr-14 py-3 rounded-2xl glass-input text-white text-sm placeholder-slate-500 resize-none focus:ring-2 focus:ring-legal-500/50"
-          />
+      {/* Composer */}
+      <div className="border-t border-ink bg-paper-dim">
+        <form onSubmit={handleSubmit} className="max-w-3xl mx-auto px-4 md:px-8 py-4">
+          {isAuthenticated ? (
+            <div className="relative">
+              <textarea
+                value={inputText}
+                onChange={(e) => setInputText(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Nhập câu hỏi pháp lý hoặc tra cứu điều luật…"
+                rows={2}
+                className="w-full bg-paper border border-rule text-ink text-sm placeholder-faint px-4 py-3 pr-14 rounded-swiss resize-none focus:outline-none focus:border-ink transition-colors"
+              />
+              <button
+                type="submit"
+                disabled={!inputText.trim() || isLoading}
+                className="absolute right-2.5 bottom-2.5 p-2.5 bg-ink text-paper rounded-swiss hover:bg-vn-600 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                aria-label="Gửi"
+              >
+                {isLoading ? (
+                  <div className="w-4 h-4 border-2 border-paper/30 border-t-paper rounded-full animate-spin" />
+                ) : (
+                  <ArrowUp className="w-4 h-4" />
+                )}
+              </button>
+            </div>
+          ) : (
+            /* Locked composer — auth gate */
+            <button
+              type="button"
+              onClick={() => setShowAuthModal(true)}
+              className="w-full flex items-center gap-3 bg-paper border border-rule px-4 py-3.5 rounded-swiss text-left hover:border-ink transition-colors"
+            >
+              <Lock className="w-4 h-4 text-vn-500 shrink-0" />
+              <span className="text-sm text-muted flex-1">Đăng nhập để gửi câu hỏi…</span>
+              <LogIn className="w-4 h-4 text-ink shrink-0" />
+            </button>
+          )}
 
-          <button
-            type="submit"
-            disabled={!inputText.trim() || isLoading}
-            className="absolute right-3 bottom-3.5 p-2.5 rounded-xl bg-gradient-to-r from-legal-600 to-legal-500 hover:from-legal-500 hover:to-legal-400 text-white shadow-lg shadow-legal-600/30 transition disabled:opacity-40"
-          >
-            {isLoading ? (
-              <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-            ) : (
-              <Send className="w-4 h-4" />
-            )}
-          </button>
+          <div className="flex items-center justify-between mt-2.5">
+            <span className="label-mono flex items-center gap-1.5">
+              <CornerDownLeft className="w-3 h-3" />
+              Enter gửi · Shift+Enter xuống dòng
+            </span>
+            <p className="text-[11px] text-faint hidden sm:block">
+              Tư vấn AI mang tính tham khảo — hỏi luật sư cho vụ việc thực tế.
+            </p>
+          </div>
         </form>
-
-        <p className="text-[11px] text-slate-500 text-center mt-2">
-          Thông tin tư vấn AI mang tính chất tham khảo trích dẫn văn bản pháp luật. Vui lòng hỏi luật sư đối với vụ việc thực tế.
-        </p>
       </div>
     </div>
   );

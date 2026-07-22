@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext';
+import { ThemeProvider } from './context/ThemeContext';
 import { AuthModal } from './components/AuthModal';
 import { Header } from './components/Header';
 import { Sidebar } from './components/Sidebar';
@@ -13,7 +14,7 @@ import {
   deleteUserHistoryApi,
 } from './services/api';
 
-// Generate or retrieve per-browser session UUID
+// Generate or retrieve per-browser session UUID (guest memory scope)
 function getSessionUserId(): string {
   let stored = localStorage.getItem('legal_rag_session_uuid');
   if (!stored) {
@@ -24,7 +25,7 @@ function getSessionUserId(): string {
 }
 
 const AppContent: React.FC = () => {
-  const { user } = useAuth();
+  const { user, isAuthenticated } = useAuth();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [history, setHistory] = useState<any[]>([]);
   const [isSidebarOpen, setIsSidebarOpen] = useState<boolean>(false);
@@ -34,6 +35,16 @@ const AppContent: React.FC = () => {
 
   // Active user ID for scoped memory and JWT association
   const activeUserId = user ? user.id : getSessionUserId();
+
+  // Admin route guard: only authenticated admin/lawyer may view admin
+  const canAccessAdmin = isAuthenticated && (user?.role === 'admin' || user?.role === 'lawyer');
+
+  // Force chat if user loses access to admin (e.g. logout / role change)
+  useEffect(() => {
+    if (activeTab === 'admin' && !canAccessAdmin) {
+      setActiveTab('chat');
+    }
+  }, [activeTab, canAccessAdmin]);
 
   // Fetch conversation history on initial load or user change
   useEffect(() => {
@@ -77,6 +88,9 @@ const AppContent: React.FC = () => {
   };
 
   const handleSendMessage = async (text: string) => {
+    // Hard gate: must be logged in to chat
+    if (!isAuthenticated) return;
+
     const userMsgId = 'u_' + Date.now();
     const assistantMsgId = 'a_' + Date.now();
 
@@ -102,13 +116,10 @@ const AppContent: React.FC = () => {
     setIsLoading(true);
 
     try {
-      // Dispatch chat message request to backend
       const res = await sendChatMessageApi(text, activeUserId, selectedVariant, false);
 
       if (res.task_id) {
         const taskId = res.task_id;
-
-        // Subscribe to SSE stream for real-time trace events
         const unsubscribe = subscribeTraceStream(
           taskId,
           (step: any) => {
@@ -126,7 +137,6 @@ const AppContent: React.FC = () => {
                   });
                 }
 
-                // Final answer step payload update
                 let updatedContent = msg.content;
                 if (step.payload && typeof step.payload === 'object' && step.payload.answer) {
                   updatedContent = step.payload.answer;
@@ -141,7 +151,6 @@ const AppContent: React.FC = () => {
             );
           },
           async () => {
-            // Finished streaming: poll final result or mark complete
             setMessages((prev) =>
               prev.map((msg) => {
                 if (msg.id !== assistantMsgId) return msg;
@@ -149,7 +158,6 @@ const AppContent: React.FC = () => {
               })
             );
             setIsLoading(false);
-            // Refresh history
             const historyData = await fetchUserHistoryApi(activeUserId);
             setHistory(historyData);
           },
@@ -159,7 +167,6 @@ const AppContent: React.FC = () => {
           }
         );
       } else if (res.response) {
-        // Sync response fallback
         setMessages((prev) =>
           prev.map((msg) => {
             if (msg.id !== assistantMsgId) return msg;
@@ -193,7 +200,7 @@ const AppContent: React.FC = () => {
   };
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-slate-950 text-slate-100 font-sans">
+    <div className="flex h-screen w-screen overflow-hidden bg-paper text-ink font-sans">
       <AuthModal />
 
       <Sidebar
@@ -218,17 +225,18 @@ const AppContent: React.FC = () => {
         />
 
         <main className="flex-1 overflow-hidden relative">
-          {activeTab === 'chat' ? (
+          {activeTab === 'admin' && canAccessAdmin ? (
+            <div className="h-full overflow-y-auto">
+              <AdminDashboard />
+            </div>
+          ) : (
             <ChatArea
               messages={messages}
               onSendMessage={handleSendMessage}
               isLoading={isLoading}
               userId={activeUserId}
+              isAuthenticated={isAuthenticated}
             />
-          ) : (
-            <div className="h-full overflow-y-auto">
-              <AdminDashboard />
-            </div>
           )}
         </main>
       </div>
@@ -238,9 +246,11 @@ const AppContent: React.FC = () => {
 
 export const App: React.FC = () => {
   return (
-    <AuthProvider>
-      <AppContent />
-    </AuthProvider>
+    <ThemeProvider>
+      <AuthProvider>
+        <AppContent />
+      </AuthProvider>
+    </ThemeProvider>
   );
 };
 
