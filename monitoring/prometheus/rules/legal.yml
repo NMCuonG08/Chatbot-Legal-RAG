@@ -61,3 +61,23 @@ groups:
         annotations:
           summary: "Backend p95 latency > 2s"
           description: "p95 = {{ $value | humanizeDuration }} over the last 10m."
+
+      # --- LLMOps / hallucination (Audit 4.2) ------------------------------
+      # verify_answer judges every final answer for citation groundedness.
+      # A verdict of partial/unsupported is a "rejection" (likely hallucination
+      # or ungrounded answer). Alert when the 15-min rejection rate exceeds 15%,
+      # sustained for 15m — a sustained high rejection rate means the model is
+      # systematically producing ungrounded answers and needs human review.
+      # Guarded against low-traffic division: clamp_min avoids a 0/0 NaN, and the
+      # `and ... > 0` clause keeps it silent when no judgments are happening.
+      - alert: LegalHighVerifyRejection
+        expr: |
+          (sum(rate(verify_rejection_total[15m]))
+            / clamp_min(sum(rate(verify_judged_total[15m])), 1e-9)) > 0.15
+          and sum(rate(verify_judged_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: high
+        annotations:
+          summary: "verify_answer rejection rate > 15%"
+          description: "15-min hallucination/rejection ratio is {{ $value | humanizePercentage }} — sustained for 15m. Review judge threshold or retrieval grounding."

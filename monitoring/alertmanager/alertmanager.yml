@@ -24,6 +24,14 @@ route:
       receiver: webhook-critical
       group_wait: 10s
       repeat_interval: 1h
+    # Audit 4.2 — hallucination/rejection alert pages on-call via Telegram +
+    # Slack. Routed ahead of the default so it is never lost in the generic
+    # webhook bucket. Falls back to webhook-default if the chat receivers are
+    # not enabled (commented below).
+    - matchers: ["alertname=LegalHighVerifyRejection"]
+      receiver: verify-rejection
+      group_wait: 10s
+      repeat_interval: 1h
 
 receivers:
   - name: webhook-default
@@ -35,6 +43,35 @@ receivers:
     webhook_configs:
       - url: "http://127.0.0.1:9999/alert-critical"
         send_resolved: true
+
+  # --- Audit 4.2: hallucination/rejection paging (Telegram + Slack) -------
+  # LegalHighVerifyRejection routes here. Both receivers are commented because
+  # their credentials are secrets — enable by uncommenting and templating at
+  # deploy time (Alertmanager does NOT do ${ENV} substitution in this file; see
+  # deploy.yml / docker-compose env injection). NEVER commit real tokens.
+  #
+  # Telegram: set TG_BOT_TOKEN + TG_CHAT_ID out-of-band; the token is a secret.
+  # - name: verify-rejection
+  #   telegram_configs:
+  #     - api_url: "https://api.telegram.org"
+  #       bot_token: "REPLACE_TG_BOT_TOKEN"      # secret — inject at deploy
+  #       chat_id: REPLACE_TG_CHAT_ID            # numeric chat id
+  #       send_resolved: true
+  #       parse_mode: "Markdown"
+  #       message: '{{ .CommonAnnotations.summary }}\n{{ .CommonAnnotations.description }}'
+  #
+  # Slack: incoming webhook URL is a secret — inject at deploy.
+  # - name: verify-rejection-slack
+  #   slack_configs:
+  #     - api_url: "REPLACE_SLACK_WEBHOOK_URL"   # secret — inject at deploy
+  #       channel: "#llmops-alerts"
+  #       send_resolved: true
+  #       title: '{{ .CommonAnnotations.summary }}'
+  #       text: '{{ .CommonAnnotations.description }}'
+  #
+  # To activate, uncomment one of the blocks above and rename the route's
+  # receiver to match. Until then the alert still fires in Prometheus and lands
+  # in webhook-default.
 
   # --- AWS SNS (advanced) -------------------------------------------------
   # Uncomment + template AWS creds + topic ARN at deploy time. Requires the

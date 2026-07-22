@@ -12,6 +12,7 @@ Verdict vocabulary mirrors ``legal_retrieval_tools.verify_citation``:
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Callable, Dict, List, Optional
 
@@ -27,7 +28,38 @@ logger = logging.getLogger(__name__)
 _MIN_ANSWER_LEN = 15
 
 
+def _record_verify_metrics(fn):
+    """Audit 4.2 — export verify_answer verdicts/scores to Prometheus.
+
+    Stacked under ``@traceable`` (innermost) so it sees the returned verdict
+    dict. Records ``verify_judged_total``, ``verify_faithfulness_score``
+    (histogram), and ``verify_rejection_total{verdict}`` for partial/unsupported
+    (a rejection = verdict below the supported threshold). Guarded: a metric
+    failure never breaks the graph or alters the returned verdict dict.
+    """
+    @functools.wraps(fn)
+    def _wrapped(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        try:
+            from memory_metrics import (
+                inc_verify_judged,
+                inc_verify_rejection,
+                observe_verify_score,
+            )
+            verdict = (result or {}).get("verdict", "")
+            score = float((result or {}).get("score", 0.0))
+            inc_verify_judged()
+            observe_verify_score(score)
+            if verdict in ("partial", "unsupported"):
+                inc_verify_rejection(verdict)
+        except Exception as exc:  # metric failure must never break the judge
+            logger.debug("verify metric recording skipped: %s", exc)
+        return result
+    return _wrapped
+
+
 @traceable(name="judge_answer", run_type="chain")
+@_record_verify_metrics
 def judge_answer(question: str, answer: str, sources: List[Dict],
                  judge_fn: Optional[Callable] = None) -> Dict:
     """Score an answer against its retrieval sources.

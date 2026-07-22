@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 try:
     from prometheus_client import Counter as _PromCounter
+    from prometheus_client import Histogram as _PromHistogram
     _PROM = True
 except Exception:  # pragma: no cover - prometheus_client optional in dev
     _PROM = False
@@ -44,6 +45,19 @@ class _NoopCounter:
         return self
 
 
+class _NoopHistogram:
+    """Drop-in for prometheus_client.Histogram when prometheus is unavailable."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    def observe(self, _v: float) -> None:
+        pass
+
+    def labels(self, **_kw):
+        return self
+
+
 def _make_counter(name: str, desc: str, labels: Optional[list] = None):
     if not _PROM:
         return _NoopCounter()
@@ -53,6 +67,16 @@ def _make_counter(name: str, desc: str, labels: Optional[list] = None):
         # Already registered (duplicate import in long-lived process) -> no-op
         # to avoid a double-registration crash. The first registration wins.
         return _NoopCounter()
+
+
+def _make_histogram(name: str, desc: str, buckets: Optional[list] = None,
+                    labels: Optional[list] = None):
+    if not _PROM:
+        return _NoopHistogram()
+    try:
+        return _PromHistogram(name, desc, buckets=buckets, labelnames=labels or [])
+    except Exception:
+        return _NoopHistogram()
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +98,19 @@ REACT_RECALL = _make_counter("react_memory_recall_total",
 PROFILE_MERGE = _make_counter("profile_merge_total",
                               "UserProfile field merges.",
                               labels=["field"])
+
+# Audit 4.2 — verify_answer (PEV) online LLMOps signals. Rejection rate =
+# verify_rejection_total / verify_judged_total; alert when > 15% over 15m.
+VERIFY_JUDGED = _make_counter("verify_judged_total",
+                              "verify_answer judgments (denominator for rejection rate).")
+VERIFY_REJECTIONS = _make_counter("verify_rejection_total",
+                                  "verify_answer rejected verdicts (partial/unsupported).",
+                                  labels=["verdict"])
+VERIFY_SCORE = _make_histogram(
+    "verify_faithfulness_score",
+    "verify_answer faithfulness score distribution (0..1).",
+    buckets=[0.1, 0.2, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -118,5 +155,26 @@ def inc_react_recall(hit: bool) -> None:
 def inc_profile_merge(field: str) -> None:
     try:
         PROFILE_MERGE.labels(field=field).inc()
+    except Exception:
+        pass
+
+
+def inc_verify_judged() -> None:
+    try:
+        VERIFY_JUDGED.inc()
+    except Exception:
+        pass
+
+
+def inc_verify_rejection(verdict: str) -> None:
+    try:
+        VERIFY_REJECTIONS.labels(verdict=verdict).inc()
+    except Exception:
+        pass
+
+
+def observe_verify_score(score: float) -> None:
+    try:
+        VERIFY_SCORE.observe(float(score))
     except Exception:
         pass
