@@ -42,9 +42,16 @@ export const ReasoningTrace: React.FC<ReasoningTraceProps> = ({ traceSteps = [],
     }
   };
 
-  const filteredSteps = traceSteps.filter(
-    (step) => step.node && step.node.toLowerCase() !== '__root__'
-  );
+  const uniqueStepsMap = new Map<string, AgentStepPayload>();
+  traceSteps.forEach((step) => {
+    if (step.node && step.node.toLowerCase() !== '__root__') {
+      const key = `${step.step_index ?? ''}_${step.node}`;
+      if (!uniqueStepsMap.has(key)) {
+        uniqueStepsMap.set(key, step);
+      }
+    }
+  });
+  const filteredSteps = Array.from(uniqueStepsMap.values());
 
   if (filteredSteps.length === 0 && !isStreaming) return null;
 

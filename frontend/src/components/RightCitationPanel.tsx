@@ -42,10 +42,15 @@ export const RightCitationPanel: React.FC<RightCitationPanelProps> = ({
       {sources.length > 1 && (
         <div className="p-3 border-b border-rule bg-paper flex flex-wrap gap-1.5 max-h-36 overflow-y-auto">
           {sources.map((src, idx) => {
+            const kind = (src as any).kind || (src as any).source_type || '';
+            const collection = src.collection || '';
+            const url = src.url || '';
             const isWeb =
-              src.collection === 'web' ||
-              (src as any).kind === 'web_search' ||
-              (src as any).source_type === 'web';
+              collection === 'web' ||
+              kind === 'web' ||
+              kind === 'web_search' ||
+              (url.startsWith('http') && !src.article_number && !(src as any).law_id && !src.document_title?.toLowerCase().includes('luật') && !src.document_title?.toLowerCase().includes('nghị định') && !src.document_title?.toLowerCase().includes('thông tư'));
+
             const docTitle = src.document_title || src.title || `Nguồn #${idx + 1}`;
             const articleNum = src.article_number ? `Điều ${src.article_number}` : '';
             const isSelected = activeSrc === src;
@@ -105,20 +110,28 @@ export const RightCitationPanel: React.FC<RightCitationPanelProps> = ({
             {activeSrc.text || activeSrc.content || 'Không có bản xem trước văn bản.'}
           </div>
 
-          <div className="mt-3 pt-2 border-t border-rule flex items-center justify-between text-[11px]">
-            <span className="font-mono text-muted">
-              Collection · {activeSrc.collection || 'llm'}
-            </span>
+          <div className="mt-3 pt-3 border-t border-rule space-y-2">
             {activeSrc.url && (
               <a
                 href={activeSrc.url}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex items-center gap-1 text-vn-600 dark:text-vn-400 hover:underline font-medium"
+                className="w-full inline-flex items-center justify-center gap-2 py-2 px-3 bg-sky-600 hover:bg-sky-700 text-white font-medium text-xs rounded-swiss shadow transition-all"
               >
-                Mở link gốc <ExternalLink className="w-3 h-3" />
+                <ExternalLink className="w-3.5 h-3.5" />
+                Mở trang web gốc ↗
               </a>
             )}
+            <div className="flex items-center justify-between text-[11px]">
+              <span className="font-mono text-muted">
+                Nguồn · {activeSrc.collection || (activeSrc as any).kind || 'web'}
+              </span>
+              {activeSrc.url && (
+                <span className="font-mono text-[10px] text-faint truncate max-w-[180px]">
+                  {activeSrc.url}
+                </span>
+              )}
+            </div>
           </div>
         </div>
       ) : (

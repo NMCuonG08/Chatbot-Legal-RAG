@@ -21,6 +21,7 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=True)
 from models import (
     create_user,
     delete_user_conversations,
+    delete_single_conversation,
     delete_user_episodes,
     ensure_database_schema,
     get_user_by_id,
@@ -753,6 +754,24 @@ async def delete_history(
         "episodic_cleared": episodic_cleared,
         "runtime_caches_cleared": runtime_cleared,
     }
+
+
+@app.delete("/history/{user_id}/{conversation_id}")
+async def delete_single_history_endpoint(
+    user_id: str,
+    conversation_id: str,
+    principal: Optional[Principal] = Depends(get_current_user_optional),
+):
+    if principal is None:
+        if os.getenv("ALLOW_ANONYMOUS", "1") != "1":
+            raise HTTPException(status_code=401, detail="Đăng nhập (JWT) là bắt buộc.")
+    elif principal.user_id != user_id and not principal.is_admin:
+        raise HTTPException(status_code=403, detail="Không có quyền xóa lịch sử của user khác.")
+
+    success = delete_single_conversation(user_id, conversation_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Không thể xóa cuộc trò chuyện này")
+    return {"status": "success", "conversation_id": conversation_id}
 
 
 @app.get("/collections/{collection_name}/points")

@@ -248,6 +248,42 @@ def delete_user_conversations(user_id: str):
         db.close()
 
 
+def delete_single_conversation(user_id: str, conversation_id: str) -> bool:
+    """Delete a single specific conversation session for a user by conversation_id or row id"""
+    db = _new_db_session()
+    try:
+        stmt = delete(ChatConversation).where(
+            ChatConversation.user_id == user_id,
+            ChatConversation.conversation_id == conversation_id,
+        )
+        res = db.execute(stmt)
+        if (res.rowcount or 0) == 0 and str(conversation_id).isdigit():
+            row_id = int(conversation_id)
+            target_row = db.query(ChatConversation).filter(ChatConversation.id == row_id).first()
+            if target_row and target_row.conversation_id:
+                db.execute(
+                    delete(ChatConversation).where(
+                        ChatConversation.user_id == user_id,
+                        ChatConversation.conversation_id == target_row.conversation_id,
+                    )
+                )
+            else:
+                db.execute(
+                    delete(ChatConversation).where(
+                        ChatConversation.user_id == user_id,
+                        ChatConversation.id == row_id,
+                    )
+                )
+        db.commit()
+        return True
+    except Exception as e:
+        logger.error(f"Error deleting single conversation {conversation_id}: {e}")
+        db.rollback()
+        return False
+    finally:
+        db.close()
+
+
 def delete_all_conversations():
     """Delete all chat conversations for all sessions"""
     db = _new_db_session()

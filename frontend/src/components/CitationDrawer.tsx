@@ -22,18 +22,23 @@ export const CitationDrawer: React.FC<CitationDrawerProps> = ({
 
       <div className="flex flex-wrap gap-1.5">
         {sources.map((src, idx) => {
+          const kind = (src as any).kind || (src as any).source_type || '';
+          const collection = src.collection || '';
+          const url = src.url || '';
           const isWeb =
-            src.collection === 'web' ||
-            (src as any).kind === 'web_search' ||
-            (src as any).source_type === 'web';
+            collection === 'web' ||
+            kind === 'web' ||
+            kind === 'web_search' ||
+            (url.startsWith('http') && !src.article_number && !(src as any).law_id && !src.document_title?.toLowerCase().includes('luật') && !src.document_title?.toLowerCase().includes('nghị định') && !src.document_title?.toLowerCase().includes('thông tư'));
+
           const docTitle = src.document_title || src.title || `Nguồn #${idx + 1}`;
           const articleNum = src.article_number ? `Điều ${src.article_number}` : '';
 
           return (
-            <button
+            <div
               key={idx}
               onClick={() => onSelectSource && onSelectSource(src)}
-              className={`inline-flex items-center gap-2 px-2.5 py-1.5 border rounded-swiss transition-all text-left cursor-pointer ${
+              className={`inline-flex items-center gap-2 px-2.5 py-1.5 border rounded-swiss transition-all text-left cursor-pointer group ${
                 isWeb
                   ? 'bg-sky-500/10 text-sky-700 dark:text-sky-300 border-sky-500/30 hover:border-sky-500 hover:bg-sky-500/20'
                   : 'bg-paper text-ink border-rule hover:border-ink hover:bg-paper-dim'
@@ -52,14 +57,25 @@ export const CitationDrawer: React.FC<CitationDrawerProps> = ({
                   LUẬT
                 </span>
               )}
-              <span className="text-xs font-medium truncate max-w-[240px]">{docTitle}</span>
+              <span className="text-xs font-medium truncate max-w-[220px]">{docTitle}</span>
               {src.score && (
                 <span className="font-mono text-[10px] opacity-70 tabular-nums">
                   {(src.score * 100).toFixed(0)}%
                 </span>
               )}
-              {src.url && <ExternalLink className="w-3 h-3 opacity-60 shrink-0" />}
-            </button>
+              {src.url && (
+                <a
+                  href={src.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => e.stopPropagation()}
+                  title={`Mở liên kết web: ${src.url}`}
+                  className="p-0.5 text-faint hover:text-sky-500 transition-colors shrink-0"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+              )}
+            </div>
           );
         })}
       </div>

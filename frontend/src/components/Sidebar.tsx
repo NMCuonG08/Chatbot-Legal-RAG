@@ -147,8 +147,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
           ) : (
             <ol className="space-y-1">
               {history.map((item, idx) => {
-                const itemId = item.id || item.conversation_id;
-                const isSelected = Boolean(selectedHistoryId && selectedHistoryId === itemId);
+                const itemId = item.conversation_id || String(item.id);
+                const isSelected = Boolean(selectedHistoryId && (selectedHistoryId === itemId || selectedHistoryId === String(item.id)));
                 return (
                   <li key={itemId || idx}>
                     <div

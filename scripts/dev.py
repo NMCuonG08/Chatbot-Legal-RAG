@@ -117,7 +117,7 @@ def handle_app():
     print("Launching Celery worker, FastAPI, Streamlit (Ctrl-C stops all)...")
     
     celery_cmd = [get_bin("celery"), "-A", "tasks.celery_app", "worker", "--loglevel=info", "-P", "solo"]
-    uvicorn_cmd = [get_bin("uvicorn"), "app:app", "--host", "0.0.0.0", "--port", "8002"]
+    uvicorn_cmd = [get_bin("uvicorn"), "app:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
     frontend_cmd = ["cmd.exe", "/c", "npm", "run", "dev"] if os.name == "nt" else ["npm", "run", "dev"]
     
     processes = []

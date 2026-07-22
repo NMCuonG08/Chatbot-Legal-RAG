@@ -166,7 +166,7 @@ class OllamaProvider(LLMProvider):
     default can never leak into local generation."""
     name = "ollama"
 
-    def __init__(self, base_url: str, model: str, api_key: str | None = None, timeout: int = 30):
+    def __init__(self, base_url: str, model: str, api_key: str | None = None, timeout: int = 120):
         super().__init__(model)
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -240,7 +240,7 @@ def build_ollama_provider(model: str | None = None, fast: bool = False) -> Ollam
         m = os.environ.get("OLLAMA_FAST_LLM_MODEL") or "qwen2.5:7b"
     else:
         m = LLM_MODEL_CONTEXTVAR.get() or os.environ.get("OLLAMA_LLM_MODEL") or os.environ.get("OLLAMA_MODEL") or "gemma4:31b"
-    return OllamaProvider(base, m, os.environ.get("OLLAMA_API_KEY"))
+    return OllamaProvider(base, m, os.environ.get("OLLAMA_API_KEY"), timeout=120)
 
 
 def get_main_provider() -> LLMProvider:
