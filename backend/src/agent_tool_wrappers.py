@@ -59,6 +59,7 @@ from legal_procedure_tools import (
 )
 from search import search_engine
 from tavily_tool import tavily_qna, tavily_search_legal
+from tool_output_sanitizer import sanitized_output
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +400,7 @@ def statute_lookup(case_type: str) -> str:
 # ===== WEB SEARCH TOOLS =====
 
 
+@sanitized_output
 @track_tool_call
 def web_search_tool(query: str, max_results: int = 5) -> str:
     """
@@ -413,13 +415,13 @@ def web_search_tool(query: str, max_results: int = 5) -> str:
         Kết quả tìm kiếm với tiêu đề, link và nội dung tóm tắt
     """
     try:
-        from tavily_tool import tavily_search_legal
         return tavily_search_legal(query, max_results=max_results)
     except Exception as e:
         logger.error(f"Web search error: {e}")
         return f"Lỗi tìm kiếm: {str(e)}"
 
 
+@sanitized_output
 @track_tool_call
 def tavily_search_tool(query: str, max_results: int = 5) -> str:
     """
@@ -440,6 +442,7 @@ def tavily_search_tool(query: str, max_results: int = 5) -> str:
         return f"Tavily không khả dụng: {str(e)}"
 
 
+@sanitized_output
 @track_tool_call
 def quick_answer_tool(question: str) -> str:
     """
