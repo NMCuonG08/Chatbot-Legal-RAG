@@ -504,7 +504,7 @@ def _retrieve_episodic_context(user_id: str | None, question: str) -> str:
             vector=query_vector,
             limit=3,
             filters={"user_id": user_id},
-            score_threshold=0.5,
+            score_threshold=0.35,
         )
         if not episodes:
             return ""
@@ -527,7 +527,7 @@ def _retrieve_episodic_context(user_id: str | None, question: str) -> str:
 # questions (inheritance fact -> vehicle question). This flag defaults to the
 # NEW behavior (disabled = no inject); set ``RAG_AUTO_INJECT_DISABLED=false`` to
 # roll back to the legacy auto-inject for one release window (P7).
-_RAG_AUTO_INJECT_DISABLED = os.environ.get("RAG_AUTO_INJECT_DISABLED", "true").lower() == "true"
+_RAG_AUTO_INJECT_DISABLED = os.environ.get("RAG_AUTO_INJECT_DISABLED", "false").lower() == "true"
 
 
 def _episodic_background_block(user_id: str | None, question: str) -> str:
@@ -2045,7 +2045,7 @@ def llm_handle_message(self, bot_id, user_id, question, role=None,
             tool_calls = []
 
     # Save full response to history (to preserve all details like the specific age)
-    update_chat_conversation(bot_id, user_id, response_text, False, sources=sources)
+    update_chat_conversation(bot_id, user_id, response_text, False, sources=sources, conversation_id=conversation_id)
 
     # 4. Save to Semantic Cache if not blocked. Skip for shared sentinel
     # user_ids: the answer may carry this client's private facts, and caching

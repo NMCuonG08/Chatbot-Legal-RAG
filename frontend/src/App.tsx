@@ -5,8 +5,9 @@ import { AuthModal } from './components/AuthModal';
 import { Header } from './components/Header';
 import { Sidebar } from './components/Sidebar';
 import { ChatArea } from './components/ChatArea';
+import { RightCitationPanel } from './components/RightCitationPanel';
 import { AdminDashboard } from './components/AdminDashboard';
-import { ChatMessage } from './types';
+import { ChatMessage, LegalSource } from './types';
 import {
   sendChatMessageApi,
   subscribeTraceStream,
@@ -41,6 +42,12 @@ const AppContent: React.FC = () => {
 
   // Admin route guard: only authenticated admin/lawyer may view admin
   const canAccessAdmin = isAuthenticated && (user?.role === 'admin' || user?.role === 'lawyer');
+
+  const [isRightPanelOpen, setIsRightPanelOpen] = useState<boolean>(false);
+  const [selectedPanelSource, setSelectedPanelSource] = useState<LegalSource | null>(null);
+
+  const latestAssistantMsg = [...messages].reverse().find((m) => m.role === 'assistant');
+  const activeSources = latestAssistantMsg?.sources || [];
 
   // Force chat if user loses access to admin (e.g. logout / role change)
   useEffect(() => {
@@ -318,19 +325,37 @@ const AppContent: React.FC = () => {
           setActiveTab={setActiveTab}
         />
 
-        <main className="flex-1 overflow-hidden relative">
+        <main className="flex-1 overflow-hidden relative flex h-full">
           {activeTab === 'admin' && canAccessAdmin ? (
-            <div className="h-full overflow-y-auto">
+            <div className="h-full overflow-y-auto w-full">
               <AdminDashboard />
             </div>
           ) : (
-            <ChatArea
-              messages={messages}
-              onSendMessage={handleSendMessage}
-              isLoading={isLoading}
-              userId={activeUserId}
-              isAuthenticated={isAuthenticated}
-            />
+            <>
+              <div className="flex-1 h-full overflow-hidden">
+                <ChatArea
+                  messages={messages}
+                  onSendMessage={handleSendMessage}
+                  isLoading={isLoading}
+                  userId={activeUserId}
+                  isAuthenticated={isAuthenticated}
+                  onSelectSource={(src) => {
+                    setSelectedPanelSource(src);
+                    setIsRightPanelOpen(true);
+                  }}
+                />
+              </div>
+              <RightCitationPanel
+                sources={activeSources}
+                selectedSource={selectedPanelSource}
+                onSelectSource={setSelectedPanelSource}
+                isOpen={isRightPanelOpen}
+                onClose={() => {
+                  setIsRightPanelOpen(false);
+                  setSelectedPanelSource(null);
+                }}
+              />
+            </>
           )}
         </main>
       </div>

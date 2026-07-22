@@ -24,6 +24,7 @@ interface ChatAreaProps {
   isLoading: boolean;
   userId: string;
   isAuthenticated: boolean;
+  onSelectSource?: (src: LegalSource | null) => void;
 }
 
 const samplePrompts: { idx: string; title: string; subtitle: string; prompt: string }[] = [
@@ -63,10 +64,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   isLoading,
   userId,
   isAuthenticated,
+  onSelectSource,
 }) => {
   const { setShowAuthModal } = useAuth();
   const [inputText, setInputText] = useState<string>('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [activeModalSource, setActiveModalSource] = useState<LegalSource | null>(null);
+
+  const formatContentWithCitations = (content: string) => {
+    if (!content) return '';
+    return content.replace(/\[(\d+)\]/g, '[$1](#cite-$1)');
+  };
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -190,13 +198,42 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
                     {msg.content && (
                       <div className="prose-swiss max-w-none">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeKatex]}>
-                          {msg.content}
+                        <ReactMarkdown
+                          remarkPlugins={[remarkGfm]}
+                          rehypePlugins={[rehypeKatex]}
+                          components={{
+                            a: ({ href, children }) => {
+                              if (href?.startsWith('#cite-')) {
+                                const idx = parseInt(href.replace('#cite-', ''), 10) - 1;
+                                const src = msg.sources?.[idx];
+                                return (
+                                  <button
+                                    type="button"
+                                    onClick={() => src && onSelectSource && onSelectSource(src)}
+                                    className="inline-flex items-center justify-center font-mono text-[11px] font-bold text-vn-600 dark:text-vn-400 hover:underline px-1 py-0.5 mx-0.5 bg-vn-500/10 hover:bg-vn-500/20 rounded border border-vn-500/30 transition-all cursor-pointer"
+                                    title={src?.document_title || src?.title || `Nguồn #${idx + 1}`}
+                                  >
+                                    {children}
+                                  </button>
+                                );
+                              }
+                              return (
+                                <a href={href} target="_blank" rel="noreferrer" className="text-vn-600 dark:text-vn-400 hover:underline">
+                                  {children}
+                                </a>
+                              );
+                            },
+                          }}
+                        >
+                          {formatContentWithCitations(msg.content)}
                         </ReactMarkdown>
                       </div>
                     )}
 
-                    <CitationDrawer sources={msg.sources} />
+                    <CitationDrawer
+                      sources={msg.sources}
+                      onSelectSource={onSelectSource}
+                    />
 
                     <div className="flex items-center justify-between pt-3 border-t border-rule text-xs text-muted">
                       <div className="flex items-center gap-2">

@@ -983,10 +983,10 @@ async def chat_stream(task_id: str):
                     "event_type": step.event_type,
                     "payload": step.payload,
                 }
-                yield {
-                    "event": step.event_type,
-                    "data": json.dumps(evt, ensure_ascii=False, default=str),
-                }
+                data_str = json.dumps(evt, ensure_ascii=False, default=str)
+                yield {"event": "message", "data": data_str}
+                if step.event_type != "message":
+                    yield {"event": step.event_type, "data": data_str}
                 if step.event_type == "run_end":
                     return
 
@@ -1052,10 +1052,10 @@ async def chat_stream(task_id: str):
                     continue
                 if idx is not None:
                     seen_indices.add(idx)
-                yield {
-                    "event": payload.get("event_type", "step"),
-                    "data": json.dumps(payload, ensure_ascii=False, default=str),
-                }
+                data_str = json.dumps(payload, ensure_ascii=False, default=str)
+                yield {"event": "message", "data": data_str}
+                if payload.get("event_type") != "message":
+                    yield {"event": payload.get("event_type", "step"), "data": data_str}
                 if payload.get("event_type") == "run_end":
                     break
         finally:
