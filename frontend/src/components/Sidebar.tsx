@@ -23,6 +23,7 @@ interface SidebarProps {
   onSelectVariant: (variant: string) => void;
   activeTab: 'chat' | 'admin';
   setActiveTab: (tab: 'chat' | 'admin') => void;
+  selectedHistoryId?: string | null;
 }
 
 const pad2 = (n: number) => String(n).padStart(2, '0');
@@ -38,13 +39,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onSelectVariant,
   activeTab,
   setActiveTab,
+  selectedHistoryId,
 }) => {
   const { user, isAuthenticated, logout, setShowAuthModal } = useAuth();
   const canAccessAdmin = isAuthenticated && (user?.role === 'admin' || user?.role === 'lawyer');
 
   return (
     <>
-      {isOpen && <div onClick={onClose} className="fixed inset-0 z-40 bg-ink/30 lg:hidden" />}
+      {isOpen && <div onClick={onClose} className="fixed inset-0 z-40 bg-black/50 backdrop-blur-sm lg:hidden" />}
 
       <aside
         className={`fixed top-0 left-0 bottom-0 z-40 w-72 bg-paper border-r border-ink flex flex-col transition-transform duration-300 ease-in-out lg:translate-x-0 ${
@@ -141,22 +143,30 @@ export const Sidebar: React.FC<SidebarProps> = ({
           {history.length === 0 ? (
             <p className="py-8 text-center text-xs text-faint">Chưa có câu hỏi nào.</p>
           ) : (
-            <ol className="space-y-px">
-              {history.map((item, idx) => (
-                <li key={idx}>
-                  <button
-                    onClick={() => onSelectHistoryItem(item)}
-                    className="w-full flex items-start gap-2.5 py-2 pr-1 text-left text-[13px] text-ink/80 hover:bg-paper-tint transition-colors group truncate"
-                  >
-                    <span className="font-mono text-[10px] text-faint pt-0.5 tabular-nums shrink-0">
-                      {pad2(idx + 1)}
-                    </span>
-                    <span className="truncate group-hover:text-ink">
-                      {item.question || item.content || `Hội thoại ${idx + 1}`}
-                    </span>
-                  </button>
-                </li>
-              ))}
+            <ol className="space-y-1">
+              {history.map((item, idx) => {
+                const itemId = item.id || item.conversation_id;
+                const isSelected = Boolean(selectedHistoryId && selectedHistoryId === itemId);
+                return (
+                  <li key={item.id || item.conversation_id || idx}>
+                    <button
+                      onClick={() => onSelectHistoryItem(item)}
+                      className={`w-full flex items-start gap-2 py-1.5 px-2 text-left text-[13px] transition-all group rounded-swiss border-l-2 ${
+                        isSelected
+                          ? 'bg-paper-tint text-vn-600 font-semibold border-vn-500'
+                          : 'border-transparent text-ink/80 hover:bg-paper-tint hover:text-ink'
+                      }`}
+                    >
+                      <span className={`font-mono text-[10px] pt-0.5 tabular-nums shrink-0 ${isSelected ? 'text-vn-600 font-bold' : 'text-faint'}`}>
+                        {pad2(idx + 1)}
+                      </span>
+                      <span className="truncate">
+                        {item.question || item.content || item.message?.question || `Hội thoại ${idx + 1}`}
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
             </ol>
           )}
         </div>

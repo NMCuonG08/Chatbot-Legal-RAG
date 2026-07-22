@@ -98,11 +98,11 @@ def convert_conversation_to_openai_messages(user_conversations):
 
 
 def update_chat_conversation(
-    bot_id: str, user_id: str, message: str, is_request: bool = True, sources: list = None
+    bot_id: str, user_id: str, message: str, is_request: bool = True, sources: list = None, conversation_id: str = None
 ):
     db = _new_db_session()
-    # Step 1: Create a new ChatConversation instance
-    conversation_id = get_conversation_id(bot_id, user_id)
+    if not conversation_id:
+        conversation_id = get_conversation_id(bot_id, user_id)
 
     new_conversation = ChatConversation(
         conversation_id=conversation_id,
@@ -138,25 +138,55 @@ def list_user_conversations(user_id: str, limit: int = 100, offset: int = 0):
         conversations = db.execute(
             select(ChatConversation)
             .where(ChatConversation.user_id == user_id)
-            .order_by(ChatConversation.created_at.desc())
-            .offset(offset)
-            .limit(limit)
+            .order_by(ChatConversation.created_at.asc())
         ).scalars().all()
-        return [
-            {
-                "id": conversation.id,
-                "conversation_id": conversation.conversation_id,
-                "bot_id": conversation.bot_id,
-                "user_id": conversation.user_id,
-                "message": conversation.message,
-                "is_request": conversation.is_request,
-                "completed": conversation.completed,
-                "created_at": conversation.created_at,
-                "updated_at": conversation.updated_at,
-                "sources": json.loads(conversation.sources) if getattr(conversation, "sources", None) else [],
-            }
-            for conversation in conversations
-        ]
+
+        sessions_map = {}
+        for c in conversations:
+            cid = c.conversation_id
+            if cid not in sessions_map:
+                sessions_map[cid] = {
+                    "id": c.id,
+                    "conversation_id": cid,
+                    "bot_id": c.bot_id,
+                    "user_id": c.user_id,
+                    "question": "",
+                    "response": "",
+                    "sources": [],
+                    "created_at": c.created_at,
+                    "updated_at": c.updated_at,
+                    "turns": [],
+                }
+            sess = sessions_map[cid]
+            if c.is_request and not sess["question"]:
+                sess["question"] = c.message
+            elif not c.is_request and not sess["response"]:
+                sess["response"] = c.message
+                if getattr(c, "sources", None):
+                    try:
+                        sess["sources"] = json.loads(c.sources)
+                    except Exception:
+                        pass
+            sess["updated_at"] = c.updated_at
+
+            turn_sources = []
+            if not c.is_request and getattr(c, "sources", None):
+                try:
+                    turn_sources = json.loads(c.sources)
+                except Exception:
+                    pass
+
+            sess["turns"].append({
+                "id": c.id,
+                "is_request": c.is_request,
+                "message": c.message,
+                "sources": turn_sources,
+                "created_at": str(c.created_at or ""),
+            })
+
+        result = list(sessions_map.values())
+        result.sort(key=lambda s: str(s.get("updated_at") or s.get("created_at") or ""), reverse=True)
+        return result[offset : offset + limit]
     finally:
         db.close()
 

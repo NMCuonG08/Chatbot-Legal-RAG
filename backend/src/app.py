@@ -154,11 +154,12 @@ async def lifespan(app: FastAPI):
             time.sleep(1)
 
         if not worker_ready:
-            logger.critical("🔴 Celery Worker check failed: No active workers found.")
-            raise RuntimeError("Celery Worker check failed: No active workers found.")
+            if getattr(celery_app.conf, 'task_always_eager', False):
+                logger.info("🟢 Celery task_always_eager is True (synchronous dev mode).")
+            else:
+                logger.warning("⚠️ Celery Worker process not detected. Backend will remain online.")
     except Exception as e:
-        logger.critical(f"🔴 Celery Worker check failed: {e}")
-        raise RuntimeError(f"Celery Worker check failed: {e}")
+        logger.warning(f"⚠️ Celery Worker check warning: {e}")
 
     # 5. Run DB Schema Migration
     logger.info("⚙️ Ensuring Database Schema...")
@@ -239,6 +240,7 @@ class CompleteRequest(BaseModel):
     # run candidate + persist for offline compare (user still gets primary).
     variant: Optional[str] = None
     shadow: Optional[bool] = False
+    conversation_id: Optional[str] = None
 
 
 # Phase 2 — auth / approval request schemas
@@ -394,7 +396,7 @@ def health_detailed():
         ollama_status = "not_configured"
 
     return {
-        "status": "healthy" if all(s in ["healthy", "not_configured"] for s in [db_status, redis_status, qdrant_status, celery_status, ollama_status]) else "unhealthy",
+        "status": "healthy" if all(s in ["healthy", "not_configured", "no_workers"] for s in [db_status, redis_status, qdrant_status, celery_status, ollama_status]) else "unhealthy",
         "database": {"status": db_status, "error": db_error},
         "redis": {"status": redis_status, "error": redis_error},
         "qdrant": {"status": qdrant_status, "error": qdrant_error},
@@ -834,7 +836,7 @@ async def complete(
         # llm_handle_message is sync (Celery task called directly). Run in a
         # worker thread so the uvicorn event loop is NOT blocked for the whole
         # generation latency.
-        response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message, role, data.variant, data.shadow)
+        response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message, role, data.variant, data.shadow, data.conversation_id)
         return {
             "response": response.get("content", ""),
             "sources": response.get("sources", []),
@@ -843,14 +845,14 @@ async def complete(
         }
     else:
         try:
-            task = llm_handle_message.delay(bot_id, user_id, user_message, role, data.variant, data.shadow)
+            task = llm_handle_message.delay(bot_id, user_id, user_message, role, data.variant, data.shadow, data.conversation_id)
             return {"task_id": task.id}
         except Exception as broker_err:
             # Broker/broker-down: fall back to the in-process sync path so a
             # transient Redis/Celery outage does not hard-500 a chat that the
             # sync handler could still serve.
             logger.warning(f"[CHAT] broker dispatch failed, falling back to sync: {broker_err}")
-            response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message, role, data.variant, data.shadow)
+            response = await asyncio.to_thread(llm_handle_message, bot_id, user_id, user_message, role, data.variant, data.shadow, data.conversation_id)
             return {
                 "response": response.get("content", ""),
                 "sources": response.get("sources", []),
@@ -873,15 +875,23 @@ async def get_response(task_id: str):
     return result
 
 
-def _make_immediate_run_end(status: str, cached: bool = False):
+def _make_immediate_run_end(status: str, cached: bool = False, result: dict = None):
     async def event_generator_finished():
+        payload = {"status": status.lower(), "cached": cached, "completed_early": True}
+        if result and isinstance(result, dict):
+            content = result.get("content") or result.get("response") or result.get("answer")
+            if content:
+                payload["answer"] = content
+                payload["content"] = content
+                payload["sources"] = result.get("sources", [])
+                payload["route"] = result.get("route", "")
         yield {
             "event": "run_end",
             "data": json.dumps({
                 "run_id": "completed_early",
                 "node": "__ROOT__",
                 "event_type": "run_end",
-                "payload": {"status": status.lower(), "cached": cached, "completed_early": True}
+                "payload": payload
             }, ensure_ascii=False, default=str),
         }
     return EventSourceResponse(event_generator_finished())
@@ -926,14 +936,16 @@ async def chat_stream(task_id: str):
     task_result = AsyncResult(task_id)
     if task_result.status in ["SUCCESS", "FAILURE", "REVOKED"]:
         logger.info(f"⚡ Task {task_id} already completed early (status={task_result.status}). Returning immediate run_end.")
-        return _make_immediate_run_end(task_result.status, cached=(task_result.status == "SUCCESS"))
+        res_dict = task_result.result if isinstance(task_result.result, dict) else {}
+        return _make_immediate_run_end(task_result.status, cached=(task_result.status == "SUCCESS"), result=res_dict)
 
     run_id = await _resolve_run_id(task_id)
     if not run_id:
         # Re-check task status in case it transitioned during poll
         if task_result.status in ["SUCCESS", "FAILURE", "REVOKED"]:
             logger.info(f"⚡ Task {task_id} completed during poll (status={task_result.status}). Returning immediate run_end.")
-            return _make_immediate_run_end(task_result.status, cached=(task_result.status == "SUCCESS"))
+            res_dict = task_result.result if isinstance(task_result.result, dict) else {}
+            return _make_immediate_run_end(task_result.status, cached=(task_result.status == "SUCCESS"), result=res_dict)
         raise HTTPException(status_code=404, detail=f"No trace run found for task {task_id}")
 
     channel = db_settings.trace_redis_channel

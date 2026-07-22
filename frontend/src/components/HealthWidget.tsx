@@ -38,7 +38,7 @@ export const HealthWidget: React.FC = () => {
 
   const rows: { icon: React.ReactNode; label: string; status: string }[] = [
     { icon: <Server className="w-3.5 h-3.5 text-muted" />, label: 'FastAPI Backend', status: 'healthy' },
-    { icon: <Database className="w-3.5 h-3.5 text-muted" />, label: 'SQL · MariaDB', status: health.database.status },
+    { icon: <Database className="w-3.5 h-3.5 text-muted" />, label: 'SQL · PostgreSQL', status: health.database.status },
     { icon: <Layers className="w-3.5 h-3.5 text-muted" />, label: 'Qdrant Vector', status: health.qdrant.status },
     { icon: <Cpu className="w-3.5 h-3.5 text-muted" />, label: 'Celery Worker', status: health.celery.status },
   ];

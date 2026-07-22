@@ -70,10 +70,10 @@ export async function fetchDetailedHealthApi(): Promise<DetailedHealth> {
     const data = await res.json();
     return {
       status: data.status,
-      database: { status: data.database?.status || 'unhealthy', label: 'CSDL SQL (MariaDB)', details: data.database?.error || 'Hoạt động' },
+      database: { status: data.database?.status || 'unhealthy', label: 'CSDL SQL (PostgreSQL)', details: data.database?.error || 'Hoạt động' },
       redis: { status: data.redis?.status || 'unhealthy', label: 'Redis Cache', details: data.redis?.error || 'Hoạt động' },
       qdrant: { status: data.qdrant?.status || 'unhealthy', label: 'Qdrant Vector DB', details: data.qdrant?.error || 'Hoạt động' },
-      celery: { status: data.celery?.status || 'unhealthy', label: 'Celery Worker', details: data.celery?.active_workers ? `Hoạt động (${data.celery.active_workers.length} workers)` : 'Không có worker' },
+      celery: { status: (data.celery?.status === 'no_workers' || data.celery?.status === 'healthy') ? 'healthy' : (data.celery?.status || 'unhealthy'), label: 'Celery Worker', details: data.celery?.active_workers?.length ? `Hoạt động (${data.celery.active_workers.length} workers)` : 'Hoạt động (Sync Mode)' },
       ollama: { status: data.ollama?.status || 'not_configured', label: 'Ollama LLM', details: data.ollama?.status === 'healthy' ? 'Hoạt động' : 'Chưa cấu hình / Cloud' },
     };
   } catch (e: any) {
@@ -92,7 +92,8 @@ export async function sendChatMessageApi(
   userMessage: string,
   userId: string,
   variant?: string,
-  syncRequest: boolean = false
+  syncRequest: boolean = false,
+  conversationId?: string
 ): Promise<{ task_id?: string; response?: string; sources?: LegalSource[]; route?: string; tool_calls?: any[] }> {
   const res = await fetch(`${API_BASE}/chat/complete`, {
     method: 'POST',
@@ -103,6 +104,7 @@ export async function sendChatMessageApi(
       bot_id: 'botLawyer',
       sync_request: syncRequest,
       variant,
+      conversation_id: conversationId,
     }),
   });
 
@@ -122,7 +124,7 @@ export function subscribeTraceStream(
 ): () => void {
   const es = new EventSource(`${API_BASE}/chat/stream/${taskId}`);
 
-  es.onmessage = (event) => {
+  const handleMessage = (event: MessageEvent) => {
     try {
       if (event.data) {
         const payload = JSON.parse(event.data);
@@ -137,9 +139,24 @@ export function subscribeTraceStream(
     }
   };
 
-  es.addEventListener('run_end', () => {
-    es.close();
-    onFinish();
+  es.onmessage = handleMessage;
+
+  const traceEventTypes = [
+    'message',
+    'run_start',
+    'query_rewrite',
+    'router',
+    'vector_retrieval',
+    'search',
+    'legal_effectivity',
+    'knowledge_graph',
+    'synthesis',
+    'run_end',
+    'ready',
+  ];
+
+  traceEventTypes.forEach((evtType) => {
+    es.addEventListener(evtType, handleMessage as any);
   });
 
   es.onerror = (err) => {

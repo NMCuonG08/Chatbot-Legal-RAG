@@ -1906,7 +1906,7 @@ def clear_user_runtime_caches_task(user_id: str, conversation_id: str | None = N
 
 @shared_task(bind=True)
 def llm_handle_message(self, bot_id, user_id, question, role=None,
-                       variant=None, shadow=False):
+                       variant=None, shadow=False, target_conversation_id=None):
     """
     Main message handler with intelligent routing.
 
@@ -1930,7 +1930,7 @@ def llm_handle_message(self, bot_id, user_id, question, role=None,
     _ensure_schema_once()
 
     # Update chat conversation
-    conversation_id = update_chat_conversation(bot_id, user_id, question, True)
+    conversation_id = update_chat_conversation(bot_id, user_id, question, True, conversation_id=target_conversation_id)
     logger.info("Conversation id: %s", conversation_id)
 
     # 1. Check Semantic Cache BEFORE loading history. Cache lookup only needs
@@ -1949,7 +1949,7 @@ def llm_handle_message(self, bot_id, user_id, question, role=None,
             cached = get_cached_response(question, user_id)
         if cached:
             logger.info("Semantic Cache HIT - returning cached response directly")
-            update_chat_conversation(bot_id, user_id, cached["response"], False, sources=cached["sources"])
+            update_chat_conversation(bot_id, user_id, cached["response"], False, sources=cached["sources"], conversation_id=conversation_id)
             return {
                 "role": "assistant",
                 "content": cached["response"],

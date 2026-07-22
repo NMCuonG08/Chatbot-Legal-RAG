@@ -56,17 +56,27 @@ def _build_index(embed_fn) -> list:
     if _index is not None:
         return _index
     import agent_tool_wrappers as atw
-    entries = []
+    tool_items = []
+    descriptions = []
     for t in atw.all_tools:
         meta = t.metadata
         name = meta.name or ""
         desc = (meta.description or "") + " " + name
-        try:
-            emb = embed_fn(desc)
-        except Exception as exc:
-            logger.warning("tool_router: embed failed for %s: %s", name, exc)
-            emb = None
+        tool_items.append((t, name, desc))
+        descriptions.append(desc)
+
+    try:
+        embeddings = embed_fn(descriptions)
+        if not isinstance(embeddings, list) or (embeddings and not isinstance(embeddings[0], list)):
+            embeddings = [embeddings]
+    except Exception as exc:
+        logger.warning("tool_router: batch embed failed: %s", exc)
+        embeddings = [None] * len(descriptions)
+
+    entries = []
+    for (t, name, desc), emb in zip(tool_items, embeddings):
         entries.append((t, name, desc, emb))
+
     _index = entries
     return entries
 

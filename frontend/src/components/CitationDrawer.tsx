@@ -20,31 +20,52 @@ export const CitationDrawer: React.FC<CitationDrawerProps> = ({ sources = [] }) 
 
       <div className="flex flex-wrap gap-1.5">
         {sources.map((src, idx) => {
-          const docTitle = src.document_title || src.title || `Văn bản #${idx + 1}`;
+          const isWeb = src.collection === 'web' || (src.url && !src.article_number);
+          const docTitle = src.document_title || src.title || `Nguồn #${idx + 1}`;
           const articleNum = src.article_number ? `Điều ${src.article_number}` : '';
+
           return (
             <button
               key={idx}
               onClick={() => setSelectedSource(src)}
-              className="inline-flex items-center gap-2 px-2.5 py-1.5 border border-rule bg-paper hover:border-ink hover:bg-paper-dim rounded-swiss transition-colors text-left"
+              className={`inline-flex items-center gap-2 px-2.5 py-1.5 border rounded-swiss transition-all text-left ${
+                isWeb
+                  ? 'bg-sky-50/60 text-sky-900 border-sky-200 hover:border-sky-400 hover:bg-sky-100/80'
+                  : 'bg-paper text-ink border-rule hover:border-ink hover:bg-paper-dim'
+              }`}
             >
-              {articleNum && (
-                <span className="font-mono text-[11px] font-semibold text-vn-600">{articleNum}</span>
-              )}
-              <span className="text-xs text-ink truncate max-w-[220px]">{docTitle}</span>
+              {isWeb ? (
+                <span className="font-mono text-[10px] uppercase font-bold text-sky-700 px-1.5 py-0.5 bg-sky-100 rounded border border-sky-200">
+                  WEB
+                </span>
+              ) : articleNum ? (
+                <span className="font-mono text-[11px] font-semibold text-vn-600 px-1.5 py-0.5 bg-vn-50 rounded border border-vn-200">
+                  {articleNum}
+                </span>
+              ) : null}
+              <span className="text-xs font-medium truncate max-w-[240px]">{docTitle}</span>
               {src.score && (
-                <span className="font-mono text-[10px] text-muted tabular-nums">
+                <span className="font-mono text-[10px] opacity-70 tabular-nums">
                   {(src.score * 100).toFixed(0)}%
                 </span>
               )}
+              {src.url && <ExternalLink className="w-3 h-3 opacity-60 shrink-0" />}
             </button>
           );
         })}
       </div>
 
       {selectedSource && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-ink/40 animate-fade-in">
-          <div className="relative w-full max-w-2xl bg-paper border border-ink rounded-swiss p-6 max-h-[85vh] flex flex-col">
+        <div
+          onClick={() => setSelectedSource(null)}
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-md animate-fade-in"
+          style={{ backgroundColor: 'rgba(0, 0, 0, 0.75)' }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="relative w-full max-w-2xl border border-rule rounded-2xl p-6 max-h-[85vh] flex flex-col shadow-2xl"
+            style={{ backgroundColor: 'rgb(var(--c-paper))' }}
+          >
             <button
               onClick={() => setSelectedSource(null)}
               className="absolute top-3 right-3 p-1.5 text-faint hover:text-ink hover:bg-paper-tint rounded-swiss transition-colors"

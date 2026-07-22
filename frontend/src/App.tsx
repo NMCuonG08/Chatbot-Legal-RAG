@@ -12,6 +12,7 @@ import {
   subscribeTraceStream,
   fetchUserHistoryApi,
   deleteUserHistoryApi,
+  pollTaskResultApi,
 } from './services/api';
 
 // Generate or retrieve per-browser session UUID (guest memory scope)
@@ -33,6 +34,8 @@ const AppContent: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'chat' | 'admin'>('chat');
   const [isLoading, setIsLoading] = useState<boolean>(false);
 
+  const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
+
   // Active user ID for scoped memory and JWT association
   const activeUserId = user ? user.id : getSessionUserId();
 
@@ -46,42 +49,75 @@ const AppContent: React.FC = () => {
     }
   }, [activeTab, canAccessAdmin]);
 
+  const handleSelectHistoryItem = (item: any) => {
+    const itemId = item.conversation_id || item.id;
+    setSelectedHistoryId(itemId);
+
+    if (item.turns && Array.isArray(item.turns) && item.turns.length > 0) {
+      const formatted: ChatMessage[] = [];
+      item.turns.forEach((t: any, idx: number) => {
+        if (t.is_request) {
+          formatted.push({
+            id: `h_req_${itemId}_${idx}`,
+            role: 'user',
+            content: t.message,
+            timestamp: t.created_at || new Date().toISOString(),
+          });
+        } else {
+          formatted.push({
+            id: `h_res_${itemId}_${idx}`,
+            role: 'assistant',
+            content: t.message,
+            timestamp: t.created_at || new Date().toISOString(),
+            sources: t.sources || [],
+          });
+        }
+      });
+      setMessages(formatted);
+    } else {
+      const q = item.question || item.message?.question || item.content;
+      const a = item.response || item.message?.response;
+      if (q && a) {
+        setMessages([
+          {
+            id: 'h_user_' + itemId,
+            role: 'user',
+            content: q,
+            timestamp: new Date().toISOString(),
+          },
+          {
+            id: 'h_asst_' + itemId,
+            role: 'assistant',
+            content: a,
+            timestamp: new Date().toISOString(),
+            sources: item.sources || [],
+          },
+        ]);
+      }
+    }
+  };
+
   // Fetch conversation history on initial load or user change
   useEffect(() => {
     async function loadHistory() {
       const historyData = await fetchUserHistoryApi(activeUserId);
       setHistory(historyData);
+      if (historyData.length > 0 && !selectedHistoryId) {
+        handleSelectHistoryItem(historyData[0]);
+      }
     }
     loadHistory();
   }, [activeUserId]);
 
   const handleNewChat = () => {
+    setSelectedHistoryId(null);
     setMessages([]);
-  };
-
-  const handleSelectHistoryItem = (item: any) => {
-    if (item.question && item.response) {
-      setMessages([
-        {
-          id: 'h_user_' + item.id,
-          role: 'user',
-          content: item.question,
-          timestamp: new Date().toISOString(),
-        },
-        {
-          id: 'h_asst_' + item.id,
-          role: 'assistant',
-          content: item.response,
-          timestamp: new Date().toISOString(),
-          sources: item.sources || [],
-        },
-      ]);
-    }
   };
 
   const handleWipeHistory = async () => {
     if (window.confirm('Bạn có chắc chắn muốn xóa toàn bộ lịch sử trò chuyện và trí nhớ dài hạn không?')) {
       await deleteUserHistoryApi(activeUserId);
+      setSelectedHistoryId(null);
       setMessages([]);
       setHistory([]);
     }
@@ -115,8 +151,13 @@ const AppContent: React.FC = () => {
     setMessages(newMessages);
     setIsLoading(true);
 
+    const targetConvId = selectedHistoryId || ('sess_' + Date.now());
+    if (!selectedHistoryId) {
+      setSelectedHistoryId(targetConvId);
+    }
+
     try {
-      const res = await sendChatMessageApi(text, activeUserId, selectedVariant, false);
+      const res = await sendChatMessageApi(text, activeUserId, selectedVariant, false, targetConvId);
 
       if (res.task_id) {
         const taskId = res.task_id;
@@ -138,8 +179,18 @@ const AppContent: React.FC = () => {
                 }
 
                 let updatedContent = msg.content;
-                if (step.payload && typeof step.payload === 'object' && step.payload.answer) {
-                  updatedContent = step.payload.answer;
+                if (step.payload && typeof step.payload === 'object') {
+                  const ans =
+                    step.payload.answer ||
+                    step.payload.content ||
+                    step.payload.response ||
+                    step.payload.final_response ||
+                    step.payload.text;
+                  if (ans && typeof ans === 'string') {
+                    updatedContent = ans;
+                  }
+                } else if (typeof step.payload === 'string' && step.payload.trim()) {
+                  updatedContent = step.payload;
                 }
 
                 return {
@@ -151,18 +202,60 @@ const AppContent: React.FC = () => {
             );
           },
           async () => {
+            let polledResult: any = null;
+            try {
+              polledResult = await pollTaskResultApi(taskId);
+            } catch (e) {
+              console.warn('Poll task result failed', e);
+            }
+
+            const taskRes = polledResult?.task_result || {};
+            const finalContent =
+              taskRes.content || taskRes.response || taskRes.answer || taskRes.text;
+            const finalSources = taskRes.sources || [];
+            const finalRoute = taskRes.route || '';
+
             setMessages((prev) =>
               prev.map((msg) => {
                 if (msg.id !== assistantMsgId) return msg;
-                return { ...msg, isStreaming: false };
+                const resolvedContent =
+                  msg.content || finalContent || '⚠️ Không nhận được câu trả lời từ máy chủ.';
+                return {
+                  ...msg,
+                  content: resolvedContent,
+                  sources: msg.sources?.length ? msg.sources : finalSources,
+                  route: msg.route || finalRoute,
+                  isStreaming: false,
+                };
               })
             );
             setIsLoading(false);
             const historyData = await fetchUserHistoryApi(activeUserId);
             setHistory(historyData);
           },
-          (err) => {
+          async (err) => {
             console.error(err);
+            try {
+              const polledResult = await pollTaskResultApi(taskId);
+              const taskRes = polledResult?.task_result || {};
+              const finalContent = taskRes.content || taskRes.response || taskRes.answer;
+              if (finalContent) {
+                setMessages((prev) =>
+                  prev.map((msg) => {
+                    if (msg.id !== assistantMsgId) return msg;
+                    return {
+                      ...msg,
+                      content: finalContent,
+                      sources: taskRes.sources || [],
+                      route: taskRes.route || '',
+                      isStreaming: false,
+                    };
+                  })
+                );
+              }
+            } catch (e) {
+              /* ignore */
+            }
             setIsLoading(false);
           }
         );
@@ -214,6 +307,7 @@ const AppContent: React.FC = () => {
         onSelectVariant={setSelectedVariant}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
+        selectedHistoryId={selectedHistoryId}
       />
 
       <div className="flex-1 flex flex-col h-full lg:pl-72 overflow-hidden">

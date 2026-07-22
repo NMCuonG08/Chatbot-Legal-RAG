@@ -262,7 +262,7 @@ class CustomEmbeddingService:
             model = self._get_sentence_transformer()
             if model is not None:
                 logger.info(f"💾 Generating {len(texts)} embeddings locally using SentenceTransformer (bge-m3)...")
-                embeddings = model.encode(texts)
+                embeddings = model.encode(texts, show_progress_bar=False)
                 return [list(map(float, emb)) for emb in embeddings]
         except Exception as e:
             logger.warning(f"⚠️ Local SentenceTransformer batch embedding failed: {e}. Falling back to sequential embedding.")
@@ -292,7 +292,16 @@ class CustomEmbeddingService:
         # Clean texts
         texts = [t.replace("\n", " ").strip() for t in texts]
 
-        # Check if we can use Cohere Cloud embeddings (highly recommended: free, fast, 0% local CPU/GPU)
+        # 1. Try local SentenceTransformer (bge-m3) first (instant, 0ms network latency, no 429 rate limits)
+        try:
+            model = self._get_sentence_transformer()
+            if model is not None:
+                embeddings = self._local_batch_embeddings(texts)
+                return embeddings[0] if is_single else embeddings
+        except Exception as e:
+            logger.warning(f"⚠️ Local SentenceTransformer embedding failed: {e}. Trying cloud fallbacks...")
+
+        # 2. Check if we can use Cohere Cloud embeddings as fallback
         cohere_api_key = os.environ.get("COHERE_API_KEY")
         if cohere_api_key and not self.service_available:
             try:
@@ -302,7 +311,7 @@ class CustomEmbeddingService:
             except Exception as e:
                 logger.warning(f"⚠️ Cohere cloud embedding failed ({e}), falling back to Ollama Cloud.")
 
-        # Try Ollama Cloud embeddings as second cloud fallback before running local models
+        # 3. Try Ollama Cloud embeddings as second cloud fallback
         ollama_base = os.environ.get("OLLAMA_BASE_URL")
         if ollama_base and not self.service_available:
             try:
